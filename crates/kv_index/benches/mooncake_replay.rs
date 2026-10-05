@@ -1239,6 +1239,20 @@ fn run<B: ReplayBackend>(
     } else {
         query_cpus.len()
     };
+    // Issuers and lanes must not share cores: a lane on an issuer's core eats the issue schedule
+    // and the trial measures the layout mistake, not the indexer (Dynamo's runner refuses too).
+    if !backend_cpus.is_empty() {
+        let overlap: Vec<usize> = issuer_cpus
+            .iter()
+            .chain(query_cpus.iter())
+            .copied()
+            .filter(|cpu| backend_cpus.contains(cpu))
+            .collect();
+        anyhow::ensure!(
+            overlap.is_empty(),
+            "issuer CPUs {overlap:?} overlap the backend CPU set; give lanes their own cores"
+        );
+    }
     if window_ns != corpus.reference_window_ns {
         let reference = corpus.reference_window_ns.max(1) as u128;
         for op in &mut corpus.ops {
