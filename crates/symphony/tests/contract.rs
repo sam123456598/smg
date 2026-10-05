@@ -19,15 +19,16 @@
 //!
 //! The design's "committed stays committed" is not a separate check: `Events` is append-only and
 //! conservation forbids saying a byte twice, so nothing a parser pushed can be taken back through
-//! the event list. The fifth property, token identity, comes with token attribution. A format joins
-//! the contract with one entry in [`FORMATS`], its constructor and its corpus.
+//! the event list. The fifth property, token identity (every token counted in exactly one event,
+//! whatever the cuts), is checked with a synthetic tokenization of each output. A format joins the
+//! contract with one entry in [`FORMATS`], its constructor and its corpus.
 
 mod common;
 
 use common::{bytes_of, chunkings, delta, prompt};
 use symphony::{
     json::PartialJson, DropReason, EngineFinish, Event, Events, FinishReason, Input,
-    MalformedReason, ParseError, Parser, Qwen3,
+    MalformedReason, ParseError, Parser, Qwen3, TokenSpan,
 };
 
 /// A format under test: how to make its parser, and the outputs it is checked over.
@@ -320,6 +321,115 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_follow_the_index() {
         for (position, (index, id, _)) in Said::of(&events).calls.iter().enumerate() {
             assert_eq!(*index as usize, position, "{}: {text:?}", format.name);
             assert_eq!(id, &format!("call_{index}"), "{}: {text:?}", format.name);
+        }
+    }
+}
+
+/// A synthetic tokenization of `text`: token boundaries at character offsets, one to three
+/// characters per token, deterministic in the text.
+fn token_boundaries(text: &str) -> Vec<usize> {
+    let chars: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let mut boundaries = vec![0];
+    let mut at = 0;
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    while at < chars.len() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        at += 1 + (state % 3) as usize;
+        if at < chars.len() {
+            boundaries.push(chars[at]);
+        }
+    }
+    boundaries.push(text.len());
+    boundaries.dedup();
+    boundaries
+}
+
+/// Replay `text` through a new parser of `format` cut at `cuts`, after the prompt, each delta
+/// carrying the spans of the synthetic tokens it holds, a token cut by a delta boundary continuing
+/// into the next delta.
+fn replay_counted(format: &Format, text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
+    let boundaries = token_boundaries(text);
+    let tokens: Vec<(usize, usize)> = boundaries.windows(2).map(|w| (w[0], w[1])).collect();
+    let mut parser = (format.new)();
+    let mut out = Events::new();
+    parser.feed(prompt(), &mut out)?;
+    let mut from = 0;
+    for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
+        if cut > from {
+            let spans: Vec<TokenSpan> = tokens
+                .iter()
+                .filter(|&&(start, end)| end > from && start < cut)
+                .map(|&(start, end)| TokenSpan {
+                    token_id: 0,
+                    start: start.max(from) - from,
+                    end: end.min(cut) - from,
+                    continued: start < from,
+                })
+                .collect();
+            parser.feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: &text[from..cut],
+                    spans: &spans,
+                },
+                &mut out,
+            )?;
+            from = cut;
+        }
+    }
+    parser.feed(
+        Input::End {
+            finish: EngineFinish::Stop,
+        },
+        &mut out,
+    )?;
+    Ok(out.drain())
+}
+
+fn tokens_of(event: &Event) -> Option<u32> {
+    match event {
+        Event::Content(t) | Event::Reasoning(t) => t.tokens,
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.tokens,
+        Event::ToolCallStart { source, .. }
+        | Event::ToolCallArguments { source, .. }
+        | Event::ToolCallEnd { source, .. } => source.tokens,
+        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+    }
+}
+
+#[test]
+fn every_token_is_counted_in_exactly_one_event_whatever_the_cuts() {
+    for (format, text) in corpus() {
+        let expected = (token_boundaries(text).len() - 1) as u32;
+        for cuts in chunkings(text) {
+            let events = replay_counted(format, text, &cuts)
+                .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", format.name));
+            let place = || format!("{}: {text:?} cut at {cuts:?}", format.name);
+            let counts: Vec<u32> = events
+                .iter()
+                .filter(|e| {
+                    !matches!(
+                        e,
+                        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. }
+                    )
+                })
+                .map(|e| tokens_of(e).unwrap_or_else(|| panic!("{}: uncounted {e:?}", place())))
+                .collect();
+            assert_eq!(counts.iter().sum::<u32>(), expected, "{}", place());
+            let reasoning: u32 = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Reasoning(t) => t.tokens,
+                    _ => None,
+                })
+                .sum();
+            assert!(
+                matches!(events.last(), Some(Event::Finish { reasoning_tokens, .. }) if *reasoning_tokens == reasoning),
+                "{}: Finish counts the reasoning tokens",
+                place()
+            );
         }
     }
 }

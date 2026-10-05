@@ -27,19 +27,23 @@
 //!   `UnterminatedRegion` means the stream ended inside the region.
 //! - Call ids are `call_<index>` for now; the id scheme is Simo's decision (deterministic or carrying
 //!   the conversation's history) and changes only this one line.
-//! - Text is `Text::uncounted`: token attribution from the input spans comes with the engine work;
-//!   `Finish::reasoning_tokens` is zero until then.
+//! - Every text event says how many tokens it carries, counted by the [`Ledger`] from the deltas'
+//!   spans (a token in the event that carries its first byte; a control token without bytes as
+//!   `Dropped { ControlToken }`), and `Finish::reasoning_tokens` is the count over the reasoning
+//!   text. Deltas without spans make the stream uncounted, and then `reasoning_tokens` is zero, the
+//!   one place where zero does not mean none (rule 7 keeps `Finish` as it is for now).
 //! - Tool names are not checked against the request's tools; the format has no tool list yet.
 //!
 //! The prompt is accepted first in the lifecycle and otherwise ignored: Qwen3 writes its own
 //! `<think>` into the output, so nothing about the prompt decides where the output starts.
 
 use crate::{
-    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{DropReason, Event, Events, FinishReason, MalformedReason},
     input::{EngineFinish, Input},
     json::Assembler,
     markers::{Piece, Scanner},
     parser::{ParseError, Parser},
+    tokens::Ledger,
 };
 
 const THINK_OPEN: usize = 0;
@@ -63,6 +67,8 @@ pub struct Qwen3 {
     scanner: Scanner,
     region: Region,
     calls: u32,
+    tokens: Ledger,
+    reasoning_tokens: u32,
     stage: Stage,
 }
 
@@ -93,6 +99,8 @@ impl Qwen3 {
             scanner: Scanner::new(MARKERS),
             region: Region::Content,
             calls: 0,
+            tokens: Ledger::new(),
+            reasoning_tokens: 0,
             stage: Stage::Fresh,
         }
     }
@@ -106,11 +114,19 @@ impl Qwen3 {
 
     fn text(&mut self, text: &str, out: &mut Events) {
         match &mut self.region {
-            Region::Content => out.push_content(Text::uncounted(text)),
-            Region::Reasoning => out.push_reasoning(Text::uncounted(text)),
+            Region::Content => out.push_content(self.tokens.text(text)),
+            Region::Reasoning => {
+                let counted = self.tokens.text(text);
+                self.reasoning_tokens += counted.tokens.unwrap_or(0);
+                out.push_reasoning(counted);
+            }
             Region::Call(assembler) => {
-                let taken = assembler.feed(text, out);
-                Self::surplus(&text[taken..], out);
+                let mut assembled = Events::new();
+                let taken = assembler.feed(text, &mut assembled);
+                for event in assembled.drain() {
+                    out.push(self.tokens.relabel(event));
+                }
+                self.surplus(&text[taken..], out);
             }
         }
     }
@@ -118,7 +134,7 @@ impl Qwen3 {
     /// Text after a call's object and before its closing marker: each run of whitespace is the
     /// template's wrapping and is dropped, each run of anything else is malformed. Classifying run
     /// by run keeps the result the same wherever the chunks were cut.
-    fn surplus(surplus: &str, out: &mut Events) {
+    fn surplus(&mut self, surplus: &str, out: &mut Events) {
         let mut rest = surplus;
         while let Some(first) = rest.chars().next() {
             let space = first.is_whitespace();
@@ -126,7 +142,7 @@ impl Qwen3 {
                 .char_indices()
                 .find(|(_, c)| c.is_whitespace() != space)
                 .map_or(rest.len(), |(at, _)| at);
-            let run = Text::uncounted(&rest[..length]);
+            let run = self.tokens.text(&rest[..length]);
             out.push(if space {
                 Event::Dropped {
                     text: run,
@@ -146,36 +162,36 @@ impl Qwen3 {
         let marker = MARKERS[index];
         match (&mut self.region, index) {
             (Region::Content, THINK_OPEN) => {
-                Self::drop_marker(marker, out);
+                self.drop_marker(marker, out);
                 out.push(Event::ReasoningStart);
                 self.region = Region::Reasoning;
             }
             (Region::Reasoning, THINK_CLOSE) => {
-                Self::drop_marker(marker, out);
+                self.drop_marker(marker, out);
                 out.push(Event::ReasoningEnd);
                 self.region = Region::Content;
             }
             (Region::Content, CALL_OPEN) => {
-                Self::drop_marker(marker, out);
+                self.drop_marker(marker, out);
                 self.open_call();
             }
             (Region::Call(_), CALL_CLOSE) => {
                 // The call's remaining events come before the marker that closed it, so the events'
                 // bytes stay in the output's order.
                 self.close_call(Closed::ByMarker, out);
-                Self::drop_marker(marker, out);
+                self.drop_marker(marker, out);
             }
             (Region::Call(_), CALL_OPEN) => {
                 // A new call before the previous one closed: finish what arrived, then start.
                 self.close_call(Closed::ByMarker, out);
-                Self::drop_marker(marker, out);
+                self.drop_marker(marker, out);
                 self.open_call();
             }
             // A closing marker with nothing open, or an opener inside a region that does not nest:
             // the model's bytes, where the model put them.
-            (Region::Content, _) => out.push_content(Text::uncounted(marker)),
-            (Region::Reasoning, _) => out.push_reasoning(Text::uncounted(marker)),
-            (Region::Call(_), _) => self.text(marker, out),
+            (Region::Content | Region::Reasoning, _) | (Region::Call(_), _) => {
+                self.text(marker, out);
+            }
         }
     }
 
@@ -197,7 +213,7 @@ impl Qwen3 {
             let mut finished = Events::new();
             assembler.finish(&mut finished);
             for event in finished.drain() {
-                out.push(match event {
+                let event = match event {
                     Event::Malformed {
                         text,
                         why: MalformedReason::UnterminatedRegion,
@@ -206,14 +222,15 @@ impl Qwen3 {
                         why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
                     },
                     event => event,
-                });
+                };
+                out.push(self.tokens.relabel(event));
             }
         }
     }
 
-    fn drop_marker(marker: &str, out: &mut Events) {
+    fn drop_marker(&mut self, marker: &str, out: &mut Events) {
         out.push(Event::Dropped {
-            text: Text::uncounted(marker),
+            text: self.tokens.text(marker),
             why: DropReason::Wrapper,
         });
     }
@@ -240,7 +257,7 @@ impl Qwen3 {
         out.push(Event::Finish {
             reason,
             tool_calls: self.calls,
-            reasoning_tokens: 0,
+            reasoning_tokens: self.reasoning_tokens,
         });
     }
 }
@@ -257,11 +274,12 @@ impl Parser for Qwen3 {
                 self.stage = Stage::Streaming;
                 Ok(())
             }
-            Input::Delta { text, .. } => {
+            Input::Delta { text, spans, .. } => {
                 if self.stage == Stage::Ended {
                     return Err(ParseError::Lifecycle("delta after end".to_string()));
                 }
                 self.stage = Stage::Streaming;
+                self.tokens.note(text, spans, out);
                 for piece in self.scanner.feed(text) {
                     self.take(piece, out);
                 }
@@ -282,6 +300,7 @@ impl Parser for Qwen3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{event::Text, input::TokenSpan};
 
     const CALL: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
 
@@ -673,6 +692,196 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The spans of `tokens`, each a run of bytes, as one delta's spans.
+    fn spans_of(tokens: &[&str]) -> Vec<TokenSpan> {
+        let mut at = 0;
+        tokens
+            .iter()
+            .map(|token| {
+                let span = TokenSpan {
+                    token_id: 0,
+                    start: at,
+                    end: at + token.len(),
+                    continued: false,
+                };
+                at += token.len();
+                span
+            })
+            .collect()
+    }
+
+    fn counted(events: &[Event]) -> Vec<(String, Option<u32>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Content(t) | Event::Reasoning(t) => Some((t.text.clone(), t.tokens)),
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => {
+                    Some((text.text.clone(), text.tokens))
+                }
+                Event::ToolCallStart { source, .. }
+                | Event::ToolCallArguments { source, .. }
+                | Event::ToolCallEnd { source, .. } => Some((source.text.clone(), source.tokens)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_token_is_counted_once_in_the_event_that_carries_its_first_byte() {
+        let tokens = [
+            "<think>",
+            "\nplan",
+            "\n</think>",
+            "\n\nHi",
+            "<tool_call>",
+            "{\"name\": \"f\", ",
+            "\"arguments\": {}}",
+            "</tool_call>",
+        ];
+        let text: String = tokens.concat();
+        let spans = spans_of(&tokens);
+        let mut parser = Qwen3::new();
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: &text,
+                    spans: &spans,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert_eq!(
+            counted(&events),
+            vec![
+                ("<think>".into(), Some(1)),
+                ("\nplan\n".into(), Some(2)),
+                ("</think>".into(), Some(0)),
+                ("\n\nHi".into(), Some(1)),
+                ("<tool_call>".into(), Some(1)),
+                ("{\"name\": \"f\", \"arguments\": ".into(), Some(2)),
+                ("{}".into(), Some(0)),
+                ("}".into(), Some(0)),
+                ("</tool_call>".into(), Some(1)),
+            ]
+        );
+        assert_eq!(
+            counted(&events)
+                .iter()
+                .map(|(_, n)| n.unwrap_or(0))
+                .sum::<u32>(),
+            tokens.len() as u32,
+            "every token exactly once"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reasoning_tokens: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_token_cut_by_a_delta_boundary_is_counted_once_and_a_control_token_at_once() {
+        let mut parser = Qwen3::new();
+        let mut out = Events::new();
+        let first = [TokenSpan {
+            token_id: 1,
+            start: 0,
+            end: 4,
+            continued: false,
+        }];
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[1],
+                    text: "<thi",
+                    spans: &first,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        let second = [
+            TokenSpan {
+                token_id: 1,
+                start: 0,
+                end: 3,
+                continued: true,
+            },
+            TokenSpan {
+                token_id: 2,
+                start: 3,
+                end: 3,
+                continued: false,
+            },
+            TokenSpan {
+                token_id: 3,
+                start: 3,
+                end: 4,
+                continued: false,
+            },
+        ];
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[1, 2, 3],
+                    text: "nk>x",
+                    spans: &second,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert_eq!(
+            events[0],
+            Event::Dropped {
+                text: Text::new("", 1),
+                why: DropReason::ControlToken,
+            },
+            "the control token is reported when its delta arrives"
+        );
+        assert_eq!(
+            counted(&events),
+            vec![
+                (String::new(), Some(1)),
+                ("<think>".into(), Some(1)),
+                ("x".into(), Some(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn deltas_without_spans_leave_the_text_uncounted() {
+        let events = run(&["<think>a</think>b"], EngineFinish::Stop);
+        assert!(counted(&events).iter().all(|(_, n)| n.is_none()));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reasoning_tokens: 0,
+                ..
+            })
+        ));
     }
 
     #[test]
