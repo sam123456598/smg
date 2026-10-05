@@ -276,6 +276,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_warmup(mut self, secs: u64, share: f32, blocks: usize) -> Self {
+        self.config.worker_warmup_secs = secs;
+        self.config.worker_warmup_share = share;
+        self.config.worker_warmup_blocks = blocks;
+        self
+    }
+
     pub fn pd_admission_wait_secs(mut self, secs: u64) -> Self {
         self.config.pd_admission_wait_secs = secs;
         self

@@ -68,7 +68,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -102,8 +102,13 @@ use crate::{
     config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::metrics::Metrics,
-    worker::{KvEventMonitor, Worker},
+    worker::{liveness, KvEventMonitor, Worker},
 };
+
+/// An overlap of at most this many blocks counts as a miss for the warm-up
+/// slice: a chat template's head is this long, shared by every holder, and
+/// recomputing it costs less than keeping a returned worker idle.
+const WARMUP_MISS_BLOCKS: f64 = 4.0;
 
 /// Cache-aware routing policy
 ///
@@ -142,6 +147,9 @@ pub struct CacheAwarePolicy {
     /// trigger. `None` until wired by the registry (then the policy stays
     /// count-only, preserving current behavior).
     load_rx: RwLock<Option<LoadReceiver>>,
+    /// Misses seen by the warm-up slice; every `period`th goes to a warming
+    /// worker (see [`liveness::Warmup`]).
+    warmup_misses: AtomicU64,
     /// Model-scoped hash indexes for resolving tenant delta hashes.
     /// Outer key is the normalized model_id; inner maps hold
     /// `hash → reconstructable prefix/tokens` per tree kind.
@@ -411,6 +419,7 @@ impl CacheAwarePolicy {
             _eviction_task: eviction_task,
             kv_monitor: RwLock::new(None),
             load_rx: RwLock::new(None),
+            warmup_misses: AtomicU64::new(0),
             hash_index,
             populate_hash_index: AtomicBool::new(false),
             mesh_tree_sync: RwLock::new(None),
@@ -1432,6 +1441,60 @@ impl CacheAwarePolicy {
             && load > avg_load + self.config.balance_abs_threshold as f64
     }
 
+    /// The warm-up slice: one cache miss in `1 / share` goes to the
+    /// least-loaded worker that became routable within the warm-up window and
+    /// whose index is still thin, so a returned or new worker builds a cache
+    /// instead of idling behind the fleet's affinity (on the GB300 fleet a
+    /// restarted worker went a minute without a request). With every worker
+    /// warming (a young fleet) nothing is sliced: a miss gets a load-balanced
+    /// pick anyway. The pick is credited through the expected-wait selector
+    /// like any other.
+    fn warmup_slice(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        indexer: &PositionalIndexer,
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let warmup = liveness::warmup();
+        if warmup.share <= 0.0 {
+            return None;
+        }
+        let warming: Vec<usize> = healthy_indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                let worker = &workers[idx];
+                let age = worker.admitted_age();
+                if age >= warmup.secs {
+                    return false;
+                }
+                let grown = indexer
+                    .worker_id(worker.url())
+                    .map(|id| worker.warmup_growth(indexer.worker_block_count(id)));
+                warmup.applies(age, grown)
+            })
+            .collect();
+        // Nothing to slice when no worker is warming, or when every one is (a
+        // young fleet): the miss then takes the regular path, which is a
+        // load-balanced pick anyway.
+        if warming.is_empty() || warming.len() == healthy_indices.len() {
+            return None;
+        }
+        if !self
+            .warmup_misses
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(warmup.period())
+        {
+            return None;
+        }
+        let idx = warming
+            .iter()
+            .copied()
+            .min_by_key(|&idx| workers[idx].load())?;
+        self.select_expected_wait(workers, &[idx], info)
+    }
+
     /// Resolve an affinity score group to one final worker. Safe affinity
     /// candidates retain priority; only when every tied holder trips the
     /// pressure gate do we scan the healthy fleet for non-gated spill targets.
@@ -1797,6 +1860,30 @@ impl CacheAwarePolicy {
             avg_load,
             prefix_hashes: (!prefix_hashes.is_empty()).then_some(prefix_hashes.as_slice()),
         };
+        // A miss for the warm-up slice is no overlap or a thin one: chat requests
+        // share their template's head with every holder, which is affinity in
+        // name only. Thin is a few blocks outright (the head of a short
+        // request) or at most the tree-mode `cache_threshold` share of a
+        // long one.
+        let best_overlap = candidates
+            .iter()
+            .map(|candidate| candidate.raw_score)
+            .fold(0.0_f64, f64::max);
+        let thin_overlap = best_overlap <= WARMUP_MISS_BLOCKS
+            || best_overlap / request.request_blocks as f64
+                <= f64::from(self.config.cache_threshold);
+        if thin_overlap {
+            if let Some(idx) = self.warmup_slice(workers, healthy_indices, indexer, info) {
+                Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
+                debug!(
+                    worker = workers[idx].url(),
+                    branch = "warmup_slice",
+                    request_blocks = content_hashes.len(),
+                    "Cache miss routed to a warming worker"
+                );
+                return Some(idx);
+            }
+        }
         let had_overlap = !candidates.is_empty();
         let idx = self.resolve_selection(
             workers,
@@ -1813,15 +1900,17 @@ impl CacheAwarePolicy {
             .iter()
             .find(|candidate| candidate.idx == idx)
             .map_or(0, |candidate| candidate.raw_score as u64);
+        let branch = if !had_overlap {
+            "event_miss"
+        } else if overlap_blocks > 0 {
+            "event_hit"
+        } else {
+            "event_spill"
+        };
+        Metrics::record_worker_cache_aware_policy_branch(branch);
         debug!(
             worker = workers[idx].url(),
-            branch = if !had_overlap {
-                "event_miss"
-            } else if overlap_blocks > 0 {
-                "event_hit"
-            } else {
-                "event_spill"
-            },
+            branch,
             overlap_blocks,
             request_blocks = content_hashes.len(),
             policy = self.selection.name(),

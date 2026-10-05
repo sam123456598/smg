@@ -616,6 +616,23 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// successful contact, instead of at its next scheduled probe.
     fn signal_connected(&self) {}
 
+    /// Record that the worker just became routable (promotion to Ready, or a
+    /// liveness veto cleared); the warm-up slice counts from here.
+    fn note_admitted(&self) {}
+
+    /// Time since the worker last became routable; `Duration::MAX` for a
+    /// worker that does not track it (never warming).
+    fn admitted_age(&self) -> Duration {
+        Duration::MAX
+    }
+
+    /// Blocks the worker's index has gained since its current admission, for
+    /// the warm-up slice; `indexed` is what the index holds for it now. A
+    /// worker that does not track admissions reports the count itself.
+    fn warmup_growth(&self, indexed: usize) -> usize {
+        indexed
+    }
+
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
     /// reads status, load, processed and the overload veto together so the hot
     /// path takes one `ArcSwap` guard per backing cell per worker instead of one
@@ -1301,6 +1318,13 @@ pub struct WorkerRuntime {
     /// Woken on every contact, so a loop backing off from this worker (the
     /// KV event subscriber) retries the moment the worker is heard from.
     contact_wake: Arc<Notify>,
+    /// When the worker last became routable (promoted to Ready, or a liveness
+    /// veto cleared), in [`super::liveness::now_ms`] milliseconds.
+    admitted_at_ms: AtomicU64,
+    /// The warm-up slice's baseline: the admission it was taken for and the
+    /// blocks the index held for the worker then (see [`Self::warmup_growth`]).
+    warmup_base_admitted_ms: AtomicU64,
+    warmup_base_blocks: AtomicUsize,
 }
 
 impl WorkerRuntime {
@@ -1323,7 +1347,44 @@ impl WorkerRuntime {
             transport_failed: AtomicBool::new(false),
             last_load_sample: AtomicUsize::new(0),
             contact_wake: Arc::new(Notify::new()),
+            admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
+            warmup_base_admitted_ms: AtomicU64::new(u64::MAX),
+            warmup_base_blocks: AtomicUsize::new(0),
         }
+    }
+
+    pub fn note_admitted(&self) {
+        self.admitted_at_ms
+            .store(super::liveness::now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn admitted_age(&self) -> Duration {
+        Self::age_of(self.admitted_at_ms.load(Ordering::Relaxed))
+    }
+
+    /// Blocks the index has gained for the worker since its current admission.
+    /// The index size itself is no measure of a returned worker's cache: a
+    /// restarted engine's stale blocks stay indexed until its first batch
+    /// reveals the restart, and an engine that gets no request sends no batch,
+    /// so the stale count would end the warm-up meant to break that circle.
+    /// The baseline is the count first seen for the current admission, and
+    /// drops to zero when the index was cleared underneath (the count went
+    /// down). Two racing callers may both take the same baseline; nothing
+    /// worse.
+    pub fn warmup_growth(&self, indexed: usize) -> usize {
+        let admitted = self.admitted_at_ms.load(Ordering::Relaxed);
+        if self.warmup_base_admitted_ms.load(Ordering::Relaxed) != admitted {
+            self.warmup_base_admitted_ms
+                .store(admitted, Ordering::Relaxed);
+            self.warmup_base_blocks.store(indexed, Ordering::Relaxed);
+            return 0;
+        }
+        let base = self.warmup_base_blocks.load(Ordering::Relaxed);
+        if indexed < base {
+            self.warmup_base_blocks.store(0, Ordering::Relaxed);
+            return indexed;
+        }
+        indexed - base
     }
 
     // ── Liveness ────────────────────────────────────────────────────
@@ -2001,6 +2062,18 @@ impl Worker for BasicWorker {
                 revision: self.revision(),
             });
         }
+    }
+
+    fn note_admitted(&self) {
+        self.runtime.load().note_admitted();
+    }
+
+    fn admitted_age(&self) -> Duration {
+        self.runtime.load().admitted_age()
+    }
+
+    fn warmup_growth(&self, indexed: usize) -> usize {
+        self.runtime.load().warmup_growth(indexed)
     }
 
     fn is_available(&self) -> bool {
@@ -3935,5 +4008,23 @@ mod tests {
         worker.set_completion_sink(None);
         drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None));
         assert_eq!(spy.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn warm_up_growth_is_measured_since_admission_and_survives_a_clear() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        // A returned worker is first seen with its stale blocks still indexed:
+        // those are the baseline, not growth.
+        assert_eq!(runtime.warmup_growth(2000), 0);
+        assert_eq!(runtime.warmup_growth(2100), 100);
+        // The restart is detected and the index cleared: growth restarts from
+        // zero, not from a baseline the index no longer holds.
+        assert_eq!(runtime.warmup_growth(50), 50);
+        assert_eq!(runtime.warmup_growth(700), 700);
+        // Admitted again: a fresh baseline.
+        thread::sleep(Duration::from_millis(2));
+        runtime.note_admitted();
+        assert_eq!(runtime.warmup_growth(900), 0);
+        assert_eq!(runtime.warmup_growth(1300), 400);
     }
 }

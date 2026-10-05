@@ -45,7 +45,53 @@ pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 const WEDGE_PILE: usize = 4;
 
 static THRESHOLDS: OnceLock<(Duration, Duration)> = OnceLock::new();
+static WARMUP: OnceLock<Warmup> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// The warm-up slice: for `secs` after a worker becomes routable, until its
+/// index has grown by `blocks` blocks, one cache miss in `1 / share` is
+/// routed to it (the least-loaded warming worker) so it builds a cache
+/// instead of idling behind the fleet's affinity. `share == 0` disables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Warmup {
+    pub secs: Duration,
+    pub share: f32,
+    pub blocks: usize,
+}
+
+impl Warmup {
+    /// Whether a worker admitted `age` ago whose index has gained
+    /// `indexed_blocks` blocks since (`None` when the index has never seen it)
+    /// is still warming up.
+    pub(crate) fn applies(&self, age: Duration, indexed_blocks: Option<usize>) -> bool {
+        self.share > 0.0
+            && age < self.secs
+            && indexed_blocks.is_none_or(|blocks| blocks < self.blocks)
+    }
+
+    /// Every how many misses one goes to a warming worker.
+    pub(crate) fn period(&self) -> u64 {
+        if self.share <= 0.0 {
+            return u64::MAX;
+        }
+        ((1.0 / f64::from(self.share)).round() as u64).max(1)
+    }
+}
+
+const DEFAULT_WARMUP: Warmup = Warmup {
+    secs: Duration::from_secs(60),
+    share: 0.25,
+    blocks: 1024,
+};
+
+/// Set the warm-up slice from the gateway configuration; the first call wins.
+pub(crate) fn configure_warmup(warmup: Warmup) {
+    let _ = WARMUP.set(warmup);
+}
+
+pub(crate) fn warmup() -> Warmup {
+    WARMUP.get().copied().unwrap_or(DEFAULT_WARMUP)
+}
 
 /// Set the stall and wedge thresholds from the gateway configuration. The
 /// first call wins; the defaults are two and three seconds.
@@ -229,6 +275,7 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
         }
         None => {
             info!(worker_url = %worker.url(), cause, "Worker re-admitted by liveness");
+            worker.note_admitted();
             if let Some(previous) = previous {
                 Metrics::set_worker_stalled(worker.url(), previous.as_str(), false);
             }
@@ -319,6 +366,44 @@ mod tests {
         );
         on_token_progress(&w);
         assert!(w.stall_reason().is_none());
+    }
+
+    #[test]
+    fn warm_up_ends_with_time_or_blocks_and_slices_by_share() {
+        let warmup = DEFAULT_WARMUP;
+        assert!(
+            warmup.applies(Duration::from_secs(10), None),
+            "never indexed"
+        );
+        assert!(warmup.applies(Duration::from_secs(10), Some(100)));
+        assert!(
+            !warmup.applies(Duration::from_secs(61), Some(100)),
+            "too old"
+        );
+        assert!(
+            !warmup.applies(Duration::from_secs(10), Some(2048)),
+            "warm already"
+        );
+        assert_eq!(warmup.period(), 4);
+        let off = Warmup {
+            share: 0.0,
+            ..warmup
+        };
+        assert!(!off.applies(Duration::ZERO, None));
+        assert_eq!(off.period(), u64::MAX);
+    }
+
+    #[test]
+    fn re_admission_restarts_the_warm_up_clock() {
+        let w = worker();
+        std::thread::sleep(Duration::from_millis(20));
+        let before = w.admitted_age();
+        set(&w, Some(StallReason::Unreachable), "test");
+        on_contact(&w);
+        assert!(
+            w.admitted_age() < before,
+            "cleared veto counts as an admission"
+        );
     }
 
     #[test]

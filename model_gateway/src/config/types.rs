@@ -106,6 +106,15 @@ pub struct RouterConfig {
     /// new requests stop being routed to it until it makes progress.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
+    /// Warm-up slice for cache-aware routing: for this many seconds after a
+    /// worker becomes routable, until its index has grown by
+    /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
+    #[serde(default = "default_worker_warmup_secs")]
+    pub worker_warmup_secs: u64,
+    #[serde(default = "default_worker_warmup_share")]
+    pub worker_warmup_share: f32,
+    #[serde(default = "default_worker_warmup_blocks")]
+    pub worker_warmup_blocks: usize,
     /// How long a disaggregated (PD) dispatch waits for a slot in the decode
     /// engine's running window before shedding. Must stay well under the
     /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
@@ -410,6 +419,18 @@ fn default_worker_stall_secs() -> u64 {
 
 fn default_worker_wedge_secs() -> u64 {
     3
+}
+
+fn default_worker_warmup_secs() -> u64 {
+    60
+}
+
+fn default_worker_warmup_share() -> f32 {
+    0.25
+}
+
+fn default_worker_warmup_blocks() -> usize {
+    1024
 }
 
 fn default_pd_admission_wait_secs() -> u64 {
@@ -1219,6 +1240,9 @@ impl Default for RouterConfig {
             load_monitor_interval_secs: 10,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
+            worker_warmup_secs: default_worker_warmup_secs(),
+            worker_warmup_share: default_worker_warmup_share(),
+            worker_warmup_blocks: default_worker_warmup_blocks(),
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
             worker_overload_protection: false,

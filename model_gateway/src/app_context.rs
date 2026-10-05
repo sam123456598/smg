@@ -692,6 +692,11 @@ impl AppContextBuilder {
             Duration::from_secs(config.worker_stall_secs),
             Duration::from_secs(config.worker_wedge_secs),
         );
+        liveness::configure_warmup(liveness::Warmup {
+            secs: Duration::from_secs(config.worker_warmup_secs),
+            share: config.worker_warmup_share,
+            blocks: config.worker_warmup_blocks,
+        });
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);

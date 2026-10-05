@@ -2351,6 +2351,10 @@ impl WorkerRegistry {
         }
 
         worker.set_status(new_status);
+        if new_status == WorkerStatus::Ready {
+            // The warm-up slice (cache_aware) counts from here.
+            worker.note_admitted();
+        }
 
         let _ = self.event_tx.send(WorkerEvent::StatusChanged {
             worker_id: worker_id.clone(),
