@@ -1299,8 +1299,8 @@ async fn get_tokenizer_without_a_tokenizer_dir_is_refused() {
 /// `SubscribeKvEvents` without a publisher is UNIMPLEMENTED with the Python
 /// servicer's message. With one configured, the call resolves before any
 /// event (headers go out eagerly, as the Python relay's initial metadata),
-/// batches arrive under the publisher's sequence numbers, and dropping the
-/// stream closes the subscription on the publisher's side.
+/// batches arrive under the publisher's sequence numbers, and stopping the
+/// servicer closes the subscription on the publisher's side.
 #[tokio::test]
 async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
     use zeromq::{prelude::*, PubSocket, SocketEvent};
@@ -1385,7 +1385,11 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
     assert_eq!(stored.blocks[0].block_hash, 42);
     assert_eq!(stored.blocks[0].token_ids, vec![100, 101]);
 
+    // The relay keeps its publisher subscription for the servicer's
+    // lifetime (its history outlives any one stream); stopping the servicer
+    // closes it.
     drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
     let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(event) = monitor.next().await {
             if matches!(event, SocketEvent::Disconnected(_)) {
@@ -1395,9 +1399,8 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         false
     })
     .await
-    .expect("the publisher notices the dropped stream in time");
+    .expect("the publisher notices the stopped servicer in time");
     assert!(disconnected);
-    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// `FlushCache`, under the Python servicer's `admin.flush_cache` contract.

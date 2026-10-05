@@ -115,6 +115,9 @@ pub struct SglangServicerConfig {
 
 pub(super) struct State {
     pub(super) model: SglangModelInfo,
+    /// The KV-event relay for the engine's ZMQ publisher; `None` when events
+    /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
+    pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     /// The local tokenizer directory `GetTokenizer` bundles; `None` when none
     /// resolved.
     pub(super) tokenizer_dir: Option<String>,
@@ -201,9 +204,15 @@ impl SglangServicerServer {
                 return Err(invalid(&format!("{name} must be a JSON object")));
             }
         }
+        let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
+            &config.model.kv_events_endpoint,
+            None,
+            &config.model.kv_events_topic,
+        );
         let state = Arc::new(State {
             tokenizer_dir: config.tokenizer_dir.clone(),
             model: config.model,
+            kv_relay,
             engine: EngineLink::default(),
             registry: Arc::new(RequestRegistry::default()),
             serving: AtomicBool::new(true),

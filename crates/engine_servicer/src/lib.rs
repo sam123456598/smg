@@ -20,6 +20,7 @@ mod engine_link;
 mod error;
 mod health;
 mod kv_events;
+mod kv_history;
 pub mod kv_wire;
 mod proto_json;
 mod requests;

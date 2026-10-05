@@ -920,7 +920,7 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
 
 /// With a publisher configured, `SubscribeKvEvents` relays it: the call
 /// resolves before any event, batches arrive under the publisher's sequence
-/// numbers, and dropping the stream closes the subscription.
+/// numbers, and stopping the servicer closes the subscription.
 #[tokio::test]
 async fn subscribe_kv_events_relays_a_configured_publisher() {
     use zeromq::{prelude::*, PubSocket, SocketEvent};
@@ -967,7 +967,11 @@ async fn subscribe_kv_events_relays_a_configured_publisher() {
     assert_eq!(first.sequence_number, 0);
     assert_eq!(first.events.len(), 4);
 
+    // The relay keeps its publisher subscription for the servicer's
+    // lifetime (its history outlives any one stream); stopping the servicer
+    // closes it.
     drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
     let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(event) = monitor.next().await {
             if matches!(event, SocketEvent::Disconnected(_)) {
@@ -977,9 +981,8 @@ async fn subscribe_kv_events_relays_a_configured_publisher() {
         false
     })
     .await
-    .expect("the publisher notices the dropped stream in time");
+    .expect("the publisher notices the stopped servicer in time");
     assert!(disconnected);
-    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// What neither servicer serves is reported, not emulated.

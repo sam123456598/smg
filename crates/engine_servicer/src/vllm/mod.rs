@@ -181,6 +181,9 @@ pub(super) struct Stats {
 
 pub(super) struct State {
     pub(super) model: VllmModelInfo,
+    /// The KV-event relay for the engine's ZMQ publisher; `None` when events
+    /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
+    pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     pub(super) stats: Stats,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.
@@ -288,9 +291,15 @@ impl VllmServicerServer {
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
+        let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
+            &config.model.kv_events_endpoint,
+            Some(&config.model.kv_events_replay_endpoint),
+            &config.model.kv_events_topic,
+        );
         let state = Arc::new(State {
             tokenizer_dir: config.tokenizer_dir.clone(),
             model: config.model,
+            kv_relay,
             stats: Stats::default(),
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),

@@ -23,7 +23,7 @@ consequences shape the gateway's rules:
 
 | Server | `start_sequence_number != 0` | History gone | Snapshot | Ranks |
 |---|---|---|---|---|
-| Rust `engine_servicer` relay (vLLM, SGLang, TokenSpeed) | ignored: streams live from the publisher's current position | `DATA_LOSS` when the publisher's sequence goes backwards (a restart); gaps never signalled | none | relays rank 0 only |
+| Rust `engine_servicer` relay (vLLM, SGLang, TokenSpeed) | served from the relay's bounded history when the cursor is inside the window (the last `SMG_KV_EVENT_HISTORY_BATCHES` batches, 10,000 by default, within `SMG_KV_EVENT_HISTORY_BYTES`, 256 MiB), then live; `OUT_OF_RANGE` below the window, beyond the newest sequence, or before the relay's own start; a cursor of 0 gets the whole window when it is complete from the publisher's first batch, else live only | `DATA_LOSS` on a publisher restart (its sequence going backwards on the relay's socket); the relay's own gaps are filled from the engine's replay socket, and what the replay cannot give is a hole in the window that a resume skips, so the gateway settles it once instead of looping | none | relays rank 0 only |
 | Python servicers (SGLang, vLLM) | replay when the engine offers one; `OUT_OF_RANGE` when it cannot honour a non-zero start | `DATA_LOSS` on a publisher restart or an unverifiable replay | none ("zero starts live rebuilding") | every DP rank, `dp_rank` set, a cursor per rank |
 | `mock-worker --engine realistic` | replays its buffer `> cursor`, then live | never signalled (the publisher-restart fault hook keeps the stream up) | none | rank 0 |
 
@@ -236,8 +236,15 @@ failed round trip and exposes them as metrics.
 
 ### 5. Servicer-side changes that need no proto change
 
-- The Rust relay should answer a non-zero cursor it cannot honour with `OUT_OF_RANGE` instead of
-  silently streaming live, and keep a bounded replay buffer (vLLM's own `buffer_steps` is 10,000
-  batches; the relay sits next to it and can mirror the last N).
+- Done on the Rust relay: a non-zero cursor it cannot honour is `OUT_OF_RANGE`, and one
+  subscription per engine keeps a bounded history (the engines' `buffer_steps`, 10,000, within a
+  byte budget) that serves resumes before live events. Its counters are logged with every gap,
+  restart and refusal (the servicer has no metrics endpoint): `relayed`, `undecodable_batches`,
+  `served_from_history`, `out_of_range`, `publisher_gaps`, `gap_batches_recovered`,
+  `gap_batches_lost`, `publisher_restarts`, `subscribers_lagged`. Read them next to the gateway's
+  `smg_kv_event_gaps_total{outcome}` and `smg_kv_event_resyncs_total{reason}`: a drop drill should
+  show `publisher_gaps` and `gap_batches_recovered` on the relay and `replay_requested` with no
+  `unrecovered` outcome on the gateway; a restart drill `publisher_restarts` on the relay and
+  `data_loss` or `publisher_restart` on the gateway.
 - The SGLang servicer should request replays in chunks below libzmq's send high-water mark so a
   long replay is not truncated into a second gap.

@@ -107,6 +107,9 @@ pub struct TokenSpeedServicerConfig {
 
 pub(super) struct State {
     pub(super) model: TokenSpeedModelInfo,
+    /// The KV-event relay for the engine's ZMQ publisher; `None` when events
+    /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
+    pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.
     pub(super) tokenizer_dir: Option<String>,
@@ -206,9 +209,15 @@ impl TokenSpeedServicerServer {
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
+        let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
+            &config.model.kv_events_endpoint,
+            None,
+            &config.model.kv_events_topic,
+        );
         let state = Arc::new(State {
             tokenizer_dir: config.tokenizer_dir.clone(),
             model: config.model,
+            kv_relay,
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),
             registry: Arc::new(RequestRegistry::default()),
