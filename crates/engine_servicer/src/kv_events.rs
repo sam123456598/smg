@@ -195,6 +195,10 @@ struct Shared {
     history: History,
     /// The last sequence relayed in this incarnation, or none yet.
     cursor: Option<u64>,
+    /// The first sequence relayed in this incarnation: the relay holds
+    /// nothing from before it, which is how a relay that started (or
+    /// restarted) after the publisher tells a resume from before its time.
+    started_at: Option<u64>,
     /// Counts the publisher's restarts; sequences compare within one.
     generation: u64,
     counts: RelayCounts,
@@ -268,6 +272,7 @@ impl Shared {
         self.generation += 1;
         self.history.clear();
         self.cursor = None;
+        self.started_at = None;
         self.counts.publisher_restarts += 1;
         self.generation
     }
@@ -323,6 +328,7 @@ impl KvEventRelay {
             shared: Arc::new(Mutex::new(Shared {
                 history: History::new(config.history_batches, config.history_bytes),
                 cursor: None,
+                started_at: None,
                 generation: 0,
                 counts: RelayCounts::default(),
                 failed: None,
@@ -411,10 +417,18 @@ impl KvEventRelay {
                                 "SubscribeKvEvents: the relay for {endpoint} holds no history \
                                  yet (it started after the publisher); resubscribe from zero"
                             ),
-                            Window::Behind { oldest } => format!(
-                                "SubscribeKvEvents: the relay for {endpoint} keeps history from \
-                                 sequence {oldest}, after cursor {cursor}; resubscribe from zero"
-                            ),
+                            Window::Behind { oldest } => match shared.started_at {
+                                Some(started) if cursor + 1 < started => format!(
+                                    "SubscribeKvEvents: the relay for {endpoint} started at \
+                                     sequence {started} and holds nothing before it; resubscribe \
+                                     from zero"
+                                ),
+                                _ => format!(
+                                    "SubscribeKvEvents: the relay for {endpoint} keeps history \
+                                     from sequence {oldest}, after cursor {cursor}; resubscribe \
+                                     from zero"
+                                ),
+                            },
                             Window::Ahead { newest } => format!(
                                 "SubscribeKvEvents: cursor {cursor} is beyond the publisher's \
                                  last sequence {newest} at {endpoint}: the publisher restarted; \
@@ -645,6 +659,9 @@ impl Relaying<'_> {
         {
             let mut shared = lock(self.shared);
             shared.history.push(sequence, Arc::clone(&batch));
+            if shared.started_at.is_none() {
+                shared.started_at = Some(sequence);
+            }
             shared.cursor = Some(sequence);
             shared.counts.relayed += 1;
             if undecodable {
@@ -1416,6 +1433,7 @@ mod tests {
         let mut shared = Shared {
             history: History::new(10, usize::MAX),
             cursor: Some(500),
+            started_at: Some(0),
             generation: 0,
             counts: RelayCounts::default(),
             failed: None,
@@ -1525,6 +1543,43 @@ mod tests {
         assert_eq!(read(&mut fresh).await.sequence_number, 2);
         let mut resumed = lab.subscribe(1).expect("inside the new window");
         assert_eq!(read(&mut resumed).await.sequence_number, 2);
+    }
+
+    /// A relay that comes up (or back up) while the publisher is already
+    /// counting holds nothing from before its first sequence: a cursor from
+    /// before it is refused, so the gateway clears and resubscribes from zero
+    /// instead of trusting a window with a silent gap in front of it.
+    #[tokio::test]
+    async fn a_relay_that_started_after_the_publisher_refuses_cursors_from_before_it() {
+        let mut late = start_lab(100, false).await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        for _ in 0..250 {
+            late.publish(5, &batch2).await;
+            if late.relay.counts().relayed >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            late.relay.counts().relayed,
+            1,
+            "the relay saw sequence 5 first"
+        );
+        let status = refused(late.subscribe(3));
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+        assert!(
+            status.message().contains("started at sequence 5"),
+            "{}",
+            status.message()
+        );
+        // Nothing is missing between cursor 4 and the relay's start.
+        let mut resumed = late.subscribe(4).expect("nothing missed");
+        assert_eq!(read(&mut resumed).await.sequence_number, 5);
+        let mut fresh = late.subscribe(0).expect("live");
+        late.publish(6, &batch2).await;
+        assert_eq!(read(&mut fresh).await.sequence_number, 6);
+        assert_eq!(read(&mut resumed).await.sequence_number, 6);
+        assert_eq!(late.relay.counts().out_of_range, 1);
     }
 
     #[tokio::test]
