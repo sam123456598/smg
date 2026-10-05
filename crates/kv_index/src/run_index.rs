@@ -92,6 +92,8 @@ const WORD_DIR: usize = 1 << 12;
 /// Hash array capacities: multiples of 8 up to 128, then powers of two.
 const SMALL_ARRAY_CLASSES: usize = 16;
 const ARRAY_CLASSES: usize = SMALL_ARRAY_CLASSES + 4 * 13;
+/// Classes above the wanted one an allocation may take a freed array from (one octave).
+const ARRAY_FIT_SPAN: usize = 4;
 /// Child table slot counts: powers of two from 2.
 const MIN_TABLE_SLOTS: usize = 2;
 const TABLE_CLASSES: usize = 27;
@@ -254,10 +256,20 @@ impl WordArena {
 
     /// A hash array holding `contents` with room for at least `capacity`; returns the data start.
     fn alloc_array(&self, contents: &[u64], capacity: usize) -> u32 {
-        let class = array_class(capacity.max(contents.len()).max(8));
+        let wanted = array_class(capacity.max(contents.len()).max(8));
+        // A freed array of the wanted class, else of one up to an octave larger: fresh words
+        // are bumped only when nothing in that range is free, so the free lists of neighbouring
+        // classes do not fill while others bump (churn moves arrays between classes as runs
+        // grow and die).
+        let (class, recycled) = (wanted..ARRAY_CLASSES.min(wanted + ARRAY_FIT_SPAN + 1))
+            .find_map(|class| self.free_arrays[class].pop().map(|start| (class, start)))
+            .unwrap_or((wanted, 0));
         let capacity = class_capacity(class);
-        let recycled = self.free_arrays[class].pop();
-        let start = recycled.unwrap_or_else(|| self.bump(capacity + 2));
+        let start = if recycled == 0 {
+            self.bump(capacity + 2)
+        } else {
+            recycled
+        };
         let data = start + 2;
         for (slot, &hash) in self.words(data, contents.len()).iter().zip(contents) {
             slot.store(hash, Ordering::Relaxed);
