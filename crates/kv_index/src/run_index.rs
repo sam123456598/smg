@@ -47,7 +47,11 @@
 //! (`engine_hash_at`), which is what lets a slot be 8 bytes. The invariant behind it is that
 //! every engine names a block by the same hash; a worker whose engine does not (`engine_conflicts`
 //! in the stats) keeps those keys in its lane map's exact side table and loses nothing but the
-//! smaller slot.
+//! smaller slot. The engine hash is also a chain hash (a hash of the parent's hash and the
+//! block's content), which is what lets a store walk match a run by one engine hash at the end
+//! of its window instead of a content hash per block (`match_run`); the content hash at the
+//! landing is still checked, and a store that fails it (`landing_mismatches`) is placed by its
+//! content, block by block.
 //!
 //! Memory: 16 bytes per distinct block on a chain (its content hash and its engine hash, shared
 //! by every worker that holds it, with about 12% slack for growth) plus a 64-byte run header, the
@@ -1077,6 +1081,10 @@ pub struct RunIndexStats {
     /// Stored blocks whose engine hash differed from the one the index carries for the block
     /// (an engine fleet that does not agree on hashes); they live in the lane maps' side tables.
     pub engine_conflicts: usize,
+    /// Stores whose blocks carried the engine hashes the index holds for other content: what
+    /// the relay's hash check refuses at the engine, seen from the index. Such a store is
+    /// placed by its content, so the index stays exact; the count names a broken engine.
+    pub landing_mismatches: usize,
 }
 
 /// Where a writer waited: the root, a leaf only this worker holds, or a run others hold too.
@@ -1193,6 +1201,8 @@ pub struct RunIndex {
     /// Stored blocks whose engine hash was not the one the index carries (kept in the lane
     /// maps' exact side tables).
     engine_conflicts: AtomicUsize,
+    /// Stores whose blocks carried the engine hashes the index holds for other content.
+    landing_mismatches: AtomicUsize,
     #[cfg(feature = "lane-stats")]
     counters: LaneCounters,
 }
@@ -1327,6 +1337,7 @@ impl RunIndex {
                 .map(|_| CachePadded::new(AtomicIsize::new(0)))
                 .collect(),
             engine_conflicts: AtomicUsize::new(0),
+            landing_mismatches: AtomicUsize::new(0),
             #[cfg(feature = "lane-stats")]
             counters: LaneCounters::default(),
         }
@@ -2183,19 +2194,13 @@ impl RunIndex {
                 } else {
                     let data = window.block + window.base + offset as u32;
                     let hashes = self.arena.words(data, len - offset);
-                    let matched = remaining
-                        .iter()
-                        .zip(hashes)
-                        .take_while(|(stored, slot)| {
-                            stored.content_hash.0 == slot.load(Ordering::Relaxed)
-                        })
-                        .count();
+                    let engines = self
+                        .arena
+                        .words(window.engine + window.base + offset as u32, len - offset);
+                    let (matched, conflicts) = self.match_run(hashes, engines, remaining, false);
                     let diverge = matched < len - offset && matched < remaining.len();
                     if !diverge && offset + matched <= held {
-                        let engines = self
-                            .arena
-                            .words(window.engine + window.base + offset as u32, matched);
-                        Plan::Skip(matched, engine_conflicts(&remaining[..matched], engines))
+                        Plan::Skip(matched, conflicts)
                     } else {
                         Plan::Lock
                     }
@@ -2342,6 +2347,72 @@ impl RunIndex {
         }
     }
 
+    /// How far `remaining` continues a run whose hashes from the position in hand are `contents`
+    /// and `engines`: the matched count and the matched positions whose engine hash is not the
+    /// one the index carries.
+    ///
+    /// An engine hash is a chain hash: an engine names a block by a hash of its parent's hash and
+    /// the block's own content, so two chains that agree at a position agree at every position
+    /// before it. The match is therefore decided by the engine hash at the end of the window,
+    /// and on a mismatch by bisection to the first differing position, instead of a content
+    /// compare per block. Two checks keep it exact for a worker whose engine breaks the
+    /// assumption, both by falling back to the compare per block: the content hash at the
+    /// landing (a block named by the hash the index carries but holding other content, which
+    /// is what the relay's hash check exists to catch; `landing_mismatches` counts it), and the
+    /// content hash right after the match (an engine that hashes the same content differently
+    /// matches by content where it cannot by engine hash, and its keys belong in the lane map's
+    /// side table).
+    ///
+    /// `count` says whether a landing mismatch is counted: the lock-free look at a run finds it
+    /// first and then takes the lock, where the locked look finds it again.
+    fn match_run(
+        &self,
+        contents: &[AtomicU64],
+        engines: &[AtomicU64],
+        remaining: &[StoredBlock],
+        count: bool,
+    ) -> (usize, Vec<usize>) {
+        let window = remaining.len().min(contents.len()).min(engines.len());
+        if window == 0 {
+            return (0, Vec::new());
+        }
+        let engine_eq = |at: usize| remaining[at].seq_hash.0 == engines[at].load(Ordering::Relaxed);
+        let content_eq =
+            |at: usize| remaining[at].content_hash.0 == contents[at].load(Ordering::Relaxed);
+        let matched = if engine_eq(window - 1) {
+            window
+        } else {
+            // The positions that agree are a prefix: find the first that does not.
+            let (mut low, mut high) = (0usize, window - 1);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if engine_eq(mid) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            low
+        };
+        let landing_holds = matched == 0 || content_eq(matched - 1);
+        let same_content_after = matched < window && content_eq(matched);
+        if landing_holds && !same_content_after {
+            return (matched, Vec::new());
+        }
+        if !landing_holds && count {
+            self.landing_mismatches.fetch_add(1, Ordering::Relaxed);
+        }
+        let matched = remaining
+            .iter()
+            .zip(contents)
+            .take_while(|(stored, slot)| stored.content_hash.0 == slot.load(Ordering::Relaxed))
+            .count();
+        (
+            matched,
+            engine_conflicts(&remaining[..matched], &engines[..matched]),
+        )
+    }
+
     /// Blocks of a run `worker` holds, read from a snapshot (no lock).
     #[inline]
     fn held_in(&self, run_id: u32, window: &Window, worker: u32) -> usize {
@@ -2393,15 +2464,10 @@ impl RunIndex {
         let base = run.base.load(Ordering::Relaxed) + offset as u32;
         let data = run.block.load(Ordering::Relaxed) + base;
         let hashes = self.arena.words(data, len - offset);
-        let matched = remaining
-            .iter()
-            .zip(hashes)
-            .take_while(|(stored, slot)| stored.content_hash.0 == slot.load(Ordering::Relaxed))
-            .count();
         let engines = self
             .arena
-            .words(run.engine.load(Ordering::Relaxed) + base, matched);
-        let conflicts = engine_conflicts(&remaining[..matched], engines);
+            .words(run.engine.load(Ordering::Relaxed) + base, len - offset);
+        let (matched, conflicts) = self.match_run(hashes, engines, remaining, true);
         let available = len - offset;
         let reach = offset + matched;
         if matched < available && matched < remaining.len() {
@@ -2928,6 +2994,7 @@ impl RunIndex {
             header_bytes: allocated * (size_of::<Run>() + self.words * size_of::<AtomicU64>()),
             slab_bytes: self.slab.chunk_bytes(),
             engine_conflicts: self.engine_conflicts.load(Ordering::Relaxed),
+            landing_mismatches: self.landing_mismatches.load(Ordering::Relaxed),
             ..RunIndexStats::default()
         };
         for id in 1..allocated as u32 {
@@ -3508,6 +3575,149 @@ mod tests {
         for block in &blocks {
             assert!(index.is_held(&mw, block.seq_hash), "{:?}", block.seq_hash);
         }
+    }
+
+    /// A run is matched by its engine chain: a store that agrees to the end of the window is
+    /// taken whole on one compare, one that diverges inside is split exactly where the bisection
+    /// lands, one that stops short is a prefix, one that runs past the end extends; the
+    /// reference agrees on every block and no counter moves.
+    #[test]
+    fn stores_match_a_run_by_its_engine_chain() {
+        let index = RunIndex::with_max_workers(8);
+        let mut reference = ReferenceIndexer::new();
+        let chain: Vec<ContentHash> = (0..100).map(|p| content(5, p)).collect();
+        let mut forked = chain[..57].to_vec();
+        forked.extend((57..100).map(|p| content(6, p)));
+        let short = chain[..30].to_vec();
+        let longer: Vec<ContentHash> = (0..140).map(|p| content(5, p)).collect();
+        let mut early_fork = chain[..1].to_vec();
+        early_fork.extend((1..40).map(|p| content(7, p)));
+        let mut maps = Vec::new();
+        for (name, contents) in [
+            ("whole", &chain),
+            ("forked", &forked),
+            ("short", &short),
+            ("longer", &longer),
+            ("early", &early_fork),
+        ] {
+            let worker = index.intern_worker(name).expect("id");
+            let mut map = RunBlockMap::default();
+            index
+                .apply_stored(worker, &blocks_of(contents), None, &mut map)
+                .expect("store");
+            reference
+                .apply_stored(worker, &blocks_of(contents), None)
+                .expect("reference store");
+            maps.push((worker, map));
+        }
+        for query in [&chain, &forked, &short, &longer, &early_fork] {
+            let expected: Vec<(u32, u32)> = reference.find_matches(query).into_iter().collect();
+            assert_eq!(scores(&index, query), expected);
+        }
+        assert_eq!(index.debug_blocks(), reference.blocks());
+        // The run of the first 57 blocks is shared by four workers and the walk after the
+        // divergence took the fork's own run: a decode extension of the fork appends to it.
+        let (fork_worker, fork_map) = &mut maps[1];
+        let more: Vec<ContentHash> = (100..110).map(|p| content(6, p)).collect();
+        let mut extended = forked.clone();
+        extended.extend(more.iter().copied());
+        let blocks = blocks_of(&extended);
+        index
+            .apply_stored(
+                *fork_worker,
+                &blocks[100..],
+                Some(blocks[99].seq_hash),
+                fork_map,
+            )
+            .expect("extend");
+        reference
+            .apply_stored(*fork_worker, &blocks[100..], Some(blocks[99].seq_hash))
+            .expect("reference extend");
+        let expected: Vec<(u32, u32)> = reference.find_matches(&extended).into_iter().collect();
+        assert_eq!(scores(&index, &extended), expected);
+        let stats = index.stats();
+        assert_eq!(stats.engine_conflicts, 0);
+        assert_eq!(stats.landing_mismatches, 0);
+    }
+
+    /// A worker whose engine names the same content by other hashes cannot match by engine
+    /// hash; the walk sees the content continue past the mismatch, compares block by block and
+    /// sends that worker's keys to its side table: lookups, an extension after its own parent
+    /// hash and removals by its hashes all stay exact.
+    #[test]
+    fn a_worker_with_other_engine_hashes_matches_by_content() {
+        let index = RunIndex::with_max_workers(8);
+        let a = index.intern_worker("a").expect("id");
+        let b = index.intern_worker("b").expect("id");
+        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let chain: Vec<ContentHash> = (0..50).map(|p| content(8, p)).collect();
+        let blocks = blocks_of(&chain);
+        let other: Vec<StoredBlock> = blocks
+            .iter()
+            .map(|block| StoredBlock {
+                seq_hash: SequenceHash(block.seq_hash.0 ^ 0x5bd1_e995),
+                content_hash: block.content_hash,
+            })
+            .collect();
+        index
+            .apply_stored(a, &blocks[..40], None, &mut ma)
+            .expect("a");
+        index
+            .apply_stored(b, &other[..40], None, &mut mb)
+            .expect("b");
+        assert_eq!(scores(&index, &chain), vec![(a, 40), (b, 40)]);
+        assert_eq!(index.stats().engine_conflicts, 40);
+        assert_eq!(mb.overflow_len(), 40);
+        index
+            .apply_stored(b, &other[40..], Some(other[39].seq_hash), &mut mb)
+            .expect("b extends");
+        assert_eq!(scores(&index, &chain), vec![(a, 40), (b, 50)]);
+        let tail: Vec<SequenceHash> = other[20..].iter().map(|block| block.seq_hash).collect();
+        index.apply_removed(b, &tail, &mut mb);
+        assert_eq!(scores(&index, &chain), vec![(a, 40), (b, 20)]);
+        for block in &other[20..] {
+            assert!(!index.is_held(&mb, block.seq_hash));
+        }
+        for block in &other[..20] {
+            assert!(index.is_held(&mb, block.seq_hash));
+        }
+        assert_eq!(index.stats().landing_mismatches, 0);
+    }
+
+    /// A store that carries the engine hashes the index holds for other content (an engine
+    /// whose hashes do not follow its content, which the relay's hash check refuses) is counted
+    /// and placed by its content: the match ends where the content does.
+    #[test]
+    fn other_content_under_known_engine_hashes_is_counted_and_placed_by_content() {
+        let index = RunIndex::with_max_workers(8);
+        let a = index.intern_worker("a").expect("id");
+        let b = index.intern_worker("b").expect("id");
+        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let chain: Vec<ContentHash> = (0..20).map(|p| content(9, p)).collect();
+        let blocks = blocks_of(&chain);
+        let mut other = chain[..10].to_vec();
+        other.extend((10..20).map(|p| content(10, p)));
+        let impostor: Vec<StoredBlock> = blocks_of(&other)
+            .into_iter()
+            .zip(&blocks)
+            .map(|(block, known)| StoredBlock {
+                seq_hash: known.seq_hash,
+                content_hash: block.content_hash,
+            })
+            .collect();
+        index.apply_stored(a, &blocks, None, &mut ma).expect("a");
+        index.apply_stored(b, &impostor, None, &mut mb).expect("b");
+        assert_eq!(index.stats().landing_mismatches, 1);
+        assert_eq!(scores(&index, &chain), vec![(a, 20), (b, 10)]);
+        assert_eq!(scores(&index, &other), vec![(a, 10), (b, 20)]);
+        let mut reference = ReferenceIndexer::new();
+        reference.apply_stored(a, &blocks, None).expect("ref a");
+        reference.apply_stored(b, &impostor, None).expect("ref b");
+        assert_eq!(index.debug_blocks(), reference.blocks());
+        let hashes: Vec<SequenceHash> = impostor.iter().map(|block| block.seq_hash).collect();
+        index.apply_removed(b, &hashes, &mut mb);
+        assert_eq!(scores(&index, &other), vec![(a, 10)]);
+        assert!(mb.is_empty());
     }
 
     /// The race the release harness caught: a split of the parent between a store walk's plan
