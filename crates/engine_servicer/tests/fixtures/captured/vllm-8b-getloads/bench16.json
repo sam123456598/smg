@@ -1,0 +1,42 @@
+{
+ "label": "e69487f8-w0",
+ "base": "http://127.0.0.1:30100",
+ "num_prompts": 320,
+ "ok": 319,
+ "failed": 1,
+ "errors": [
+  "http 503"
+ ],
+ "rate_offered": 16.0,
+ "duration_s": 21.34,
+ "req_throughput": 14.95,
+ "num_prefixes": 16,
+ "prefix_len": 1024,
+ "suffix_len": 128,
+ "output_len": 64,
+ "prompt_tokens_median": 1152,
+ "cached_tokens_mean": 972.6,
+ "cache_hit_requests": 303,
+ "cached_reported": 319,
+ "ttft_ms": {
+  "50": 55.45,
+  "90": 88.88,
+  "99": 121.34
+ },
+ "tpot_ms": {
+  "50": 5.552,
+  "90": 7.229,
+  "99": 8.792
+ },
+ "itl_ms": {
+  "50": 3.727,
+  "90": 4.262,
+  "99": 30.933
+ },
+ "e2e_ms": {
+  "50": 412.7,
+  "90": 522.3,
+  "99": 638.8
+ },
+ "itl_zero_fraction": 0.0
+}

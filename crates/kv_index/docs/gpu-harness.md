@@ -216,6 +216,23 @@ healthy: wait for the `Tokenizer '<model>' ... registered` log line before loadi
   not compute.
 - `vllm serve` inside a container and from the host do not share the torch.compile / FlashInfer caches; warm the
   one you measure.
+- Never let two vLLM engines profile on the same GPU at the same time: the profiler reads device-wide free memory and
+  books another process's allocations made during its window as its own non-torch memory. Two engines started three
+  seconds apart on GPU 0 came up with 170 k and 621 k-token pools instead of 676 k and 754 k. Start the engines of one GPU
+  strictly one after the other (wait for `the servicer is SERVING`); different GPUs can start in parallel.
+- Do not edit a shell script while a run of it is still executing: bash reads the file incrementally and the running
+  instance picks up the shifted bytes (a series driver died with a syntax error after its last run). Copy, then edit.
+- The gateway polls `GetLoads` every `--load-monitor-interval` seconds (10 by default); the `smg_engine_*` gauges and the
+  expected-wait inputs are that stale. A per-second series must read the servicer directly (`fleet_series.py` does).
+- The e69487f8 relay serves a cursor-0 subscriber the engine's whole state only while its history still starts at
+  sequence 0 (10,000 batches / 256 MiB by default, two or three replays' worth); after that a fresh gateway on warm
+  engines learns nothing the engines already hold and routes on `event_miss` (99 % of selections in the branch census
+  of `gpu-harness-e69487f8.md` section 4). Run the fleet with `SMG_KV_EVENT_HISTORY_BATCHES=400000
+  SMG_KV_EVENT_HISTORY_BYTES=4294967296` (`scripts/relaunch-8b.sh`) or relaunch the engines before each series, and
+  check the servicer log for `serving from history cursor=0 batches=N` on every fresh gateway
+  (`RUST_LOG=info,engine_servicer::kv_events=debug`).
+- A host reboot takes every engine and gateway with it; the pid files stay behind. Check `kill -0 $(cat logs/host-*.pid)`
+  before trusting section 10, and check `uptime`.
 
 ## 7. Loop-head recipe (what the publication run repeats)
 
@@ -267,9 +284,27 @@ binding wheel from the same tree (`scripts/build-head.sh`, maturin `--compatibil
    Servicer parity: one cache_aware and one round-robin replay on the fleet running the 2d37b25a servicer wheel gave
    goodput 8.5 and 8.3 req/s at the restricted pool, inside the spread of the f4dc134b-servicer runs.
 
+10. Loop head e69487f8 (`gpu-harness-e69487f8.md`): the vLLM servicer's new load fields confirmed live on the 8B fleet
+   (`num_waiting_uncached_tokens` up to 472 k under a 96 x 8,192-token burst, `gen_throughput`, `cache_hit_rate`,
+   `num_used_tokens`, `utilization`; fixture `captured/vllm-8b-getloads/`); the gateway reads them every
+   `--load-monitor-interval` (10 s). Labelled replays: round robin unchanged (14.55 req/s, 87.1 %, 184/379/765 ms);
+   `cache_aware` with the live fields forms the mock's hot worker (one fallback target at KV 1.00 with 17-38 waiting), and
+   fresh gateways on warm engines went blind once the relay history window rolled (section 4). Clean series on fresh
+   engines with a session-long history: `cache_aware` 12.67 req/s / 79.0 % / TTFT p50-p90-p99 192-2159-4660 ms at the
+   default 10 s load poll, 14.73 / 90.9 % / 161-418-957 at `--load-monitor-interval 1` (round robin 14.3-14.6 / 86-87 %). Drills: an engine restart is detected at the first reconnect
+   (`out_of_range` resync at +20 s, before the engine is serving) instead of at the first batch; a gateway restart gets the
+   fleet's state from history in the first second with no resync and hit fraction 1.00 throughout.
+
 ## 10. What is running / where things are
 
-As of the end of round 4: host processes `8b-w0..w3` on the 2d37b25a servicer wheel (kept up for the policy comparison; 40 960 context, **12 000-block pools** for the restricted setting, drop `--num-gpu-blocks-override` for the full pool) (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.
+As of the end of the e69487f8 round (after the 13:45 host reboot; everything relaunched on the e69487f8 servicer wheel from
+`wheels-head5`, binaries in `~/.cargo/target-leap-gpu-harness-head/release/`): host processes `8b-w0..w3` (gRPC 20061-20064,
+full 676 k / 474 k-token pools), `drill-w0..w3` (20071-20074, `RUST_LOG=info,engine_servicer::kv_events=debug`), `http-8b`
+(:8104), `sgl-hicache` (:8202) and `sgl-dp2` (:8201, two visible GPUs); logs `logs/host-<name>.log`, pids
+`logs/host-<name>.pid`; the last labelled gateway may still be up on :30100 (`logs/gateway.pid`), the drill gateway on
+:30400 (`logs/gateway-drill.pid`). Results of the round: `gpu-harness-e69487f8.md`.
+
+As of the end of round 4 (superseded by the reboot): host processes `8b-w0..w3` on the 2d37b25a servicer wheel (kept up for the policy comparison; 40 960 context, **12 000-block pools** for the restricted setting, drop `--num-gpu-blocks-override` for the full pool) (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.
 
 - `~/smg-perf/gpu/scripts`: everything above; `fixtures/{vllm,sglang}`: raw captures and summaries;
   `results/`: bench JSONs, T4 table, anomaly note; `logs/`: container and gateway logs; `models/hub`: copies
