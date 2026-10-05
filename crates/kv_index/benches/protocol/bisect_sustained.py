@@ -158,7 +158,16 @@ def main() -> int:
         "--point-minutes", type=float, default=6.0, help="expected length of one point"
     )
     parser.add_argument("--cores", default="0-63", help="cores to check for foreign load")
-    parser.add_argument("--threshold-pct", type=float, default=5.0)
+    parser.add_argument(
+        "--threshold-pct", type=float, default=5.0, help="record foreign processes above this share"
+    )
+    parser.add_argument(
+        "--discard-pct",
+        type=float,
+        default=50.0,
+        help="a trial that fell short under a foreign process above this share is replaced",
+    )
+    parser.add_argument("--max-replacements", type=int, default=3, help="per point")
     parser.add_argument("--sample-seconds", type=float, default=1.0)
     parser.add_argument(
         "--allow", default="", help="regex of background processes to record, not flag"
@@ -184,18 +193,32 @@ def main() -> int:
     lo, hi = args.lo, args.hi
     points: list[dict] = []
 
+    def disturbed(trial: dict) -> bool:
+        """A trial that fell short while a foreign process sat above the discard threshold does
+        not count against the point; it is replaced, as the protocol runner replaces such trials."""
+        if trial["kept_up"]:
+            return False
+        return any(row["cpu_pct"] >= args.discard_pct for row in trial["foreign_load"])
+
     def measure(rate: float) -> bool:
         index = len(points)
-        trials = [run_trial(args, index, t, rate, out, lock) for t in range(args.trials)]
-        passed = all(t["kept_up"] for t in trials)
-        points.append({"rate": rate, "passed": passed, "trials": trials})
+        trials: list[dict] = []
+        replaced: list[dict] = []
+        attempt = 0
+        while len(trials) < args.trials and attempt < args.trials + args.max_replacements:
+            trial = run_trial(args, index, attempt, rate, out, lock)
+            attempt += 1
+            (replaced if disturbed(trial) else trials).append(trial)
+        passed = len(trials) == args.trials and all(t["kept_up"] for t in trials)
+        points.append({"rate": rate, "passed": passed, "trials": trials, "replaced": replaced})
         line = ", ".join(
             f"{t.get('ratio', 0) * 100:.1f}%{'' if t['kept_up'] else '!'}"
             + (" FL" if t["foreign_load"] else "")
             for t in trials
         )
+        note = f", {len(replaced)} replaced for foreign load" if replaced else ""
         print(
-            f"point {index}: {fmt_rate(rate)} offered -> {'pass' if passed else 'fail'} [{line}]",
+            f"point {index}: {fmt_rate(rate)} offered -> {'pass' if passed else 'fail'} [{line}]{note}",
             flush=True,
         )
         (out / "bracket.json").write_text(
