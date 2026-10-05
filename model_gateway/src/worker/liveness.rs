@@ -14,6 +14,10 @@
 //!   successful contact clears it. Health probes count as contact when they
 //!   pass; a failed probe is left to the health state machine, because probe
 //!   timeouts on a slow but streaming worker are not unreachability.
+//! - **wedged**: the worker still answers polls but has produced no token or
+//!   completion for the wedge threshold while it holds in-flight requests and
+//!   its waiting queue grows. Progress clears it. A paused engine that keeps
+//!   answering health looks exactly like this.
 //!
 //! Neither veto touches the worker's health status: the health checker keeps
 //! its own state machine, and the veto is simply gone once the worker talks.
@@ -33,6 +37,11 @@ const DEFAULT_WEDGE: Duration = Duration::from_secs(3);
 
 /// How often the sweep runs.
 pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
+
+/// In-flight requests this many deep with no token for the wedge threshold
+/// are a wedged engine even when nothing new arrives (a saturated client
+/// stops adding to the pile); fewer could be a long prefill.
+const WEDGE_PILE: usize = 4;
 
 static THRESHOLDS: OnceLock<(Duration, Duration)> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -98,7 +107,9 @@ pub(crate) fn on_contact_failed(worker: &Arc<dyn Worker>, what: &'static str) {
 /// Keepalive pings fail a dead connection within about two seconds, so this
 /// puts the exclusion at the threshold itself.
 pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
-    let stall = thresholds().0;
+    let (stall, wedge) = thresholds();
+    let load = worker.load();
+    let previous_load = worker.swap_load_sample(load);
     if worker.stall_reason().is_some() {
         return;
     }
@@ -110,11 +121,85 @@ pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
         );
         return;
     }
+    // The gateway's own view of a wedged engine: requests pile up on it and
+    // none has produced a token for the wedge threshold. Needs no poll.
+    if wedged_by_pile(load, previous_load, worker.token_progress_age(), wedge) {
+        set(
+            worker,
+            Some(StallReason::Wedged),
+            "in-flight requests pile up without progress",
+        );
+    }
+}
+
+/// A token or a completion from the worker: progress clears any veto.
+pub(crate) fn on_token_progress(worker: &Arc<dyn Worker>) {
+    worker.note_token_progress();
+    if worker.stall_reason().is_some() {
+        set(worker, None, "progress");
+    }
+}
+
+/// A load report: the engine answers, but does it move? Wedged when requests
+/// are in flight, the engine reports a waiting queue (or one that grew since
+/// the previous report) and no token or completion arrived within the wedge
+/// threshold.
+pub(crate) fn on_load_report(worker: &Arc<dyn Worker>, waiting: i64) {
+    let previous = worker.swap_waiting_reqs(waiting);
+    let (_, wedge) = thresholds();
+    match worker.stall_reason() {
+        Some(StallReason::Wedged) => {
+            if worker.token_progress_age() < wedge {
+                set(worker, None, "progress");
+            }
+        }
+        Some(StallReason::Unreachable) => {}
+        None => {
+            if wedged_by_queue(
+                worker.load(),
+                waiting,
+                previous,
+                worker.token_progress_age(),
+                wedge,
+            ) {
+                set(
+                    worker,
+                    Some(StallReason::Wedged),
+                    "no progress with a waiting queue",
+                );
+            }
+        }
+    }
 }
 
 /// The unreachable rule on its inputs.
 fn stalled(contact_age: Duration, stall: Duration) -> bool {
     contact_age >= stall
+}
+
+/// The wedged rule from an engine's load report: work in flight, a waiting
+/// queue (or one that grew), and silence for the wedge threshold.
+fn wedged_by_queue(
+    in_flight: usize,
+    waiting: i64,
+    previous: i64,
+    token_age: Duration,
+    wedge: Duration,
+) -> bool {
+    in_flight > 0 && (waiting > 0 || waiting > previous) && token_age >= wedge
+}
+
+/// The wedged rule from the gateway's own counters: the pile of in-flight
+/// requests grew, or is already deep, and nothing moved for the threshold.
+fn wedged_by_pile(
+    in_flight: usize,
+    previous_in_flight: usize,
+    token_age: Duration,
+    wedge: Duration,
+) -> bool {
+    token_age >= wedge
+        && in_flight > 0
+        && (in_flight > previous_in_flight || in_flight >= WEDGE_PILE)
 }
 
 fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static str) {
@@ -158,6 +243,46 @@ mod tests {
     }
 
     #[test]
+    fn wedged_by_queue_needs_in_flight_work_a_queue_and_silence() {
+        let wedge = DEFAULT_WEDGE;
+        assert!(wedged_by_queue(3, 5, 2, Duration::from_secs(4), wedge));
+        assert!(
+            wedged_by_queue(3, 5, 5, Duration::from_secs(4), wedge),
+            "a standing queue counts once the client stops adding to it"
+        );
+        assert!(
+            !wedged_by_queue(0, 5, 2, Duration::from_secs(4), wedge),
+            "nothing in flight"
+        );
+        assert!(
+            !wedged_by_queue(3, 0, 0, Duration::from_secs(4), wedge),
+            "no queue: a long prefill, not a wedge"
+        );
+        assert!(
+            !wedged_by_queue(3, 5, 2, Duration::from_secs(1), wedge),
+            "tokens still flowing"
+        );
+    }
+
+    #[test]
+    fn wedged_by_pile_needs_growth_or_depth_and_silence() {
+        let wedge = DEFAULT_WEDGE;
+        assert!(
+            wedged_by_pile(2, 1, Duration::from_secs(4), wedge),
+            "growing"
+        );
+        assert!(wedged_by_pile(4, 4, Duration::from_secs(4), wedge), "deep");
+        assert!(
+            !wedged_by_pile(1, 1, Duration::from_secs(4), wedge),
+            "one quiet request could be prefilling"
+        );
+        assert!(
+            !wedged_by_pile(8, 4, Duration::from_secs(1), wedge),
+            "tokens still flowing"
+        );
+    }
+
+    #[test]
     fn a_veto_removes_the_worker_from_routing_and_contact_restores_it() {
         let w = worker();
         assert!(w.stall_reason().is_none());
@@ -169,6 +294,20 @@ mod tests {
         on_contact(&w);
         assert!(w.stall_reason().is_none());
         assert!(!w.routing_state().stalled);
+    }
+
+    #[test]
+    fn a_wedged_veto_survives_polls_and_ends_with_progress() {
+        let w = worker();
+        set(&w, Some(StallReason::Wedged), "test");
+        on_contact(&w);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "answering a poll is not progress"
+        );
+        on_token_progress(&w);
+        assert!(w.stall_reason().is_none());
     }
 
     #[test]

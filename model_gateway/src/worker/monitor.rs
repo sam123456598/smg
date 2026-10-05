@@ -1166,6 +1166,13 @@ async fn group_monitor_loop(
                     .set_worker_overloaded(&worker, verdict);
             }
             if let Some(load) = response {
+                // The wedged rule reads the queue depth off every report.
+                let waiting: i64 = load
+                    .loads
+                    .iter()
+                    .map(|rank| i64::from(rank.num_waiting_reqs))
+                    .sum();
+                liveness::on_load_report(&worker, waiting);
                 // Only feed the DP-rank cache from responses that carry real
                 // absolute per-rank token counts. Ratio-only snapshots,
                 // which would otherwise poison with a fake `{0: 0}`

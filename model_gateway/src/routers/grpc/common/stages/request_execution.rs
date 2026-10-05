@@ -644,6 +644,11 @@ async fn execute_single(
             "start_generation_failed",
         )
     })?;
+    // Every response on this stream is progress for the worker (liveness).
+    let stream = match workers.single() {
+        Some(worker) => stream.tracked(Arc::clone(worker)),
+        None => stream,
+    };
 
     Ok(ExecutionResult::Single { stream })
 }

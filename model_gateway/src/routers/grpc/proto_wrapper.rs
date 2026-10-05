@@ -14,7 +14,7 @@ use std::{
     process,
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Arc, OnceLock,
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -42,9 +42,12 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::{
-    multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
-    zmq_client::ZmqGenerateStream,
+use crate::{
+    routers::grpc::{
+        multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+        zmq_client::ZmqGenerateStream,
+    },
+    worker::{liveness, Worker},
 };
 
 /// How a streaming response's per-token payloads (token ids, sampled
@@ -2519,6 +2522,16 @@ pub enum ProtoStream {
     /// An n>1 fan-out over rendezvous-room PD pairs: one child per sample,
     /// each response stamped with its sample's index (see [`FanoutStream`]).
     Fanout(FanoutStream),
+    /// Any of the above, with the worker it came from: every response is a
+    /// sign of life for that worker (see [`crate::worker::liveness`]).
+    Tracked(Box<TrackedStream>),
+}
+
+/// A [`ProtoStream`] paired with the worker serving it, so each response it
+/// yields counts as token progress for that worker.
+pub struct TrackedStream {
+    inner: ProtoStream,
+    worker: Arc<dyn Worker>,
 }
 
 /// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
@@ -2534,6 +2547,15 @@ fn reject_engine_error(
 }
 
 impl ProtoStream {
+    /// Count this stream's responses as progress for `worker`.
+    #[must_use]
+    pub fn tracked(self, worker: Arc<dyn Worker>) -> Self {
+        Self::Tracked(Box::new(TrackedStream {
+            inner: self,
+            worker,
+        }))
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let item = match self {
@@ -2570,6 +2592,13 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
+            Self::Tracked(tracked) => {
+                let item = Box::pin(tracked.inner.next()).await;
+                if matches!(item, Some(Ok(_))) {
+                    liveness::on_token_progress(&tracked.worker);
+                }
+                return item;
+            }
         };
         item.map(reject_engine_error)
     }
@@ -2584,6 +2613,7 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
+            Self::Tracked(stream) => stream.inner.mark_completed(),
         }
     }
 
@@ -2605,6 +2635,10 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
             Self::Zmq(stream) => Self::Zmq(stream),
             Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+            Self::Tracked(stream) => {
+                let TrackedStream { inner, worker } = *stream;
+                inner.defer_abort_until_first_item().tracked(worker)
+            }
         }
     }
 }
