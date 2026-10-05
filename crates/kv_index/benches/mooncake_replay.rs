@@ -1253,6 +1253,18 @@ fn run<B: ReplayBackend>(
             "issuer CPUs {overlap:?} overlap the backend CPU set; give lanes their own cores"
         );
     }
+    // The layout, first line of every run log, so the provenance shows it at a glance.
+    println!(
+        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores)",
+        issuer_threads,
+        issuer_cpus,
+        query_issuers,
+        query_cpus,
+        args.event_lanes,
+        args.query_lanes,
+        backend_cpus,
+        backend_cpus.len(),
+    );
     if window_ns != corpus.reference_window_ns {
         let reference = corpus.reference_window_ns.max(1) as u128;
         for op in &mut corpus.ops {
