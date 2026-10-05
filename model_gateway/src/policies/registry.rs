@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
 };
 
 use dashmap::DashMap;
@@ -28,8 +28,32 @@ use crate::{
     routers::common::header_utils::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
-    worker::{KvEventMonitor, Worker},
+    worker::{KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
 };
+
+/// Routes a request completion to the policy that placed the request: the
+/// prefill, decode or encode policy by worker type, else the model's policy.
+/// Holds the registry weakly so a worker outliving its registry reports to
+/// nobody instead of keeping the registry alive.
+#[derive(Debug)]
+struct PolicyCompletionSink {
+    registry: Weak<PolicyRegistry>,
+}
+
+impl RequestCompletionSink for PolicyCompletionSink {
+    fn request_completed(&self, worker: &dyn Worker) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let policy = match worker.worker_type() {
+            WorkerType::Prefill => registry.get_prefill_policy(),
+            WorkerType::Decode => registry.get_decode_policy(),
+            WorkerType::Encode => registry.get_encode_policy(),
+            WorkerType::Regular => registry.get_policy_or_default(worker.model_id()),
+        };
+        policy.on_request_complete(worker.url(), true);
+    }
+}
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -495,6 +519,15 @@ impl PolicyRegistry {
 
     /// Called when a worker is added
     /// Returns the policy that should be used for this worker's model
+    /// The request-completion observer to install on every worker (see
+    /// [`RequestCompletionSink`]): policies that book state at dispatch
+    /// release it when the request's load guard drops.
+    pub fn completion_sink(self: &Arc<Self>) -> Arc<dyn RequestCompletionSink> {
+        Arc::new(PolicyCompletionSink {
+            registry: Arc::downgrade(self),
+        })
+    }
+
     pub fn on_worker_added(
         &self,
         model_id: &str,
@@ -2366,5 +2399,81 @@ mod tests {
 
         registry.remove_worker_from_pd_cache_aware("http://prefill-1:8000");
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
+    }
+
+    /// A policy that remembers completions.
+    #[derive(Debug, Default)]
+    struct CompletionRecorder(std::sync::Mutex<Vec<String>>);
+
+    impl LoadBalancingPolicy for CompletionRecorder {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn on_request_complete(&self, worker_url: &str, _success: bool) {
+            self.0.lock().unwrap().push(worker_url.to_string());
+        }
+
+        fn name(&self) -> &'static str {
+            "completion_recorder"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn completion_sink_reports_to_the_policy_that_owns_the_worker_type() {
+        use crate::worker::{BasicWorkerBuilder, WorkerLoadGuard};
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let prefill_policy = Arc::new(CompletionRecorder::default());
+        let decode_policy = Arc::new(CompletionRecorder::default());
+        registry.set_prefill_policy(Arc::clone(&prefill_policy) as Arc<dyn LoadBalancingPolicy>);
+        registry.set_decode_policy(Arc::clone(&decode_policy) as Arc<dyn LoadBalancingPolicy>);
+        let sink = registry.completion_sink();
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:9000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:9000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let regular: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://regular:9000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        for worker in [&prefill, &decode, &regular] {
+            worker.set_completion_sink(Some(Arc::clone(&sink)));
+        }
+
+        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
+        drop(WorkerLoadGuard::new(Arc::clone(&decode), None));
+        // The regular worker's model policy (random) accepts the completion silently.
+        drop(WorkerLoadGuard::new(Arc::clone(&regular), None));
+
+        assert_eq!(
+            prefill_policy.0.lock().unwrap().as_slice(),
+            ["grpc://prefill:9000"]
+        );
+        assert_eq!(
+            decode_policy.0.lock().unwrap().as_slice(),
+            ["grpc://decode:9000"]
+        );
+
+        // A worker that outlives its registry reports to nobody.
+        drop(registry);
+        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
+        assert_eq!(prefill_policy.0.lock().unwrap().len(), 1);
     }
 }

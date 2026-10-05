@@ -22,8 +22,8 @@ pub trait WorkerScorer: Send + Sync + Debug {
 }
 
 /// Turns the scored candidates into a decision. A picker that keeps its own in-flight
-/// accounting (Ramjet's size-weighted reservations) learns about the host's final dispatch and
-/// about completions through the two hooks; both default to no-ops.
+/// accounting (size-weighted reservations released at completion) learns about the host's final
+/// dispatch and about completions through the hooks below; all default to no-ops.
 pub trait WorkerPicker: Send + Sync + Debug {
     fn pick(
         &self,

@@ -412,6 +412,15 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Decrement the load counter
     fn decrement_load(&self);
 
+    /// The request-completion observer installed on this worker, if any
+    /// (see [`RequestCompletionSink`]).
+    fn completion_sink(&self) -> Option<Arc<dyn RequestCompletionSink>> {
+        None
+    }
+
+    /// Install (or clear) the request-completion observer.
+    fn set_completion_sink(&self, _sink: Option<Arc<dyn RequestCompletionSink>>) {}
+
     /// Claim `count` PD bootstrap rooms while the worker's claimed total
     /// stays within `window`; a refusal claims nothing.
     ///
@@ -1496,6 +1505,16 @@ impl WorkerRuntime {
     }
 }
 
+/// Observer of request completions on a worker. The request's load guard
+/// notifies it when it drops, which is the one point every path that holds
+/// worker load (HTTP, gRPC, both PD legs, admitted prefill) passes through on
+/// success, error and client disconnect alike. The policy registry installs
+/// one on each worker it learns about, so policies that book state at
+/// dispatch (reservations, bookings) see the request end.
+pub trait RequestCompletionSink: Send + Sync + fmt::Debug {
+    fn request_completed(&self, worker: &dyn Worker);
+}
+
 /// Basic worker implementation
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
@@ -1537,12 +1556,16 @@ pub struct BasicWorker {
     pub http_client: Arc<LazyHttpClient>,
     /// Resolved resilience config (retry + circuit breaker settings).
     pub resilience: ResolvedResilience,
+    /// Request-completion observer, installed by the policy registry; shared
+    /// by clones so a DP-rank view reports to the same sink.
+    pub completion_sink: Arc<std::sync::RwLock<Option<Arc<dyn RequestCompletionSink>>>>,
 }
 
 impl Clone for BasicWorker {
     fn clone(&self) -> Self {
         Self {
             metadata: self.metadata.clone(),
+            completion_sink: Arc::clone(&self.completion_sink),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             backend_client: Arc::clone(&self.backend_client),
@@ -1960,6 +1983,20 @@ impl Worker for BasicWorker {
         rt.status() == WorkerStatus::Ready && !rt.is_overloaded() && rt.stall_reason().is_none()
     }
 
+    fn completion_sink(&self) -> Option<Arc<dyn RequestCompletionSink>> {
+        self.completion_sink
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_completion_sink(&self, sink: Option<Arc<dyn RequestCompletionSink>>) {
+        *self
+            .completion_sink
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sink;
+    }
+
     fn routing_state(&self) -> RoutingState {
         // One runtime guard covers status + load + processed + the overload veto
         // (all live in `self.runtime`); the circuit breaker is a separate
@@ -2293,6 +2330,11 @@ impl Drop for WorkerLoadGuard {
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.decrement_routing_key_load(key);
+        }
+        // Every request path releases its worker load here, so this is where
+        // policies learn that the request ended, whatever the outcome.
+        if let Some(sink) = self.worker.completion_sink() {
+            sink.request_completed(self.worker.as_ref());
         }
     }
 }
@@ -3811,5 +3853,52 @@ mod tests {
             !worker.zmq_connect_started.load(Ordering::SeqCst),
             "handshake guard must reset so a later probe can retry"
         );
+    }
+
+    /// Records which worker URLs reported a completion.
+    #[derive(Debug, Default)]
+    struct CompletionSpy(std::sync::Mutex<Vec<String>>);
+
+    impl RequestCompletionSink for CompletionSpy {
+        fn request_completed(&self, worker: &dyn Worker) {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(worker.url().to_string());
+        }
+    }
+
+    #[test]
+    fn load_guard_drop_reports_the_completion_to_the_installed_sink() {
+        let spy = Arc::new(CompletionSpy::default());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        worker.set_completion_sink(Some(Arc::clone(&spy) as Arc<dyn RequestCompletionSink>));
+
+        let guard = WorkerLoadGuard::with_key(Arc::clone(&worker), Some("session-a"));
+        let twin = guard.replicate();
+        assert_eq!(worker.load(), 2);
+        assert!(
+            spy.0.lock().unwrap().is_empty(),
+            "nothing completes while guards live"
+        );
+        drop(guard);
+        assert_eq!(worker.load(), 1);
+        assert_eq!(spy.0.lock().unwrap().as_slice(), ["http://w1:8000"]);
+        drop(twin);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            spy.0.lock().unwrap().len(),
+            2,
+            "each held load reports once"
+        );
+
+        // Without a sink the guard is exactly what it was.
+        worker.set_completion_sink(None);
+        drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None));
+        assert_eq!(spy.0.lock().unwrap().len(), 2);
     }
 }
