@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::engine::{Calibration, EngineParams, TimingModel};
+use crate::engine::{Calibration, EngineParams, LoadsLike, TimingModel};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -56,6 +56,8 @@ pub struct Config {
     pub kv_events_buffer_steps: usize,
     /// Which engine's wire the publishers speak.
     pub kv_events_wire: crate::kv_zmq::Wire,
+    /// Which backend's load report the workers imitate (`GetLoads`, `/v1/loads`).
+    pub loads_like: LoadsLike,
 }
 
 /// Timing flags collected while parsing; resolved into one [`TimingModel`]
@@ -144,6 +146,7 @@ impl Default for Config {
             kv_events_topic: String::new(),
             kv_events_buffer_steps: 10_000,
             kv_events_wire: crate::kv_zmq::Wire::Vllm,
+            loads_like: LoadsLike::Mock,
         }
     }
 }
@@ -230,6 +233,7 @@ impl Config {
                     cfg.kv_events_buffer_steps = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--kv-events-wire" => cfg.kv_events_wire = value(&mut args, &flag)?.parse()?,
+                "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
                 "--block-size" => {
                     cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?;
                     block_size_given = true;
@@ -358,6 +362,8 @@ fn usage() -> String {
        --kv-events-topic <s>    topic frame (default empty, as vLLM)\n\
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
+       --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
+                                vLLM servicer reports (running, waiting, token_usage, maxima)\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)"
         .to_string()

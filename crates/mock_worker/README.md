@@ -94,6 +94,7 @@ replay, which models the same loop):
 | `--prefix-cache` | true | prefix caching + KV events |
 | `--prefill-first` | false | SGLang-style prefill-only passes |
 | `--context-length` | 32768 | advertised context length |
+| `--loads-like` | mock | `vllm`: report only what the vLLM servicer reports (running, waiting, `token_usage`, maxima), so the gateway's expected-wait routes as it does on a vLLM fleet |
 | `--admin-port` | off | process-wide admin API (below) |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
 

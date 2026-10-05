@@ -471,7 +471,7 @@ pub enum GenEvent {
 }
 
 /// A point-in-time view of engine load, served via `GetLoads` / `/v1/loads`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LoadSnapshot {
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
@@ -1943,7 +1943,48 @@ impl SchedulerState {
     }
 }
 
+/// Which backend's load report the transports imitate. The vLLM servicer
+/// fills only `num_running_reqs`, `num_waiting_reqs`, `token_usage` and the
+/// maxima; the gateway's expected-wait then uses its default throughput and
+/// `waiting_reqs × mean prefill` instead of the queued token-work and live
+/// throughput the mock knows. Matching that makes routing on the mock agree
+/// with routing on a vLLM fleet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoadsLike {
+    /// Everything the simulator knows (SGLang-style report).
+    #[default]
+    Mock,
+    /// Only what the vLLM servicer reports.
+    Vllm,
+}
+
+impl std::str::FromStr for LoadsLike {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mock" | "sglang" => Ok(Self::Mock),
+            "vllm" => Ok(Self::Vllm),
+            other => Err(format!("--loads-like must be mock|vllm, got {other}")),
+        }
+    }
+}
+
 impl LoadSnapshot {
+    /// The snapshot as a backend of kind `like` would report it.
+    pub fn as_reported_by(&self, like: LoadsLike) -> Self {
+        match like {
+            LoadsLike::Mock => self.clone(),
+            LoadsLike::Vllm => Self {
+                num_waiting_uncached_tokens: 0,
+                num_used_tokens: 0,
+                gen_throughput: 0.0,
+                cache_hit_rate: 0.0,
+                ..self.clone()
+            },
+        }
+    }
+
     fn idle(p: &EngineParams) -> Self {
         Self {
             num_running_reqs: 0,
@@ -2466,6 +2507,79 @@ mod tests {
         assert!(matches!(
             TimingModel::fitted(&c),
             TimingModel::Calibrated { .. }
+        ));
+    }
+
+    #[test]
+    fn vllm_like_loads_drop_what_the_vllm_servicer_does_not_report() {
+        let full = LoadSnapshot {
+            num_running_reqs: 30,
+            num_waiting_reqs: 2,
+            num_waiting_uncached_tokens: 20_000,
+            num_used_tokens: 400_000,
+            max_total_num_tokens: 676_128,
+            max_running_requests: 128,
+            token_usage: 0.59,
+            gen_throughput: 3_000.0,
+            cache_hit_rate: 0.4,
+            num_cached_blocks: 42_000,
+            num_preemptions: 0,
+            num_kv_batches: 10,
+        };
+        assert_eq!(full.as_reported_by(LoadsLike::Mock), full);
+        let v = full.as_reported_by(LoadsLike::Vllm);
+        assert_eq!((v.num_running_reqs, v.num_waiting_reqs), (30, 2));
+        assert_eq!(
+            (v.max_total_num_tokens, v.max_running_requests),
+            (676_128, 128)
+        );
+        assert_eq!(v.token_usage, 0.59);
+        assert_eq!(
+            (v.num_waiting_uncached_tokens, v.num_used_tokens),
+            (0, 0),
+            "no queued token-work or used-token count"
+        );
+        assert_eq!((v.gen_throughput, v.cache_hit_rate), (0.0, 0.0));
+        assert_eq!("vllm".parse::<LoadsLike>(), Ok(LoadsLike::Vllm));
+        assert!("other".parse::<LoadsLike>().is_err());
+    }
+
+    #[test]
+    fn calibrated_model_reproduces_the_gb300_batched_sweep() {
+        // fit-gb300-v2.json: table of single-request medians, pass form from the batched sweep.
+        let model = TimingModel::Calibrated {
+            table: vec![
+                (1.0, 23.84),
+                (128.0, 37.33),
+                (256.0, 48.16),
+                (512.0, 81.72),
+                (1024.0, 74.94),
+                (2048.0, 76.98),
+                (3072.0, 76.44),
+                (4096.0, 98.39),
+                (6144.0, 103.1),
+                (8192.0, 105.73),
+                (12288.0, 157.74),
+                (16384.0, 211.04),
+            ],
+            pass_intercept_ms: 36.12,
+            pass_ms_per_token: 0.01028,
+            decode: [3.7646, 15.2448, -2.8663],
+        };
+        let within = |value: f64, lo: f64, hi: f64| (lo..=hi).contains(&value);
+        // Measured: 4x1024 in 79.6-80.8 ms, 8x1024 in 114.8-121.8 ms, 16x1024 in 200-210 ms.
+        assert!(within(model.prefill_pass_ms(4096, 1024), 74.0, 86.0));
+        assert!(within(model.prefill_pass_ms(8192, 1024), 110.0, 126.0));
+        assert!(within(model.prefill_pass_ms(16384, 1024), 195.0, 215.0));
+        // The single-request plateau: 512-3072 tokens cost 75-82 ms alone.
+        assert!(within(model.prefill_pass_ms(2048, 2048), 74.0, 82.0));
+        // 8x4096 is two passes of 16384 on a 16384-token budget: 409 ms by the
+        // pass form against ~335 ms measured; the second pass is cheaper on the
+        // hardware than the form says (recorded, not matched).
+        assert!(within(
+            2.0 * model.prefill_pass_ms(16384, 4096),
+            390.0,
+            430.0
         ));
     }
 

@@ -102,7 +102,10 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn loads(State(state): State<Arc<AppState>>) -> Response {
-    let load = state.engine.as_ref().map(|e| e.load());
+    let load = state
+        .engine
+        .as_ref()
+        .map(|e| e.load().as_reported_by(state.cfg.loads_like));
     let value = match load {
         Some(s) => json!({
             "dp_rank": 0,
