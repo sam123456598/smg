@@ -1,10 +1,14 @@
-//! Shared selection arithmetic: the two softmax draws and deterministic tie-breaking.
+//! Shared selection arithmetic: the two softmax draws, deterministic tie-breaking and the
+//! lowest-cost picker built on them.
 
 use std::cmp::Ordering;
 
 use rand::RngExt;
 
-use super::inputs::CandidateInputs;
+use super::{
+    inputs::{CandidateInputs, RequestInputs},
+    policy::{Pick, WorkerPicker},
+};
 
 /// Softmax selection over min-max normalised *scores* (higher is better): the draw cache-aware
 /// routing has always used. The normalisation makes temperature scale-free, the best candidate's
@@ -102,6 +106,25 @@ pub enum TieBreak {
     Deterministic,
     /// Uniform draw among the tied rows.
     Uniform,
+}
+
+/// Lowest cost, with the configured tie-break at temperature zero and a cost-softmax draw above.
+#[derive(Debug)]
+pub(super) struct LowestCostPicker {
+    pub temperature: f64,
+    pub tie_break: TieBreak,
+}
+
+impl WorkerPicker for LowestCostPicker {
+    fn pick(
+        &self,
+        _request: &RequestInputs<'_>,
+        candidates: &[CandidateInputs<'_>],
+        costs: &[f64],
+    ) -> Pick {
+        pick_lowest(candidates, costs, self.temperature, self.tie_break)
+            .map_or(Pick::None, Pick::Final)
+    }
 }
 
 /// Lowest cost with the configured tie-break, or a cost-softmax draw when `temperature > 0`.

@@ -7,14 +7,17 @@
 //!
 //! - [`catalog::DEFAULT_POLICY`] reproduces the pre-policy cache-aware decision exactly (an affinity
 //!   group that the host resolves with its pressure gate and expected-wait selector).
+//! - `cache-aware-balanced` prices the host's expected wait and a capped prefix credit, taken
+//!   relative to the fleet's best holder, in the same seconds and takes the lowest, behind a
+//!   fail-open saturation veto on the worker-protection signals.
 //! - [`accounting::OptimisticAccounting`] closes the window between a dispatch and the engine's
 //!   first event, when enabled.
 //! - With the `bench-policies` feature the catalog also builds the replay harness's comparison
 //!   baseline (`reference-cost`, the published prefill-load cost formula); it is not part of the
 //!   product and cannot be selected without the feature.
 //!
-//! Design notes from the routers surveyed while building this layer, kept here because they shape
-//! the next cache-aware candidate:
+//! Design notes from the routers surveyed while building this layer, kept here because they are
+//! what `cache-aware-balanced` is built from:
 //! - credit a worker's prefix overlap *relative to the fleet's best holder* and *capped* (a few
 //!   thousand tokens), so a full holder is not out-bid by load alone and a marginal holder earns
 //!   little, which keeps sessions sticky at scale without pinning a hot prefix to one worker;
@@ -33,6 +36,7 @@ pub mod inputs;
 pub mod policy;
 pub mod softmax;
 
+mod balanced;
 mod default;
 #[cfg(feature = "bench-policies")]
 mod reference_cost;

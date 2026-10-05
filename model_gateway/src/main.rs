@@ -365,8 +365,9 @@ struct CliArgs {
 
     /// Worker selection policy for cache_aware, run over the per-worker
     /// inputs the router gathers (prefix overlap, in-flight requests,
-    /// backend load reports); cache-aware-default is the affinity-group
-    /// decision
+    /// backend load reports): cache-aware-default is the affinity-group
+    /// decision, cache-aware-balanced the expected wait less a capped
+    /// prefix credit behind a fail-open saturation veto
     #[arg(
         long,
         default_value = "cache-aware-default",

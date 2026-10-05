@@ -1,20 +1,25 @@
 //! The policy catalog: names, parameters, construction.
 //!
 //! Parameters are YAML (JSON is YAML) text; unknown parameters are rejected, so a typo cannot
-//! silently fall back to a default. The product ships one selection policy, the cache-aware
-//! default; the `bench-policies` feature adds the replay harness's comparison baseline.
+//! silently fall back to a default. The product ships two selection policies, the cache-aware
+//! default and `cache-aware-balanced`; the `bench-policies` feature adds the replay harness's
+//! comparison baseline.
 
 #[cfg(feature = "bench-policies")]
 use super::reference_cost;
-use super::{default, policy::WorkerSelectionPolicy};
+use super::{balanced, default, policy::WorkerSelectionPolicy};
 
 /// The policy used when none is configured: the pre-policy cache-aware decision.
 pub const DEFAULT_POLICY: &str = default::POLICY_NAME;
 
 #[cfg(not(feature = "bench-policies"))]
-pub const POLICY_NAMES: &[&str] = &[default::POLICY_NAME];
+pub const POLICY_NAMES: &[&str] = &[default::POLICY_NAME, balanced::POLICY_NAME];
 #[cfg(feature = "bench-policies")]
-pub const POLICY_NAMES: &[&str] = &[default::POLICY_NAME, reference_cost::POLICY_NAME];
+pub const POLICY_NAMES: &[&str] = &[
+    default::POLICY_NAME,
+    balanced::POLICY_NAME,
+    reference_cost::POLICY_NAME,
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -24,7 +29,6 @@ pub enum CatalogError {
     Parameters { name: String, message: String },
 }
 
-#[cfg(feature = "bench-policies")]
 fn parse<T: Default + serde::de::DeserializeOwned>(
     name: &str,
     params: Option<&str>,
@@ -61,6 +65,14 @@ pub fn build(
             }
             Ok(default::policy(selection_temperature))
         }
+        balanced::POLICY_NAME => {
+            let p: balanced::BalancedParams = parse(name, params)?;
+            p.validate().map_err(|message| CatalogError::Parameters {
+                name: name.to_string(),
+                message,
+            })?;
+            Ok(balanced::policy(p))
+        }
         #[cfg(feature = "bench-policies")]
         reference_cost::POLICY_NAME => {
             let p: reference_cost::ReferenceCostParams = parse(name, params)?;
@@ -94,6 +106,32 @@ mod tests {
         ));
         assert!(matches!(
             build(DEFAULT_POLICY, Some("{x: 1}"), 0.0),
+            Err(CatalogError::Parameters { .. })
+        ));
+    }
+
+    #[test]
+    fn the_balanced_policy_takes_parameters_and_checks_them() {
+        assert!(build(
+            "cache-aware-balanced",
+            Some("{affinity_cap_tokens: 4096, saturation_waiting_requests: 0}"),
+            0.0
+        )
+        .is_ok());
+        assert!(matches!(
+            build(
+                "cache-aware-balanced",
+                Some("{saturation_kv_usage: 0}"),
+                0.0
+            ),
+            Err(CatalogError::Parameters { .. })
+        ));
+        assert!(matches!(
+            build(
+                "cache-aware-balanced",
+                Some("{affinity_cap_blocks: 32}"),
+                0.0
+            ),
             Err(CatalogError::Parameters { .. })
         ));
     }

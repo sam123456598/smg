@@ -90,6 +90,7 @@ use super::{
     cost::{
         self, CandidateInputs, OptimisticAccounting, Pick, RequestInputs, WorkerSelectionPolicy,
     },
+    least_load::ExpectedWaitView,
     normalize_model_key,
     utils::PeriodicTask,
     CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
@@ -1504,10 +1505,23 @@ impl CacheAwarePolicy {
             return self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info);
         }
 
-        let loads = if needs.backend_loads {
+        let loads = if needs.backend_loads || needs.expected_wait {
             self.load_snapshot()
         } else {
             None
+        };
+        // The host's own expected-wait reading of each row the policy will
+        // see, in the order the inputs are built below.
+        let expected: Vec<ExpectedWaitView> = if needs.expected_wait {
+            let rows: Vec<usize> = if wants_all {
+                healthy_indices.to_vec()
+            } else {
+                candidates.iter().map(|candidate| candidate.idx).collect()
+            };
+            self.load_scorer
+                .expected_waits(workers, &rows, loads.as_deref())
+        } else {
+            Vec::new()
         };
         let predicted = match (accounting, request.prefix_hashes) {
             (Some(accounting), Some(hashes)) => accounting.predicted_overlaps(hashes),
@@ -1564,9 +1578,12 @@ impl CacheAwarePolicy {
                         .sum()
                 }),
                 taint: 1.0,
+                expected_wait_secs: None,
+                drain_tokens_per_sec: None,
+                dispatched_since_report: 0,
             }
         };
-        let inputs: Vec<CandidateInputs<'_>> = if wants_all {
+        let mut inputs: Vec<CandidateInputs<'_>> = if wants_all {
             // Candidates follow healthy order, so one merge pass pairs them.
             let mut next = candidates.iter().peekable();
             healthy_indices
@@ -1592,6 +1609,11 @@ impl CacheAwarePolicy {
                 })
                 .collect()
         };
+        for (input, view) in inputs.iter_mut().zip(&expected) {
+            input.expected_wait_secs = Some(view.seconds);
+            input.drain_tokens_per_sec = Some(view.drain_tokens_per_sec);
+            input.dispatched_since_report = view.dispatched_since_report;
+        }
 
         let selected = match self.selection.select(request, &inputs) {
             Pick::None => {
@@ -6065,6 +6087,9 @@ mod tests {
                 queue_depth: None,
                 running_requests: None,
                 taint: 1.0,
+                expected_wait_secs: None,
+                drain_tokens_per_sec: None,
+                dispatched_since_report: 0,
             })
             .collect()
     }
@@ -6281,6 +6306,71 @@ mod tests {
         // A worker without bookings is a no-op, with or without accounting.
         policy.reconcile_in_flight("http://w2:8000", 0);
         CacheAwarePolicy::with_config(test_config()).reconcile_in_flight("http://w1:8000", 0);
+    }
+
+    /// The balanced policy through the host: the holder of the prompt's
+    /// blocks wins while its expected wait is within the credit of the cold
+    /// worker's, and loses the request once its queue is deeper than that.
+    #[test]
+    fn balanced_policy_trades_the_holders_affinity_against_its_queue() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            selection_policy: Some("cache-aware-balanced".to_string()),
+            ..test_config()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer =
+            setup_indexer_with_blocks("http://w2:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+
+        // Both drain at 2,000 tokens/s; w2 holds the prompt's two blocks, a
+        // credit of 8 tokens (4 ms). Each round publishes fresh loads, which
+        // also clears the previous dispatch's since-poll credit.
+        let route = |w1_queued: i32, w2_queued: i32| {
+            let loads: HashMap<String, WorkerLoadResponse> = [
+                (
+                    "http://w1:8000".to_string(),
+                    expected_wait_load(w1_queued, 0.1, 2_000.0),
+                ),
+                (
+                    "http://w2:8000".to_string(),
+                    expected_wait_load(w2_queued, 0.1, 2_000.0),
+                ),
+            ]
+            .into_iter()
+            .collect();
+            let (_tx, rx) = watch::channel(complete_load_snapshot(loads.clone()));
+            policy.set_load_receiver(Some(rx));
+            policy.update_loads(&loads);
+            let selected = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            policy.on_request_complete(workers[selected].url(), true);
+            selected
+        };
+        assert_eq!(
+            route(0, 4),
+            1,
+            "the holder keeps the request within its credit"
+        );
+        assert_eq!(
+            route(0, 40),
+            0,
+            "a deeper queue outweighs the capped credit"
+        );
+        assert_eq!(
+            route(40, 0),
+            1,
+            "and the holder wins outright when it is the idle one"
+        );
     }
 
     #[test]

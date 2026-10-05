@@ -17,8 +17,8 @@
 
 use super::{
     inputs::{CandidateInputs, RequestInputs},
-    policy::{Needs, Pick, WorkerPicker, WorkerScorer, WorkerSelectionPolicy},
-    softmax::{pick_lowest, TieBreak},
+    policy::{Needs, WorkerScorer, WorkerSelectionPolicy},
+    softmax::{LowestCostPicker, TieBreak},
 };
 
 pub const POLICY_NAME: &str = "reference-cost";
@@ -127,25 +127,6 @@ impl WorkerScorer for ReferenceCostScorer {
                 + p.decode_active_request_weight * candidate.active_requests as f64;
             *cost += logit * candidate.taint;
         }
-    }
-}
-
-/// Lowest cost, with the configured tie-break at temperature zero and a cost-softmax draw above.
-#[derive(Debug)]
-pub(super) struct LowestCostPicker {
-    pub temperature: f64,
-    pub tie_break: TieBreak,
-}
-
-impl WorkerPicker for LowestCostPicker {
-    fn pick(
-        &self,
-        _request: &RequestInputs<'_>,
-        candidates: &[CandidateInputs<'_>],
-        costs: &[f64],
-    ) -> Pick {
-        pick_lowest(candidates, costs, self.temperature, self.tie_break)
-            .map_or(Pick::None, Pick::Final)
     }
 }
 

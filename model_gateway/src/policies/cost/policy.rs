@@ -70,6 +70,9 @@ pub struct Needs {
     pub all_workers: bool,
     /// The backend load snapshot (waiting prefill, KV usage, queue depth).
     pub backend_loads: bool,
+    /// The host's expected-wait reading of every candidate (`CandidateInputs::expected_wait_secs`,
+    /// its drain rate and the dispatches since the last report).
+    pub expected_wait: bool,
 }
 
 impl Needs {
@@ -78,6 +81,13 @@ impl Needs {
         prefix_hashes: false,
         all_workers: true,
         backend_loads: true,
+        expected_wait: false,
+    };
+
+    /// The fleet with its load reports and the host's expected wait on each worker.
+    pub const FLEET_WITH_EXPECTED_WAIT: Self = Self {
+        expected_wait: true,
+        ..Self::FLEET_WITH_LOADS
     };
 }
 

@@ -95,6 +95,9 @@ fn gather<'a>(fleet: &'a Fleet, all_workers: bool) -> Vec<CandidateInputs<'a>> {
                 queue_depth: Some(waiting_reqs),
                 running_requests: Some(running_reqs),
                 taint: 1.0,
+                expected_wait_secs: Some(waiting_tokens as f64 / 2_000.0),
+                drain_tokens_per_sec: Some(2_000.0),
+                dispatched_since_report: 0,
             })
         })
         .collect()

@@ -56,6 +56,18 @@ pub struct CandidateInputs<'a> {
     pub running_requests: Option<u64>,
     /// Multiplier applied to a cost by taint-aware pickers; `1.0` when untainted.
     pub taint: f64,
+    /// The host's expected wait on this worker, in seconds: queued token-work plus what this
+    /// router dispatched since the worker's last report, over the worker's drain rate, plus the
+    /// KV-pressure barrier. The number the host's own expected-wait selector ranks on; gathered
+    /// only for policies that ask (`Needs::expected_wait`).
+    pub expected_wait_secs: Option<f64>,
+    /// Tokens per second that wait drains at (the worker's live generation rate, else the host's
+    /// default), so a policy can price token-work it saves in the same unit. Gathered with the
+    /// wait.
+    pub drain_tokens_per_sec: Option<f64>,
+    /// Requests this router dispatched to the worker since its last load report; `queue_depth`
+    /// and `running_requests` do not include them yet.
+    pub dispatched_since_report: u64,
 }
 
 impl CandidateInputs<'_> {

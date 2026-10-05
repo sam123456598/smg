@@ -105,6 +105,18 @@ pub struct LeastLoadPolicy {
     max_waiting_requests: u32,
 }
 
+/// One worker's expected-wait reading for a selection policy (see
+/// [`LeastLoadPolicy::expected_waits`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ExpectedWaitView {
+    /// The selector's score for the worker, in seconds.
+    pub seconds: f64,
+    /// Tokens per second the score drains at.
+    pub drain_tokens_per_sec: f64,
+    /// Requests this router dispatched to the worker since its last report.
+    pub dispatched_since_report: u64,
+}
+
 /// Everything one expected-wait score reads besides the worker itself.
 #[derive(Clone, Copy)]
 struct ScoreInputs<'a> {
@@ -214,15 +226,9 @@ impl LeastLoadPolicy {
             Some(load) => {
                 let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens;
                 let queued_tokens = self.queued_tokens(load);
-                let live_throughput = load.total_gen_throughput();
-                let throughput = if live_throughput > 0.0 {
-                    live_throughput
-                } else {
-                    self.default_throughput
-                };
                 ExpectedWait::new(
                     queued_tokens,
-                    throughput,
+                    self.drain_rate(load),
                     load.effective_token_usage(),
                     self.kv_pressure_weight,
                 )
@@ -256,6 +262,124 @@ impl LeastLoadPolicy {
             return None;
         }
         loads.and_then(|map| map.get(url))
+    }
+
+    /// The drain rate a reporting worker's wait is priced at: its live
+    /// generation rate, else the configured default.
+    fn drain_rate(&self, load: &WorkerLoadResponse) -> f64 {
+        let live = load.total_gen_throughput();
+        if live > 0.0 {
+            live
+        } else {
+            self.default_throughput
+        }
+    }
+
+    /// The scoring inputs for one pass over `candidates`: the nominal drain
+    /// rate (mean of the positive reports) that stands in for a worker
+    /// missing a fresh snapshot; whether anyone reports at all, which
+    /// separates a partial gap (estimate the missing worker at the nominal
+    /// rate) from a dark fleet (join-shortest-queue on live in-flight); and
+    /// the best-known reporting peer's score, which a worker without a report
+    /// starts from: never better than a worker whose load is known, never
+    /// starved by one. The baseline is computed only when some candidate
+    /// lacks a report, so the common all-reporting case pays nothing for it.
+    fn score_inputs<'a>(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        loads: Option<&'a HashMap<String, WorkerLoadResponse>>,
+        complete_snapshot: Option<&'a LoadSnapshot>,
+        inflight: &'a HashMap<String, SincePollDispatch>,
+    ) -> ScoreInputs<'a> {
+        let (tp_sum, tp_count) = candidates
+            .iter()
+            .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
+            .map(|l| l.total_gen_throughput())
+            .filter(|t| *t > 0.0)
+            .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
+        let nominal_throughput = if tp_count > 0 {
+            tp_sum / tp_count as f64
+        } else {
+            self.default_throughput
+        };
+        let reporting = candidates
+            .iter()
+            .filter(|&&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some())
+            .count();
+        let mut inputs = ScoreInputs {
+            loads,
+            complete_snapshot,
+            inflight,
+            nominal_throughput,
+            fleet_has_loads: reporting > 0,
+            peer_baseline: 0.0,
+        };
+        if reporting < candidates.len() {
+            let best_known = candidates
+                .iter()
+                .filter(|&&i| {
+                    Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some()
+                })
+                .map(|&i| self.score(&workers[i], &inputs))
+                .fold(f64::INFINITY, f64::min);
+            // Nobody reports: the dark-fleet arm scores by live in-flight and
+            // never reads the baseline; keep it neutral rather than infinite.
+            if best_known.is_finite() {
+                inputs.peer_baseline = best_known;
+            }
+        }
+        inputs
+    }
+
+    /// What the selector would score each candidate at right now, without
+    /// choosing or crediting: the expected wait in seconds, the drain rate
+    /// behind it and the router's dispatches since the worker's last report,
+    /// for selection policies that trade that wait against other signals
+    /// (`CandidateInputs::expected_wait_secs`). Same lock order as the
+    /// selector. A dark fleet, which the selector ranks by in-flight count,
+    /// reads here as one mean prefill per in-flight request at the default
+    /// drain rate: the same order, in seconds, so a credit priced in tokens
+    /// still compares.
+    pub(super) fn expected_waits(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        complete_snapshot: Option<&LoadSnapshot>,
+    ) -> Vec<ExpectedWaitView> {
+        let loads_guard = self.cached_loads.read().ok();
+        let loads = loads_guard.as_deref();
+        let inflight = self
+            .inflight_tokens
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inputs = self.score_inputs(workers, candidates, loads, complete_snapshot, &inflight);
+        candidates
+            .iter()
+            .map(|&idx| {
+                let worker = &workers[idx];
+                let url = worker.url();
+                let dispatched_since_report =
+                    inflight.get(url).copied().unwrap_or_default().requests;
+                let (seconds, drain_tokens_per_sec) =
+                    match Self::fresh_load(loads, complete_snapshot, url) {
+                        Some(load) => (self.score(worker, &inputs), self.drain_rate(load)),
+                        None if inputs.fleet_has_loads => {
+                            (self.score(worker, &inputs), inputs.nominal_throughput)
+                        }
+                        None => (
+                            worker.load() as f64 * f64::from(self.mean_prefill_tokens)
+                                / self.default_throughput,
+                            self.default_throughput,
+                        ),
+                    };
+                ExpectedWaitView {
+                    seconds,
+                    drain_tokens_per_sec,
+                    dispatched_since_report,
+                }
+            })
+            .collect()
     }
 
     /// Waiting-queue token-work for a worker.
@@ -348,78 +472,19 @@ impl LeastLoadPolicy {
         };
         let (&first, rest) = candidates.split_first()?;
 
-        // Nominal throughput (mean of positive reports) stands in for a
-        // worker missing a fresh snapshot; `fleet_has_loads` distinguishes a
-        // partial gap (estimate that worker's drain time at the nominal rate)
-        // from a fully dark fleet (fall back to join-shortest-queue).
-        let (tp_sum, tp_count) = candidates
-            .iter()
-            .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
-            .map(|l| l.total_gen_throughput())
-            .filter(|t| *t > 0.0)
-            .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
-        let nominal_throughput = if tp_count > 0 {
-            tp_sum / tp_count as f64
-        } else {
-            self.default_throughput
-        };
-        let fleet_has_loads = candidates
-            .iter()
-            .any(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some());
-
         // Held across selection so the in-flight estimate stays consistent and
         // the chosen worker can be credited before the guard is released.
         let mut inflight = self
             .inflight_tokens
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inputs = self.score_inputs(workers, candidates, loads, complete_snapshot, &inflight);
 
         // Argmin with reservoir tie-breaking: equal-score workers (the common
         // idle/homogeneous case scores exactly equal) are sampled uniformly
         // instead of first-index-wins, which herded ties onto one worker.
-        // A worker without a fresh report scores as the best-known reporting
-        // peer plus its own in-flight: never better than a worker whose load
-        // is known, never starved by one. Computed only when some candidate
-        // lacks a report, so the common all-reporting case pays nothing.
-        let peer_baseline = if candidates
-            .iter()
-            .all(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some())
-        {
-            0.0
-        } else {
-            let known = ScoreInputs {
-                loads,
-                complete_snapshot,
-                inflight: &inflight,
-                nominal_throughput,
-                fleet_has_loads,
-                peer_baseline: 0.0,
-            };
-            let best_known = candidates
-                .iter()
-                .filter(|&&i| {
-                    Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some()
-                })
-                .map(|&i| self.score(&workers[i], &known))
-                .fold(f64::INFINITY, f64::min);
-            // Nobody reports: the dark-fleet arm scores by live in-flight and
-            // never reads the baseline; keep it neutral rather than infinite.
-            if best_known.is_finite() {
-                best_known
-            } else {
-                0.0
-            }
-        };
         let mut rng = rand::rng();
         let mut best = first;
-        let inputs = ScoreInputs {
-            loads,
-            complete_snapshot,
-            inflight: &inflight,
-            nominal_throughput,
-            fleet_has_loads,
-            peer_baseline,
-        };
         let mut best_score = self.score(&workers[best], &inputs);
         let mut tied = 1u32;
         for &idx in rest {
