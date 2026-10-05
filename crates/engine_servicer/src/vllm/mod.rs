@@ -185,6 +185,9 @@ pub(super) struct State {
     /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
     pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     pub(super) stats: Stats,
+    /// Queued token-work, generation throughput and hit rate from the
+    /// requests this servicer forwards, for `GetLoads`.
+    pub(super) loads: crate::load_tracker::LoadTracker,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.
     pub(super) tokenizer_dir: Option<String>,
@@ -301,6 +304,7 @@ impl VllmServicerServer {
             model: config.model,
             kv_relay,
             stats: Stats::default(),
+            loads: crate::load_tracker::LoadTracker::default(),
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),
             registry: Arc::new(RequestRegistry::default()),

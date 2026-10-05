@@ -22,6 +22,7 @@ mod health;
 mod kv_events;
 mod kv_history;
 pub mod kv_wire;
+mod load_tracker;
 mod proto_json;
 mod requests;
 mod server;
