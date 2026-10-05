@@ -100,6 +100,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't cache per-worker state
     }
 
+    /// Reconcile the state this policy booked on `worker_url` against the
+    /// router's live count of requests in flight there.
+    ///
+    /// Every request end reaches [`Self::on_request_complete`] through the
+    /// worker's load guard; this is the safety net behind it. The worker
+    /// monitor calls it once per load poll with the requests the router still
+    /// holds on the worker. A dispatch books once and a completion releases
+    /// once, so whatever a policy holds beyond `in_flight` is a completion
+    /// that never arrived (a worker that moved under another policy, a sink
+    /// never installed) and is released here rather than kept for good.
+    /// Default: no-op for policies that book nothing.
+    fn reconcile_in_flight(&self, _worker_url: &str, _in_flight: usize) {}
+
     /// Reset any internal state
     ///
     /// This is useful for policies that maintain state (e.g., round-robin counters).

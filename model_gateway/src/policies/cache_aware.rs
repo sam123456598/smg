@@ -1287,6 +1287,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         self.selection.on_worker_removed(url);
     }
 
+    fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
+        let released = self
+            .accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.reconcile(worker_url, in_flight));
+        self.selection.reconcile_in_flight(worker_url, in_flight);
+        if released > 0 {
+            Metrics::record_policy_inflight_reconciled(self.name(), released);
+            debug!(
+                worker = worker_url,
+                in_flight, released, "Released bookings whose completion never arrived"
+            );
+        }
+    }
+
     fn reset(&self) {
         self.load_scorer.reset();
     }
@@ -6241,6 +6256,31 @@ mod tests {
 
         policy.on_request_complete("http://w1:8000", true);
         assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 0);
+    }
+
+    #[test]
+    fn reconciliation_releases_bookings_whose_completion_never_arrived() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            selection_accounting_ttl_ms: 60_000,
+            ..test_config()
+        });
+        let accounting = policy.accounting.as_ref().expect("accounting enabled");
+        accounting.record_dispatch("http://w1:8000", 100, &[]);
+        accounting.record_dispatch("http://w1:8000", 200, &[]);
+        accounting.record_dispatch("http://w1:8000", 400, &[]);
+
+        // The router still holds all three: nothing to release.
+        policy.reconcile_in_flight("http://w1:8000", 3);
+        assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 700);
+
+        // Two requests ended without a completion report: the two oldest
+        // bookings go, the one the router still holds stays.
+        policy.reconcile_in_flight("http://w1:8000", 1);
+        assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 400);
+
+        // A worker without bookings is a no-op, with or without accounting.
+        policy.reconcile_in_flight("http://w2:8000", 0);
+        CacheAwarePolicy::with_config(test_config()).reconcile_in_flight("http://w1:8000", 0);
     }
 
     #[test]

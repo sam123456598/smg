@@ -1190,6 +1190,14 @@ async fn group_monitor_loop(
             }
         }
 
+        // The poll is also the reconciliation tick: each policy trims what it
+        // booked on a worker to the requests the router still holds there,
+        // the safety net behind the load guard's completion report. It runs
+        // whether or not the fetch succeeded; the live count is the router's.
+        for worker in &workers {
+            monitor.policy_registry.reconcile_in_flight(worker.as_ref());
+        }
+
         // Compute the URL set up front so both the success and
         // empty-fetch branches can prune stale entries from the watch
         // snapshot. Without the empty-fetch prune, a group that
@@ -1793,7 +1801,8 @@ mod native_loads_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+        policies::{LoadBalancingPolicy, SelectWorkerInfo},
+        worker::{BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard, WorkerType},
     };
 
     const VLLM_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
@@ -1962,6 +1971,71 @@ mod native_loads_tests {
         })
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    /// A policy that records the reconciliation ticks it receives.
+    #[derive(Debug, Default)]
+    struct ReconcileRecorder(Mutex<Vec<(String, usize)>>);
+
+    impl LoadBalancingPolicy for ReconcileRecorder {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
+            self.0.lock().push((worker_url.to_string(), in_flight));
+        }
+
+        fn name(&self) -> &'static str {
+            "reconcile_recorder"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Every poll hands each polled worker's policy the router's live
+    /// in-flight count on it, the safety net for a completion that never
+    /// reached the policy.
+    #[tokio::test]
+    async fn load_poll_reconciles_in_flight_with_the_workers_policy() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let recorder = Arc::new(ReconcileRecorder::default());
+        monitor
+            .policy_registry
+            .set_decode_policy(Arc::clone(&recorder) as Arc<dyn LoadBalancingPolicy>);
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(stub.url.as_str())
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("a"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.set_status(WorkerStatus::Ready);
+        let held = WorkerLoadGuard::new(Arc::clone(&worker), None);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("the poll to reconcile the worker's policy", || {
+            recorder
+                .0
+                .lock()
+                .iter()
+                .any(|(url, in_flight)| *url == stub.url && *in_flight == 1)
+        })
+        .await;
+        drop(held);
     }
 
     /// `NATIVE_BODY` reports 4 waiting requests, so a threshold of 4 vetoes and

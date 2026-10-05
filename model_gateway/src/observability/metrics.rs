@@ -404,6 +404,11 @@ pub(crate) fn init_metrics() {
         "Cache-aware tree-mode selection branch (tree_match, spill, expected_wait_fallback, \
          first_healthy_fallback)"
     );
+    describe_counter!(
+        "smg_policy_inflight_reconciled_total",
+        "Policy bookings released at the per-poll in-flight reconciliation because their \
+         completion never arrived, by policy"
+    );
     describe_histogram!(
         "smg_cache_aware_match_ratio",
         "Cache-aware tree-mode best prefix match ratio per request (matched/input, 0..1)"
@@ -1460,6 +1465,16 @@ impl Metrics {
             "branch" => branch
         )
         .increment(1);
+    }
+
+    /// Record bookings a policy released at the in-flight reconciliation
+    /// tick: dispatches whose completion never reached it.
+    pub fn record_policy_inflight_reconciled(policy: &'static str, released: usize) {
+        counter!(
+            "smg_policy_inflight_reconciled_total",
+            "policy" => policy
+        )
+        .increment(released as u64);
     }
 
     /// Record the best prefix match ratio (matched/input, 0..1) of a cache-aware

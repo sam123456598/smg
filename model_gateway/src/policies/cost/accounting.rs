@@ -174,6 +174,26 @@ impl OptimisticAccounting {
         }
     }
 
+    /// Trim the live bookings on `url` to the router's in-flight count there,
+    /// oldest first, and return how many were released. A dispatch books once
+    /// and a completion releases once, so bookings beyond the live count are
+    /// completions that never arrived. Expired bookings are dropped on the way
+    /// and not counted: they were already out of every sum.
+    pub fn reconcile(&self, url: &str, in_flight: usize) -> usize {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        let Some(queue) = state.booked.get_mut(url) else {
+            return 0;
+        };
+        queue.retain(|booking| booking.expires > now);
+        let excess = queue.len().saturating_sub(in_flight);
+        queue.drain(..excess);
+        if queue.is_empty() {
+            state.booked.remove(url);
+        }
+        excess
+    }
+
     /// Prefill tokens booked on `url` that have not expired or been released.
     pub fn pending_prefill_tokens(&self, url: &str) -> u64 {
         let now = Instant::now();
@@ -275,6 +295,28 @@ mod tests {
         assert_eq!(acc.pending_prefill_tokens("w1"), 200);
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(acc.pending_prefill_tokens("w1"), 0);
+    }
+
+    #[test]
+    fn reconcile_releases_bookings_beyond_the_live_count_oldest_first() {
+        let acc = OptimisticAccounting::new(Duration::from_secs(5));
+        acc.record_dispatch("w1", 100, &[]);
+        acc.record_dispatch("w1", 200, &[]);
+        acc.record_dispatch("w1", 400, &[]);
+        assert_eq!(acc.reconcile("w1", 3), 0, "nothing beyond the live count");
+        assert_eq!(acc.reconcile("w1", 1), 2, "two completions never arrived");
+        assert_eq!(
+            acc.pending_prefill_tokens("w1"),
+            400,
+            "the newest booking is the one still in flight"
+        );
+        assert_eq!(acc.reconcile("w1", 0), 1);
+        assert_eq!(acc.pending_prefill_tokens("w1"), 0);
+        assert_eq!(
+            acc.reconcile("w1", 0),
+            0,
+            "a worker with no bookings releases nothing"
+        );
     }
 
     #[test]

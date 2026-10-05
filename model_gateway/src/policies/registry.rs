@@ -45,13 +45,9 @@ impl RequestCompletionSink for PolicyCompletionSink {
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
-        let policy = match worker.worker_type() {
-            WorkerType::Prefill => registry.get_prefill_policy(),
-            WorkerType::Decode => registry.get_decode_policy(),
-            WorkerType::Encode => registry.get_encode_policy(),
-            WorkerType::Regular => registry.get_policy_or_default(worker.model_id()),
-        };
-        policy.on_request_complete(worker.url(), true);
+        registry
+            .policy_for_worker(worker)
+            .on_request_complete(worker.url(), true);
     }
 }
 
@@ -526,6 +522,27 @@ impl PolicyRegistry {
         Arc::new(PolicyCompletionSink {
             registry: Arc::downgrade(self),
         })
+    }
+
+    /// The policy that places requests on `worker`: the prefill, decode or
+    /// encode policy by worker type, else the model's policy. Completion
+    /// reports and in-flight reconciliation both go there.
+    fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
+        match worker.worker_type() {
+            WorkerType::Prefill => self.get_prefill_policy(),
+            WorkerType::Decode => self.get_decode_policy(),
+            WorkerType::Encode => self.get_encode_policy(),
+            WorkerType::Regular => self.get_policy_or_default(worker.model_id()),
+        }
+    }
+
+    /// Reconcile the policy that places requests on `worker` against the
+    /// router's live in-flight count there (see
+    /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
+    /// calls this once per load poll for every polled worker.
+    pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
+        self.policy_for_worker(worker)
+            .reconcile_in_flight(worker.url(), worker.load());
     }
 
     pub fn on_worker_added(
@@ -2401,9 +2418,12 @@ mod tests {
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
     }
 
-    /// A policy that remembers completions.
+    /// A policy that remembers completions and reconciliation ticks.
     #[derive(Debug, Default)]
-    struct CompletionRecorder(std::sync::Mutex<Vec<String>>);
+    struct CompletionRecorder {
+        completed: std::sync::Mutex<Vec<String>>,
+        reconciled: std::sync::Mutex<Vec<(String, usize)>>,
+    }
 
     impl LoadBalancingPolicy for CompletionRecorder {
         fn select_worker(
@@ -2415,7 +2435,14 @@ mod tests {
         }
 
         fn on_request_complete(&self, worker_url: &str, _success: bool) {
-            self.0.lock().unwrap().push(worker_url.to_string());
+            self.completed.lock().unwrap().push(worker_url.to_string());
+        }
+
+        fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
+            self.reconciled
+                .lock()
+                .unwrap()
+                .push((worker_url.to_string(), in_flight));
         }
 
         fn name(&self) -> &'static str {
@@ -2463,17 +2490,48 @@ mod tests {
         drop(WorkerLoadGuard::new(Arc::clone(&regular), None));
 
         assert_eq!(
-            prefill_policy.0.lock().unwrap().as_slice(),
+            prefill_policy.completed.lock().unwrap().as_slice(),
             ["grpc://prefill:9000"]
         );
         assert_eq!(
-            decode_policy.0.lock().unwrap().as_slice(),
+            decode_policy.completed.lock().unwrap().as_slice(),
             ["grpc://decode:9000"]
         );
 
         // A worker that outlives its registry reports to nobody.
         drop(registry);
         drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
-        assert_eq!(prefill_policy.0.lock().unwrap().len(), 1);
+        assert_eq!(prefill_policy.completed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_in_flight_reaches_the_policy_that_owns_the_worker_type() {
+        use crate::worker::{BasicWorkerBuilder, WorkerLoadGuard};
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let decode_policy = Arc::new(CompletionRecorder::default());
+        registry.set_decode_policy(Arc::clone(&decode_policy) as Arc<dyn LoadBalancingPolicy>);
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:9000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+
+        // The count handed over is the router's live one: two guards held,
+        // then none.
+        let held = [
+            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            WorkerLoadGuard::new(Arc::clone(&decode), None),
+        ];
+        registry.reconcile_in_flight(decode.as_ref());
+        drop(held);
+        registry.reconcile_in_flight(decode.as_ref());
+        assert_eq!(
+            decode_policy.reconciled.lock().unwrap().as_slice(),
+            [
+                ("grpc://decode:9000".to_string(), 2),
+                ("grpc://decode:9000".to_string(), 0)
+            ]
+        );
     }
 }

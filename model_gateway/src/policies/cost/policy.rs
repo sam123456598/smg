@@ -39,6 +39,11 @@ pub trait WorkerPicker: Send + Sync + Debug {
     /// A request on `url` finished, successfully or not.
     fn on_request_complete(&self, _url: &str) {}
 
+    /// The router holds `in_flight` requests on `url` right now; a picker
+    /// keeping per-dispatch reservations releases any beyond that count (see
+    /// `LoadBalancingPolicy::reconcile_in_flight`).
+    fn reconcile_in_flight(&self, _url: &str, _in_flight: usize) {}
+
     /// `url` left the fleet.
     fn on_worker_removed(&self, _url: &str) {}
 }
@@ -119,6 +124,11 @@ impl WorkerSelectionPolicy {
     /// Tell the picker a request on `url` completed.
     pub fn on_request_complete(&self, url: &str) {
         self.picker.on_request_complete(url);
+    }
+
+    /// Tell the picker how many requests the router holds on `url`.
+    pub fn reconcile_in_flight(&self, url: &str, in_flight: usize) {
+        self.picker.reconcile_in_flight(url, in_flight);
     }
 
     /// Tell the picker `url` left the fleet.
