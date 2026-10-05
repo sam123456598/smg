@@ -348,10 +348,11 @@ fn token_boundaries(text: &str) -> Vec<usize> {
 
 /// Replay `text` through a new parser of `format` cut at `cuts`, after the prompt, each delta
 /// carrying the spans of the synthetic tokens it holds, a token cut by a delta boundary continuing
-/// into the next delta.
+/// into the next delta, and a byte-less token at the very end, as an end-of-turn token would be.
 fn replay_counted(format: &Format, text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
     let boundaries = token_boundaries(text);
-    let tokens: Vec<(usize, usize)> = boundaries.windows(2).map(|w| (w[0], w[1])).collect();
+    let mut tokens: Vec<(usize, usize)> = boundaries.windows(2).map(|w| (w[0], w[1])).collect();
+    tokens.push((text.len(), text.len()));
     let mut parser = (format.new)();
     let mut out = Events::new();
     parser.feed(prompt(), &mut out)?;
@@ -360,7 +361,10 @@ fn replay_counted(format: &Format, text: &str, cuts: &[usize]) -> Result<Vec<Eve
         if cut > from {
             let spans: Vec<TokenSpan> = tokens
                 .iter()
-                .filter(|&&(start, end)| end > from && start < cut)
+                .filter(|&&(start, end)| {
+                    (end > from && start < cut)
+                        || (start == end && start == cut && cut == text.len())
+                })
                 .map(|&(start, end)| TokenSpan {
                     token_id: 0,
                     start: start.max(from) - from,
@@ -378,6 +382,22 @@ fn replay_counted(format: &Format, text: &str, cuts: &[usize]) -> Result<Vec<Eve
             )?;
             from = cut;
         }
+    }
+    if text.is_empty() {
+        // No delta carried text, so the byte-less token arrives in an empty one.
+        parser.feed(
+            Input::Delta {
+                token_ids: &[],
+                text: "",
+                spans: &[TokenSpan {
+                    token_id: 0,
+                    start: 0,
+                    end: 0,
+                    continued: false,
+                }],
+            },
+            &mut out,
+        )?;
     }
     parser.feed(
         Input::End {
@@ -402,7 +422,8 @@ fn tokens_of(event: &Event) -> Option<u32> {
 #[test]
 fn every_token_is_counted_in_exactly_one_event_whatever_the_cuts() {
     for (format, text) in corpus() {
-        let expected = (token_boundaries(text).len() - 1) as u32;
+        // The synthetic tokens plus the byte-less one at the end.
+        let expected = token_boundaries(text).len() as u32;
         for cuts in chunkings(text) {
             let events = replay_counted(format, text, &cuts)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", format.name));

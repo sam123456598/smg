@@ -28,10 +28,12 @@
 //! - Call ids are `call_<index>` for now; the id scheme is Simo's decision (deterministic or carrying
 //!   the conversation's history) and changes only this one line.
 //! - Every text event says how many tokens it carries, counted by the [`Ledger`] from the deltas'
-//!   spans (a token in the event that carries its first byte; a control token without bytes as
-//!   `Dropped { ControlToken }`), and `Finish::reasoning_tokens` is the count over the reasoning
-//!   text. Deltas without spans make the stream uncounted, and then `reasoning_tokens` is zero, the
-//!   one place where zero does not mean none (rule 7 keeps `Finish` as it is for now).
+//!   spans: a token in the event that carries its first byte, a byte-less span (a held half of a
+//!   character, or a hidden special token) into the run that carries the next byte, and the tokens
+//!   left without bytes at the end once as `Dropped { ControlToken }`. `Finish::reasoning_tokens` is
+//!   the count over the reasoning text. A stream with a delta lacking spans is uncounted throughout,
+//!   and then `reasoning_tokens` is zero, the one place where zero does not mean none (rule 7 keeps
+//!   `Finish` as it is for now).
 //! - Tool names are not checked against the request's tools; the format has no tool list yet.
 //!
 //! The prompt is accepted first in the lifecycle and otherwise ignored: Qwen3 writes its own
@@ -248,6 +250,7 @@ impl Qwen3 {
             Region::Call(_) => self.close_call(Closed::ByEnd, out),
             Region::Content => {}
         }
+        self.tokens.finish(out);
         let reason = match finish {
             EngineFinish::Stop => FinishReason::Stop,
             EngineFinish::Length => FinishReason::Length,
@@ -257,7 +260,11 @@ impl Qwen3 {
         out.push(Event::Finish {
             reason,
             tool_calls: self.calls,
-            reasoning_tokens: self.reasoning_tokens,
+            reasoning_tokens: if self.tokens.counting() {
+                self.reasoning_tokens
+            } else {
+                0
+            },
         });
     }
 }
@@ -279,7 +286,7 @@ impl Parser for Qwen3 {
                     return Err(ParseError::Lifecycle("delta after end".to_string()));
                 }
                 self.stage = Stage::Streaming;
-                self.tokens.note(text, spans, out);
+                self.tokens.note(text, spans);
                 for piece in self.scanner.feed(text) {
                     self.take(piece, out);
                 }
@@ -795,7 +802,80 @@ mod tests {
     }
 
     #[test]
-    fn a_token_cut_by_a_delta_boundary_is_counted_once_and_a_control_token_at_once() {
+    fn held_halves_of_a_character_count_as_reasoning_and_a_trailing_special_token_is_reported_once()
+    {
+        // The emoji is three tokens: two held halves with no bytes and a third carrying it.
+        let pieces: [(&str, &[(usize, usize)]); 8] = [
+            ("<think>", &[(0, 7)]),
+            ("\n", &[(0, 1)]),
+            ("", &[(0, 0)]),
+            ("", &[(0, 0)]),
+            ("🌍", &[(0, 4)]),
+            ("\n", &[(0, 1)]),
+            ("</think>", &[(0, 8)]),
+            ("", &[(0, 0)]),
+        ];
+        let mut parser = Qwen3::new();
+        let mut out = Events::new();
+        for (text, ranges) in pieces {
+            let spans: Vec<TokenSpan> = ranges
+                .iter()
+                .map(|&(start, end)| TokenSpan {
+                    token_id: 0,
+                    start,
+                    end,
+                    continued: false,
+                })
+                .collect();
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text,
+                        spans: &spans,
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+        }
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        assert_eq!(
+            counted(&events),
+            vec![
+                ("<think>".into(), Some(1)),
+                ("\n🌍\n".into(), Some(5)),
+                ("</think>".into(), Some(1)),
+                (String::new(), Some(1)),
+            ],
+            "the held halves count into the character they began; the trailing token is reported at the end"
+        );
+        assert_eq!(
+            events[events.len() - 2],
+            Event::Dropped {
+                text: Text::new("", 1),
+                why: DropReason::ControlToken,
+            }
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reasoning_tokens: 5,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_token_cut_by_a_delta_boundary_is_counted_once_and_a_special_token_counts_into_what_follows(
+    ) {
         let mut parser = Qwen3::new();
         let mut out = Events::new();
         let first = [TokenSpan {
@@ -854,21 +934,50 @@ mod tests {
             .expect("end");
         let events = out.drain();
         assert_eq!(
-            events[0],
-            Event::Dropped {
-                text: Text::new("", 1),
-                why: DropReason::ControlToken,
-            },
-            "the control token is reported when its delta arrives"
-        );
-        assert_eq!(
             counted(&events),
-            vec![
-                (String::new(), Some(1)),
-                ("<think>".into(), Some(1)),
-                ("x".into(), Some(1)),
-            ]
+            vec![("<think>".into(), Some(1)), ("x".into(), Some(2))],
+            "the cut token once, where its first byte landed; the byte-less token into the text after it"
         );
+    }
+
+    #[test]
+    fn a_stream_that_turns_uncounted_reports_no_reasoning_count() {
+        let mut parser = Qwen3::new();
+        let mut out = Events::new();
+        let spans = [TokenSpan {
+            token_id: 0,
+            start: 0,
+            end: 8,
+            continued: false,
+        }];
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "<think>a",
+                    spans: &spans,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(delta("b</think>"), &mut out)
+            .expect("a delta without spans");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        assert!(matches!(
+            out.as_slice().last(),
+            Some(Event::Finish {
+                reasoning_tokens: 0,
+                ..
+            })
+        ));
     }
 
     #[test]
