@@ -4,8 +4,6 @@
 | --- | --- |
 | `throughput_bench.rs` | Criterion micro-benchmarks of the indexers (see its module doc). |
 | `mooncake_replay.rs` | Open-loop replay of a Mooncake indexer corpus by Dynamo's method, against this crate's indexers (`cargo bench -p kv-index --bench mooncake_replay -- --help`). |
-| `corpus_export.patch` | The `--export-corpus` option for Dynamo's `lib/bench/kv_router/mooncake_bench` (against ai-dynamo/dynamo `50bdb355f8`), which writes the corpus the replay consumes. |
-| `dynamo-adapter/` | `PositionalIndexer` behind Dynamo's `SyncIndexer`, so Dynamo's own binary can measure it (its README explains the wiring). |
 | `protocol/bisect_sustained.py` | Threshold search for sustained throughput: brackets the highest offered rate at which trials keep up (3 fresh-process trials per point, geometric bisection to within 10%), for either harness. |
 | `protocol/publish_protocol.py` | Guardrail 5 runner: N fresh-process trials with an interleaved same-binary control pair, the lock held per trial, a foreign-load check on the measurement cores before and after each trial, medians with bootstrap 95% confidence intervals, markdown output. |
 | `protocol/hostload.py` | The foreign-load sampler the two scripts share (per-process CPU on a core set over a short interval). |
@@ -103,8 +101,9 @@ Differences from Dynamo's runner, all on the harness side:
 
 ## Commands
 
-Export the standard corpus from a Dynamo checkout with `corpus_export.patch` applied (the
-`dynamo-adapter` wiring adds the `smg-positional` subcommand; any backend subcommand works):
+Export the standard corpus from a Dynamo checkout with the out-of-tree corpus-export patch applied
+(the patch and the adapter that lets Dynamo's binary drive this crate's indexers are kept with the
+measurement scripts, outside this repository; any backend subcommand works):
 
 ```
 mooncake_bench lib/kv-router/traces/mooncake_trace.jsonl \
@@ -266,7 +265,7 @@ The same corpus (128 workers, duplication 20, length factor 4; 2,446,195 operati
 block ops) was replayed against this crate's `PositionalIndexer` through both harnesses on one
 144-CPU Neoverse-V2 host, Dynamo's competitor layout (event issuers on CPUs 0-3, query issuer on
 4, 64 event lanes and 128 query lanes on 5-63, `numactl --interleave=all`, one process per trial,
-3000 ms and 750 ms windows). Dynamo's binary ran the indexer through `dynamo-adapter/`.
+3000 ms and 750 ms windows). Dynamo's binary ran the indexer through the out-of-tree adapter.
 
 | Window | Harness | Achieved per trial (M block ops/s) | Lookup p50 (us) | Lookup p99 (us) | Scheduled to finished p99 (us) | Kept up |
 | --- | --- | --- | --- | --- | --- | --- |
