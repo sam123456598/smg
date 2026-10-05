@@ -42,20 +42,19 @@
 //! Engine hashes: the index trusts the engine's parent pointers and block identities, as the
 //! positional indexer does. Nothing is shared between workers through the maps, so one engine
 //! reusing a hash cannot corrupt another worker's view. The index carries one engine hash per
-//! distinct block, the one its first holder stored, in an array parallel to the content hashes;
-//! the lane maps' slots hold a place only and are checked against that hash
-//! (`engine_hash_at`), which is what lets a slot be 8 bytes. The invariant behind it is that
-//! every engine names a block by the same hash; a worker whose engine does not (`engine_conflicts`
-//! in the stats) keeps those keys in its lane map's exact side table and loses nothing but the
-//! smaller slot. The engine hash is also a chain hash (a hash of the parent's hash and the
-//! block's content), which is what lets a store walk match a run by one engine hash at the end
-//! of its window instead of a content hash per block (`match_run`); the content hash at the
-//! landing is still checked, and a store that fails it (`landing_mismatches`) is placed by its
-//! content, block by block.
+//! distinct block, the one its first holder stored, in an array parallel to the content hashes.
+//! The engine hash is a chain hash (a hash of the parent's hash and the block's content), which
+//! is what lets a store walk match a run by one engine hash at the end of its window instead of
+//! a content hash per block (`match_run`); the content hash at the landing is still checked, and
+//! a store that fails it (`landing_mismatches`) is placed by its content, block by block. A
+//! worker whose engine names the same content by other hashes (`engine_conflicts` in the stats)
+//! is matched by content too; its own hashes key its lane map, so nothing else changes for it.
+//! A lane-map slot carries its key: a probe is settled in the map itself, with no read into the
+//! index per block (key-less 8-byte slots checked through the index cost 30-40% of lane CPU).
 //!
 //! Memory: 16 bytes per distinct block on a chain (its content hash and its engine hash, shared
 //! by every worker that holds it, with about 12% slack for growth) plus a 64-byte run header, the
-//! coverage words and a child table per branching run, against the 10-byte lane-map slot each
+//! coverage words and a child table per branching run, against the 16-byte lane-map slot each
 //! lane keeps per held block for removals.
 
 use std::{
@@ -1079,7 +1078,8 @@ pub struct RunIndexStats {
     /// words, used or not.
     pub slab_bytes: usize,
     /// Stored blocks whose engine hash differed from the one the index carries for the block
-    /// (an engine fleet that does not agree on hashes); they live in the lane maps' side tables.
+    /// (an engine fleet that does not agree on hashes); such a block is matched by content and
+    /// keyed by the worker's own hash in its lane map.
     pub engine_conflicts: usize,
     /// Stores whose blocks carried the engine hashes the index holds for other content: what
     /// the relay's hash check refuses at the engine, seen from the index. Such a store is
@@ -1198,8 +1198,7 @@ pub struct RunIndex {
     worker_blocks: Box<[CachePadded<AtomicUsize>]>,
     /// Per-worker signed contributions to the distinct-block count, summed on demand.
     distinct_blocks: Box<[CachePadded<AtomicIsize>]>,
-    /// Stored blocks whose engine hash was not the one the index carries (kept in the lane
-    /// maps' exact side tables).
+    /// Stored blocks whose engine hash was not the one the index carries.
     engine_conflicts: AtomicUsize,
     /// Stores whose blocks carried the engine hashes the index holds for other content.
     landing_mismatches: AtomicUsize,
@@ -1233,9 +1232,8 @@ enum Walk {
 /// What the lock-free look at a run during a store walk decided.
 enum Plan {
     /// Nothing changes here: `matched` blocks are already held; carry on after them. With them,
-    /// the blocks (indices into the matched range) whose engine hash is not the one the index
-    /// carries.
-    Skip(usize, Vec<usize>),
+    /// how many of the matched blocks carry an engine hash that is not the one the index holds.
+    Skip(usize, usize),
     /// Continue in the child `(id, generation)` from its first block.
     Descend(u32, u32),
     /// Open a new child for the blocks in hand, without the run's lock if the table has room.
@@ -1272,21 +1270,19 @@ struct Placed {
     offset: u32,
     start: usize,
     count: usize,
-    /// Blocks of the range (indices from 0) whose engine hash differs from the one the index
-    /// carries for the block: they go to the lane map's exact side table.
-    conflicts: Vec<usize>,
+    /// Blocks of the range whose engine hash differs from the one the index carries for the
+    /// block (counted in the stats; the worker's own hash keys its lane map either way).
+    conflicts: usize,
 }
 
-/// Indices of the stored blocks whose engine hash is not the one the index carries (`engines`
-/// runs parallel to `stored`). Empty, and allocation-free, in a fleet whose engines agree.
-fn engine_conflicts(stored: &[StoredBlock], engines: &[AtomicU64]) -> Vec<usize> {
-    let mut conflicts = Vec::new();
-    for (index, (block, slot)) in stored.iter().zip(engines).enumerate() {
-        if block.seq_hash.0 != slot.load(Ordering::Relaxed) {
-            conflicts.push(index);
-        }
-    }
-    conflicts
+/// How many of the stored blocks carry an engine hash that is not the one the index holds
+/// (`engines` runs parallel to `stored`); zero in a fleet whose engines agree.
+fn engine_conflicts(stored: &[StoredBlock], engines: &[AtomicU64]) -> usize {
+    stored
+        .iter()
+        .zip(engines)
+        .filter(|(block, slot)| block.seq_hash.0 != slot.load(Ordering::Relaxed))
+        .count()
 }
 
 /// A batch of a worker's offsets in one run, with the generation the run must still have.
@@ -1573,63 +1569,10 @@ impl RunIndex {
         }
     }
 
-    /// The engine hash of the block a lane-map entry points at, read where the block lives now
-    /// (forwarding records followed), or `None` when nobody holds it any more. This is how a
-    /// key-less lane map slot is checked against its key. Lock-free unless the entry points past
-    /// a run's end while its split is still in flight (the forward record arrives before the
-    /// splitter's lock is released), when the run's lock settles it. Never called with a run lock
-    /// held.
-    fn engine_hash_at(&self, mut at: BlockRef) -> Option<u64> {
-        loop {
-            let (place, generation) = self.resolve(at)?;
-            let run = self.slab.run(place.run);
-            let mut settled = None;
-            for _ in 0..8 {
-                let (window, version) = run.snapshot();
-                if (version >> 32) as u32 != generation {
-                    return None;
-                }
-                if window.engine == NONE || place.offset >= window.len {
-                    break;
-                }
-                let hash = self
-                    .arena
-                    .word(window.engine + window.base + place.offset)
-                    .load(Ordering::Relaxed);
-                if run.confirm(version) {
-                    settled = Some(hash);
-                    break;
-                }
-            }
-            if let Some(hash) = settled {
-                return Some(hash);
-            }
-            let meta = run.meta.lock();
-            if meta.dead || run.generation() != generation {
-                return None;
-            }
-            let forwards = run.forwards.load(Ordering::Relaxed);
-            match self.arena.forwards_find(forwards, place.offset) {
-                Some((next, _)) => {
-                    drop(meta);
-                    at = next;
-                }
-                None => {
-                    if (place.offset as usize) >= run.len() {
-                        return None;
-                    }
-                    let data = run.engine.load(Ordering::Relaxed)
-                        + run.base.load(Ordering::Relaxed)
-                        + place.offset;
-                    return Some(self.arena.word(data).load(Ordering::Relaxed));
-                }
-            }
-        }
-    }
-
     /// Whether `worker`'s lane map holds the block with engine hash `key`.
     pub fn is_held(&self, map: &RunBlockMap, key: SequenceHash) -> bool {
-        map.contains_key(key, |at| self.engine_hash_at(at) == Some(key.0))
+        let _ = self;
+        map.contains_key(key)
     }
 
     /// Add `child` to the run's table (the run is locked): claims a slot like a lock-free
@@ -2050,7 +1993,7 @@ impl RunIndex {
                 if map.is_empty() {
                     return Err(ApplyError::WorkerNotTracked);
                 }
-                match map.get(hash, |at| self.engine_hash_at(at) == Some(hash.0)) {
+                match map.get(hash) {
                     Some(at) => Some((hash, at)),
                     None => return Err(ApplyError::ParentBlockNotFound),
                 }
@@ -2086,35 +2029,11 @@ impl RunIndex {
                 offset: placed.offset,
             };
             let range = &blocks[placed.start..placed.start + placed.count];
-            if placed.conflicts.is_empty() {
-                map.insert_run(
-                    range.iter().map(|stored| stored.seq_hash),
-                    first,
-                    |at, key| self.engine_hash_at(at) == Some(key.0),
-                    |at| self.engine_hash_at(at),
-                );
-                continue;
+            if placed.conflicts > 0 {
+                self.engine_conflicts
+                    .fetch_add(placed.conflicts, Ordering::Relaxed);
             }
-            // An engine that names a block by another hash than the index carries: those keys
-            // go to the exact side table, the rest in one by one.
-            self.engine_conflicts
-                .fetch_add(placed.conflicts.len(), Ordering::Relaxed);
-            for (index, stored) in range.iter().enumerate() {
-                let at = BlockRef {
-                    run: first.run,
-                    offset: first.offset + index as u32,
-                };
-                if placed.conflicts.contains(&index) {
-                    map.insert_overflow(stored.seq_hash, at);
-                } else {
-                    map.insert_run(
-                        std::iter::once(stored.seq_hash),
-                        at,
-                        |at, key| self.engine_hash_at(at) == Some(key.0),
-                        |at| self.engine_hash_at(at),
-                    );
-                }
-            }
+            map.insert_run(range.iter().map(|stored| stored.seq_hash), first);
         }
         lap(self.counter_slot(2), writes);
         outcome
@@ -2152,15 +2071,10 @@ impl RunIndex {
             None => (ROOT, 0usize, self.slab.run(ROOT).generation()),
             Some((hash, at)) => {
                 let Some((at, generation)) = self.resolve(at) else {
-                    map.remove(hash, |at| self.engine_hash_at(at) == Some(hash.0));
+                    map.remove(hash);
                     return Walk::NoParent;
                 };
-                map.insert(
-                    hash,
-                    at,
-                    |at| self.engine_hash_at(at) == Some(hash.0),
-                    |at| self.engine_hash_at(at),
-                );
+                map.insert(hash, at);
                 (at.run, at.offset as usize + 1, generation)
             }
         };
@@ -2258,7 +2172,7 @@ impl RunIndex {
                                 offset: 0,
                                 start: block_start,
                                 count: remaining.len(),
-                                conflicts: Vec::new(),
+                                conflicts: 0,
                             });
                             self.credit(worker, contents.len());
                             self.distinct_add(worker, contents.len());
@@ -2348,8 +2262,8 @@ impl RunIndex {
     }
 
     /// How far `remaining` continues a run whose hashes from the position in hand are `contents`
-    /// and `engines`: the matched count and the matched positions whose engine hash is not the
-    /// one the index carries.
+    /// and `engines`: the matched count and how many of the matched blocks carry an engine hash
+    /// that is not the one the index holds.
     ///
     /// An engine hash is a chain hash: an engine names a block by a hash of its parent's hash and
     /// the block's own content, so two chains that agree at a position agree at every position
@@ -2360,8 +2274,7 @@ impl RunIndex {
     /// landing (a block named by the hash the index carries but holding other content, which
     /// is what the relay's hash check exists to catch; `landing_mismatches` counts it), and the
     /// content hash right after the match (an engine that hashes the same content differently
-    /// matches by content where it cannot by engine hash, and its keys belong in the lane map's
-    /// side table).
+    /// matches by content where it cannot by engine hash, and is counted).
     ///
     /// `count` says whether a landing mismatch is counted: the lock-free look at a run finds it
     /// first and then takes the lock, where the locked look finds it again.
@@ -2371,10 +2284,10 @@ impl RunIndex {
         engines: &[AtomicU64],
         remaining: &[StoredBlock],
         count: bool,
-    ) -> (usize, Vec<usize>) {
+    ) -> (usize, usize) {
         let window = remaining.len().min(contents.len()).min(engines.len());
         if window == 0 {
-            return (0, Vec::new());
+            return (0, 0);
         }
         let engine_eq = |at: usize| remaining[at].seq_hash.0 == engines[at].load(Ordering::Relaxed);
         let content_eq =
@@ -2397,7 +2310,7 @@ impl RunIndex {
         let landing_holds = matched == 0 || content_eq(matched - 1);
         let same_content_after = matched < window && content_eq(matched);
         if landing_holds && !same_content_after {
-            return (matched, Vec::new());
+            return (matched, 0);
         }
         if !landing_holds && count {
             self.landing_mismatches.fetch_add(1, Ordering::Relaxed);
@@ -2560,7 +2473,7 @@ impl RunIndex {
             offset: first as u32,
             start: block_start,
             count: remaining.len(),
-            conflicts: Vec::new(),
+            conflicts: 0,
         });
         self.credit(worker, contents.len());
         self.distinct_add(worker, contents.len());
@@ -2641,11 +2554,7 @@ impl RunIndex {
         }
         let unmapping = tick();
         let mut refs: Vec<BlockRef> = Vec::with_capacity(hashes.len());
-        map.remove_all(
-            hashes,
-            |at, key| self.engine_hash_at(at) == Some(key.0),
-            |at| refs.push(at),
-        );
+        map.remove_all(hashes, |at| refs.push(at));
         lap(self.counter_slot(3), unmapping);
         let grouping = tick();
         refs.sort_unstable_by_key(|at| at.run);
@@ -2759,7 +2668,7 @@ impl RunIndex {
         // shadow the live run that reused the id.
         let mut seen: FxHashSet<(u32, Option<u32>)> = FxHashSet::default();
         let mut work: Vec<(u32, Option<u32>)> = Vec::new();
-        for at in map {
+        for (_, at) in map {
             if seen.insert((at.run, None)) {
                 work.push((at.run, None));
             }
@@ -3537,11 +3446,7 @@ mod tests {
         index
             .apply_stored(w, &blocks[..140], None, &mut mw)
             .expect("first store");
-        let verify = |at: BlockRef, key: SequenceHash| index.engine_hash_at(at) == Some(key.0);
-        let run_id = mw
-            .get(blocks[0].seq_hash, |at| verify(at, blocks[0].seq_hash))
-            .expect("mapped")
-            .run;
+        let run_id = mw.get(blocks[0].seq_hash).expect("mapped").run;
         let run = index.slab.run(run_id);
         let (block, engine) = (
             run.block.load(Ordering::Relaxed),
@@ -3642,8 +3547,8 @@ mod tests {
 
     /// A worker whose engine names the same content by other hashes cannot match by engine
     /// hash; the walk sees the content continue past the mismatch, compares block by block and
-    /// sends that worker's keys to its side table: lookups, an extension after its own parent
-    /// hash and removals by its hashes all stay exact.
+    /// counts the conflicts, and the worker's own hashes key its lane map: lookups, an extension
+    /// after its own parent hash and removals by its hashes all stay exact.
     #[test]
     fn a_worker_with_other_engine_hashes_matches_by_content() {
         let index = RunIndex::with_max_workers(8);
@@ -3667,7 +3572,6 @@ mod tests {
             .expect("b");
         assert_eq!(scores(&index, &chain), vec![(a, 40), (b, 40)]);
         assert_eq!(index.stats().engine_conflicts, 40);
-        assert_eq!(mb.overflow_len(), 40);
         index
             .apply_stored(b, &other[40..], Some(other[39].seq_hash), &mut mb)
             .expect("b extends");
@@ -3732,12 +3636,7 @@ mod tests {
         let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index.apply_stored(w, &blocks, None, &mut mw).expect("w");
-        let parent = mw
-            .get(blocks[9].seq_hash, |at| {
-                index.engine_hash_at(at) == Some(blocks[9].seq_hash.0)
-            })
-            .expect("mapped")
-            .run;
+        let parent = mw.get(blocks[9].seq_hash).expect("mapped").run;
         let (_, planned) = index.slab.run(parent).snapshot();
         // Another lane diverges inside the run: it is split at 5, its end moves.
         let mut fork: Vec<ContentHash> = held[..5].to_vec();
