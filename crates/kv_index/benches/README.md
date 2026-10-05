@@ -188,6 +188,33 @@ why, and the background processes seen. The sampled rows are stored raw, so re-r
 same output directory resumes an interrupted run and re-summarises finished trials under other
 thresholds.
 
+### Query issuers
+
+Same corpus, null backend, 16 event issuers on CPUs 0-15, Q query issuers on 16..16+Q-1, lanes on
+24-63; cells give the generator verdict and the rate actually issued:
+
+| Query issuers | 150 ms (2.13B offered) | 75 ms (4.27B offered) | 50 ms (6.40B offered) | 35 ms (9.15B offered) |
+| --- | --- | --- | --- | --- |
+| 1 | invalid, 1.55B issued | - | invalid, 1.44B issued | - |
+| 2 | valid, 2.13B issued | - | invalid, 2.62B issued | - |
+| 4 | valid, 2.13B issued | invalid, 3.55B issued | invalid, 3.11B issued | - |
+| 8 | - | - | invalid, 4.98B issued | invalid, 4.45B issued |
+
+Event issuers at four query issuers, same layout:
+
+| Event issuers | 150 ms (2.13B offered) | 50 ms (6.40B offered) |
+| --- | --- | --- |
+| 4 | invalid, 1.66B issued | invalid, 1.73B issued |
+| 8 | valid, 2.13B issued | invalid, 3.11B issued |
+| 16 | valid, 2.13B issued | invalid, 3.11B issued |
+
+Sharding the query issuer moves the idle-lane ceiling from below 1.55B (one issuer, whatever the
+number of event issuers) to 2.13B on schedule with two or four, and the generator issues 3.5-5B
+block ops/s at shorter windows without holding the schedule; four event issuers cap near 1.7B,
+eight are enough for 2.13B. These are worst-case numbers (every publish wakes a parked lane); with
+a busy backend the same layouts issue far more on schedule, as the overloaded `PositionalIndexer`
+rows above show.
+
 ## Measurement method for published numbers
 
 This is the method guardrail 5 asks for, as the runner implements it; a publication can cite
@@ -244,12 +271,76 @@ above; the 750 ms window offers 427M.
 | Dynamo CRTC, Dynamo harness | 750 ms window (427M offered) | 20 / 0 | 20 of 20 | 426.0 [426.0, 426.1] | 3.4 [3.3, 3.4] | 14 [13, 14] | +0.0 [-0.0, +0.1], +0.0 [-0.1, +0.1], +0.2 [-0.1, +0.4] |
 | control (same binary) (Dynamo CRTC) | same | 20 / 0 | 19 of 20 | 426.0 [426.0, 426.0] | 3.4 [3.3, 3.4] | 13 [13, 14] | |
 
+Overload (capacity) points on the same layout, added when their series completed:
+
+| System, harness | Load | Used / discarded | Kept up | Achieved median [95% CI] (M block ops/s) | Lookup p50 [CI] (us) | Lookup p99 [CI] (us) |
+| --- | --- | --- | --- | --- | --- | --- |
+| SMG PositionalIndexer, SMG harness | 750 ms window (427M offered, overloaded) | 22 / 4 | 0 of 22 | 138.5 [136.2, 140.4] | 14.8 [14.7, 14.9] | 225 [223, 226] |
+| control (same binary) | same | 20 / 6 | 0 of 20 | 140.1 [138.7, 170.1] | 14.6 [13.4, 14.8] | 224 [221, 238] |
+| Dynamo CRTC, Dynamo harness | 300 ms window (1.07B offered, overloaded) | 20 / 11 | 0 of 20 | 857.4 [807.4, 868.8] | 2.9 [2.9, 2.9] | 12 [12, 13] |
+| SMG PositionalIndexer, SMG harness, cores 26 and 35 excluded from the lane mask | 750 ms window | 20 / 12 | 0 of 20 | 133.9 [131.9, 137.7] | 14.5 [13.4, 14.6] | 240 [234, 243] |
+
 The control pairs put the noise floor at or below one unit in the last digit for throughput and
-lookup p50; lookup p99 for the SMG indexer has a wider floor (about ±10 us at 20 trials). Discarded
-trials were replaced; the reasons were other users' jobs crossing 50% of a core (git operations,
-a backup agent, a load generator). At 750 ms the competitor still keeps up (99.8% of 427M), so its
-capacity point needs a shorter window; the SMG indexer's 750 ms series and the competitor's 300 ms
-series are the next rows.
+lookup p50 at sustained load; lookup p99 for the SMG indexer has a wider floor (about ±10 us at
+20 trials), and overload capacity has the widest (the SMG 750 ms subject and control differ by
+1.7M with an interval of [-31.7, +1.2]). Discarded trials were replaced; the reasons were
+other users' jobs crossing 50% of a core (git operations, a source-control filesystem, a backup
+agent, a load generator). Excluding cores 26 and 35 from the lane mask did not shrink the spread
+(achieved-rate interval width 5.8M against 4.2M with the full mask; p99 widths 9 against 4 us),
+so the full mask stays. At 750 ms the competitor still keeps up (99.8% of 427M); its capacity is
+the 300 ms row.
+
+## Scaled layout: equal backend cores and same-binary rows
+
+The competitor layout gives the two harnesses different lane sets and leaves the generator as the
+limit past about 1.5B block ops/s (one query issuer, see Issuer scaling). The scaled layout fixes
+both: 8 event issuers on CPUs 0-7, 4 query issuers on 8-11 in the SMG harness (one, on 8, in
+Dynamo's), and 64 event lanes plus 128 query lanes on 12-63 for every system, so every row below
+ran on 52 lane cores and every total divides by the same number. The rows a publication cites are
+the same-binary ones: Dynamo's `mooncake_bench` running its CRTC and, through the adapter kept
+with the measurement scripts outside this repository, this crate's `PositionalIndexer` and
+`RunIndex`, one binary, one generator, one lane scheduler. The SMG harness rows are the
+cross-check: the two harnesses agree to 0.2% at 107M (Parity) and the SMG harness reads lower at
+high rates, since it mirrors Dynamo's per-event costs but not its lane scheduling.
+
+Binaries, one build each, every trial of the entry on these: Dynamo `mooncake_bench` from
+ai-dynamo/dynamo `50bdb355f8` with features `mooncake,router-bench` (mimalloc), plus the
+out-of-tree wiring and lane-CPU patches; the same-binary build adds this crate as a path
+dependency at `408b3254` (indexers as in `perf/kv-router-leap` `b4943d69`, the run index with the
+lane pool); the SMG replayer `mooncake_replay` built from `93876aa0` (the same indexers). Every
+result JSON carries its command line and the hashes of its binary and of the trace or corpus, and
+every series directory carries a provenance file naming the build it ran on.
+
+### Brackets
+
+Threshold searches as above (3 fresh processes per point, all three must achieve 99% of offered
+with a valid generator, geometric bisection to within 10%; a trial that fell short while a foreign
+process sat above half a core on the measurement cores is replaced, not counted). Per lane core
+is the kept-up rate over the 52 lane cores.
+
+| Indexer, harness | Keeps up at | Per lane core (M) | Fails at | Ratio | Trials at the failing rate (achieved / offered) | Lookup p50 / p99 (us) at the kept-up rate | Points, replaced trials |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Dynamo CRTC, Dynamo harness | 480.8M | 9.25 | 511.2M | 1.063 | 99.7%, 99.7%, 89.4% | 3.5-3.6 / 14 | 6, 0 |
+| SMG `PositionalIndexer`, Dynamo harness | 132.4M | 2.55 | 143.1M | 1.080 | 93.9%, 94.3%, 95.2% | 30.6-31.7 / 449-516 | 7, 0 |
+| SMG `RunIndex`, Dynamo harness | 656.4M | 12.62 | 718.7M | 1.095 | 99.7%, 99.8%, 98.9% | 1.3-1.4 / 4 | 6, 3 |
+| SMG `PositionalIndexer`, SMG harness | 122.6M | 2.36 | 132.4M | 1.080 | 99.4%, 96.2%, 96.3% | 28.1-34.4 / 347-487 | 7, 0 |
+| SMG `RunIndex`, SMG harness | 571.7M | 10.99 | 611.3M | 1.069 | 99.8%, 99.8%, 96.9% | 1.1 / 6 | 7, 0 |
+| no indexer (harness ceiling), SMG harness | 1669.9M | 32.11 | 1766.1M | 1.058 | 98.5%, 98.9%, 99.8% | 0.4-0.5 / 3-4 | 7, 0 |
+
+The strict rule makes every bracket conservative: the competitor's failing point at 511.2M and
+the run index's at 718.7M each lost one trial of three (89.4% with nothing above 5% of a core in
+the samples around it; 98.9%), and the competitor achieved 98.9-99.3% at 653.3M and 69-74% of
+1.07B (736-790M) when overloaded, while the run index achieved 99.5-99.6% in two trials of three
+at 1,033M. In one binary and on the same 52 cores the run index keeps up with 1.37x the
+competitor's sustained rate (12.6 against 9.3M block ops/s per lane core) with lookups at p50
+1.3 us and p99 4 us against 3.5 us and 14 us; the positional design keeps up at 0.28x of it. The
+SMG harness brackets read 7-13% lower than Dynamo's for the same indexers (positional 122.6
+against 132.4M, run index 571.7 against 656.4M); the null backend's 1.67B is the harness's own
+ceiling on this layout (the generator, with the lanes doing nothing).
+
+### 20-trial series
+
+(in progress: rendered by `protocol-tables.py` when the series complete)
 
 ## Plugging in a new index
 
