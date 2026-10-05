@@ -56,10 +56,12 @@ replay, which models the same loop):
 - **block-level KV pool** — `--kv-blocks`/`--kv-tokens` physical blocks of
   `--block-size` tokens, keyed by content hash with reference counts; idle
   cached blocks sit in an LRU and are evicted head-first when an allocation
-  needs room; a running request that still cannot get a block preempts the most
-  recently admitted request (LIFO), which recomputes later. A fully cached
-  prompt recomputes its last block; a prefix hit on an idle block references it
-  again.
+  needs room; a waiting prompt is admitted only when the pool has room for all
+  of it beyond its cached blocks (vLLM's `scheduler_reserve_full_isl`,
+  head-of-line), and a running request that still cannot get a block for its
+  next tokens preempts the most recently admitted request (LIFO), which
+  recomputes later. A fully cached prompt recomputes its last block; a prefix
+  hit on an idle block references it again.
 - **KV events** (`SubscribeKvEvents`) — per request within a pass, `Removed`
   for the blocks evicted by its allocation, then one `Stored` per contiguous
   run of blocks it completed (parent-chained, with token ids). `Removed` fires
@@ -93,6 +95,7 @@ replay, which models the same loop):
 | `--block-size` | 16 | cache block/page size (tokens); must match the worker's `kv_block_size` |
 | `--prefix-cache` | true | prefix caching + KV events |
 | `--prefill-first` | false | SGLang-style prefill-only passes |
+| `--reserve-full-isl` | true | admit a waiting prompt only when KV room exists for all of it beyond its cached blocks, stopping at the first that does not fit (vLLM's `scheduler_reserve_full_isl`); `false` reserves only the pass's chunk |
 | `--context-length` | 32768 | advertised context length |
 | `--loads-like` | mock | `vllm`: report only what the vLLM servicer reports (running, waiting, `token_usage`, maxima), so the gateway's expected-wait routes as it does on a vLLM fleet |
 | `--admin-port` | off | process-wide admin API (below) |

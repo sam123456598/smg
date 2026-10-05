@@ -219,6 +219,9 @@ impl Config {
                 "--prefill-first" => {
                     cfg.engine.prefill_first = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--reserve-full-isl" => {
+                    cfg.engine.reserve_full_isl = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--context-length" => {
                     cfg.context_length = parse(value(&mut args, &flag)?, &flag)?;
                 }
@@ -355,6 +358,8 @@ fn usage() -> String {
        --block-size <n>         cache block/page size in tokens (default 16)\n\
        --prefix-cache <bool>    enable prefix caching + KV events (default true)\n\
        --prefill-first <bool>   SGLang-style: a pass with prefill runs prefill only (default false)\n\
+       --reserve-full-isl <bool>  admit a prompt only with KV room for all of it beyond its cached\n\
+                                blocks, head-of-line (vLLM's scheduler_reserve_full_isl; default true)\n\
        --context-length <n>     advertised context length (default 32768)\n\
        --kv-events-zmq-base-port <port>  vLLM-wire ZMQ KV-event publishers: worker i publishes\n\
                                 on base+2i (PUB) and replays on base+2i+1 (ROUTER) (default off)\n\

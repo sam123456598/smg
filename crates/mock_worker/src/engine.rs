@@ -397,6 +397,11 @@ pub struct EngineParams {
     pub prefix_cache: bool,
     /// SGLang-style scheduling: a pass that contains prefill runs prefill only.
     pub prefill_first: bool,
+    /// vLLM's `scheduler_reserve_full_isl`: a waiting request is admitted only
+    /// when KV room exists for its whole prompt beyond its cached blocks, and
+    /// admission stops at the first request that does not fit. Off, only the
+    /// pass's chunk is reserved (the older, over-admitting behaviour).
+    pub reserve_full_isl: bool,
     /// Output tokens to generate when a request does not specify `max_new_tokens`.
     pub max_new_default: u32,
     /// Fixed per-request overhead in ms (a calibration's intercept that the
@@ -419,6 +424,7 @@ impl Default for EngineParams {
             block_size: 16,
             prefix_cache: true,
             prefill_first: false,
+            reserve_full_isl: true,
             max_new_default: 128,
             request_overhead_ms: 0.0,
             kv_broadcast_capacity: 1024,
@@ -1085,6 +1091,9 @@ struct RunningReq {
     held: Vec<u64>,
     /// Whether an anonymous (not yet full) block is allocated for the tail.
     partial: bool,
+    /// Anonymous blocks reserved ahead for the rest of the prompt (full-ISL
+    /// admission); chunks draw on these before asking the pool.
+    reserved_spare: u64,
     /// Tokens of the not-yet-full tail block (the next stored event's payload).
     pending: Vec<u32>,
     /// FNV over every token of the sequence so far (the next block's key).
@@ -1518,7 +1527,14 @@ impl SchedulerState {
             let chunk = remaining.min(budget);
             let completes = chunk == remaining;
             let add = chunk + u32::from(completes);
-            let need = blocks_for(cached + add, bs) - cached_blocks as u64;
+            // Room for this pass's chunk, or for the whole prompt (plus the
+            // first output token's slot) under full-ISL reservation.
+            let covered = if p.reserve_full_isl {
+                cached + remaining + 1
+            } else {
+                cached + add
+            };
+            let need = blocks_for(covered, bs) - cached_blocks as u64;
             // Reference the cached prefix before making room, so the eviction
             // cannot take the very blocks this request is about to reuse.
             for k in &front.keys[..cached_blocks] {
@@ -1594,12 +1610,16 @@ impl SchedulerState {
                 output_ids,
                 held: Vec::new(),
                 partial: false,
+                reserved_spare: 0,
                 pending: Vec::new(),
                 rolling_hash: w.rolling_hash,
                 token_seed,
             });
             let idx = self.running.len() - 1;
             self.running[idx].held = self.running[idx].seq_keys[..cached_blocks].to_vec();
+            // Everything reserved beyond this pass's chunk is spare for the next chunks.
+            self.running[idx].reserved_spare =
+                need.saturating_sub(blocks_for(cached + add, bs) - cached_blocks as u64);
             evicted.extend(freed.iter().copied());
             self.push_removed(&mut kv, freed, p);
             let mut completed = self.apply_prefill(idx, chunk, p);
@@ -1725,7 +1745,10 @@ impl SchedulerState {
     ) -> Result<(), Blocked> {
         let bs = p.block_size.max(1);
         let before = self.running[idx].seq_len();
-        let need = blocks_for(before + add, bs) - blocks_for(before, bs);
+        let mut need = blocks_for(before + add, bs) - blocks_for(before, bs);
+        let spare = self.running[idx].reserved_spare.min(need);
+        self.running[idx].reserved_spare -= spare;
+        need -= spare;
         if need == 0 {
             return Ok(());
         }
@@ -1803,6 +1826,7 @@ impl SchedulerState {
         if r.partial {
             self.pool.release_anonymous(1);
         }
+        self.pool.release_anonymous(r.reserved_spare);
     }
 
     /// Compute `chunk` more prompt tokens of `running[idx]`, registering the
@@ -2742,6 +2766,91 @@ mod tests {
             st.pool.allocated
         );
         drop(rxs);
+    }
+
+    #[test]
+    fn full_isl_reservation_admits_only_prompts_that_fit_and_blocks_head_of_line() {
+        // 16 blocks of 4 tokens. Two 40-token prompts need 10 blocks (+1 for the
+        // first token) each: the second does not fit beside the first, and a
+        // small prompt behind it waits too (head-of-line), as vLLM does.
+        let p = EngineParams {
+            block_size: 4,
+            kv_capacity_tokens: 64,
+            max_batched_tokens: 60,
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let (a, _ra) = req("a", (0..40).collect(), 1);
+        let (b, _rb) = req("b", (100..140).collect(), 1);
+        let (c, _rc) = req("c", (200..208).collect(), 1);
+        st.enqueue(a, &p);
+        st.enqueue(b, &p);
+        st.enqueue(c, &p);
+        let step = st.step(&p);
+        assert_eq!(step.admitted.len(), 1, "only the first prompt fits");
+        assert_eq!(
+            step.snapshot.num_waiting_reqs, 2,
+            "the small prompt waits behind the big one"
+        );
+        assert!(st.pool.allocated <= 16);
+
+        // Without the reservation the old behaviour admits chunks of everything.
+        let loose = EngineParams {
+            reserve_full_isl: false,
+            ..p.clone()
+        };
+        let mut st = SchedulerState::new();
+        let (a, _ra) = req("a", (0..40).collect(), 1);
+        let (b, _rb) = req("b", (100..140).collect(), 1);
+        st.enqueue(a, &loose);
+        st.enqueue(b, &loose);
+        let step = st.step(&loose);
+        assert_eq!(
+            step.admitted.len(),
+            2,
+            "chunk-only reservation admits both long prompts"
+        );
+    }
+
+    #[test]
+    fn full_isl_reservation_is_spent_by_the_prefill_chunks_and_returned_on_release() {
+        // A 2500-token prompt against a 1000-token pass budget: three chunks
+        // draw on the reservation made at admission; nothing is reserved twice.
+        let p = EngineParams {
+            max_batched_tokens: 1000,
+            block_size: 16,
+            kv_capacity_tokens: 16 * 400,
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let (r, mut rx) = req("long", vec![7; 2500], 3);
+        st.enqueue(r, &p);
+        let after_first = {
+            st.step(&p);
+            st.pool.allocated
+        };
+        assert_eq!(
+            after_first,
+            blocks_for(2501, 16),
+            "the whole prompt and the first token's slot are reserved up front"
+        );
+        let (_, passes) = run_to_first_token(&mut st, &p, &mut rx);
+        assert_eq!(passes, 2, "two more passes finish the prefill");
+        assert_eq!(
+            st.pool.allocated,
+            blocks_for(2501, 16),
+            "chunks consumed the reservation, nothing more"
+        );
+        assert_eq!(st.running[0].reserved_spare, 0, "no spare left over");
+        for _ in 0..10 {
+            st.step(&p);
+        }
+        assert!(st.is_idle());
+        assert_eq!(
+            st.pool.allocated as usize,
+            st.pool.cached(),
+            "once done, only cached blocks remain allocated (no leaked reservation)"
+        );
     }
 
     #[test]
