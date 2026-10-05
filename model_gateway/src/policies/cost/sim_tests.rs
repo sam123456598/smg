@@ -238,49 +238,23 @@ fn run(scenario: Scenario, chooser: Chooser<'_>, seed: u64) -> Outcome {
     }
 }
 
-/// Policies under test with parameters on the simulation's scale (2048-token prefixes, one tick
-/// per second, a 512-token-per-tick drain), where the published defaults encode hardware scale.
+/// Policies under test. The product's own policy, plus the replay harness's comparison baseline
+/// when it is compiled in.
 fn policies() -> Vec<(&'static str, WorkerSelectionPolicy)> {
-    vec![
-        (
-            "cache-aware-default",
-            build("cache-aware-default", None, 0.0).unwrap(),
-        ),
-        (
-            "dynamo-default",
-            build("dynamo-default", None, 0.0).unwrap(),
-        ),
-        (
-            "llm-d-optimized-baseline",
-            build("llm-d-optimized-baseline", None, 0.0).unwrap(),
-        ),
-        (
-            "llm-d-precise-prefix",
-            build("llm-d-precise-prefix", None, 0.0).unwrap(),
-        ),
-        (
-            "llm-d-sticky-until-saturated",
-            build(
-                "llm-d-sticky-until-saturated",
-                Some("{peak_prefill_tokens_per_second: 512, max_ttft_penalty_ms: 2000}"),
-                0.0,
-            )
-            .unwrap(),
-        ),
-        (
-            "ramjet",
-            build(
-                "ramjet",
-                Some("{affinity_block_tokens: 64, load_unit_tokens: 1024}"),
-                0.0,
-            )
-            .unwrap(),
-        ),
-        (
-            "dualmap",
-            build("dualmap", Some("{pending_prefill_token_budget: 4096}"), 0.0).unwrap(),
-        ),
-    ]
+    let list = vec![(
+        "cache-aware-default",
+        build("cache-aware-default", None, 0.0).unwrap(),
+    )];
+    #[cfg(feature = "bench-policies")]
+    let list = {
+        let mut list = list;
+        list.push((
+            "reference-cost",
+            build("reference-cost", None, 0.0).unwrap(),
+        ));
+        list
+    };
+    list
 }
 
 const REPEAT_HEAVY: Scenario = Scenario {

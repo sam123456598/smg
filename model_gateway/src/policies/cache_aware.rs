@@ -1508,7 +1508,7 @@ impl CacheAwarePolicy {
                 None if booked > 0 => Some(booked),
                 None => None,
             };
-            // Dynamo prices decode by the blocks its active sequences hold.
+            // The reference cost prices decode by the blocks its active sequences hold.
             // The router has no per-request block ledger yet, so every
             // request in flight on the worker is taken to hold this request's
             // blocks, plus any output blocks the accounting layer credited.
@@ -6121,18 +6121,11 @@ mod tests {
         );
     }
 
-    /// Parameters that put a ported policy on the tests' scale (4-token
-    /// blocks, 8-token prompts); Ramjet's affinity block is 512 tokens.
-    fn test_scale_params(name: &str) -> Option<String> {
-        (name == "ramjet").then(|| "{affinity_block_tokens: 4}".to_string())
-    }
-
     #[test]
-    fn ported_policies_route_event_driven_hits_and_misses() {
+    fn every_catalog_policy_routes_event_driven_hits_and_misses() {
         for name in cost::POLICY_NAMES {
             let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
                 selection_policy: Some((*name).to_string()),
-                selection_policy_params: test_scale_params(name),
                 ..test_config()
             });
             let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -6165,11 +6158,10 @@ mod tests {
     }
 
     #[test]
-    fn ported_policies_route_tree_matches() {
+    fn every_catalog_policy_routes_tree_matches() {
         for name in cost::POLICY_NAMES {
             let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
                 selection_policy: Some((*name).to_string()),
-                selection_policy_params: test_scale_params(name),
                 ..test_config()
             });
             let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);

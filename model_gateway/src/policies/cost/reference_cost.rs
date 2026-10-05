@@ -1,6 +1,6 @@
-//! Dynamo's default cost function (`dynamo-default-cost-fn`) as an SMG policy.
-//!
-//! From `lib/router-plugins/builtin/src/default/{scorer,picker}.rs` at Dynamo `main`:
+//! The reference prefill-load cost: the published cost formula used by the replay harness as its
+//! comparison baseline, and nothing else. Compiled only with the `bench-policies` feature; the
+//! catalog does not know the name without it.
 //!
 //! ```text
 //! credit  = c · decay · device + 0.75 · host + 0.25 · disk
@@ -9,14 +9,11 @@
 //! decay   = 1 / (1 + k · ((active_prefill − min_active_prefill) / block_size) / request_blocks)
 //! ```
 //!
-//! Departures from the source, all forced by what SMG's host can supply today:
-//! - `decode_blocks` is the host's estimate of the blocks held by the worker's in-flight requests
-//!   (each taken to hold this request's blocks, plus credited output blocks); Dynamo tracks every
-//!   active sequence's blocks itself. The backend's KV usage is deliberately not used: it counts
-//!   reusable cached blocks and lags by a poll interval, which routes by cache fill, not load.
-//! - no shared-cache credit term (SMG indexes no shared pool yet).
-//! - ties at temperature zero go to the smallest worker URL unless `tie_break: uniform`; Dynamo
-//!   draws uniformly in production and deterministically only in replay.
+//! Inputs the host supplies differ from the formula's origin in three ways, all documented on
+//! the inputs: `decode_blocks` is the host's in-flight estimate (requests in flight × this
+//! request's blocks, plus credited output blocks) rather than a per-sequence ledger; there is
+//! no shared-cache credit term; and ties at temperature zero go to the smallest worker URL unless
+//! `tie_break: uniform`.
 
 use super::{
     inputs::{CandidateInputs, RequestInputs},
@@ -24,11 +21,11 @@ use super::{
     softmax::{pick_lowest, TieBreak},
 };
 
-pub const POLICY_NAME: &str = "dynamo-default";
+pub const POLICY_NAME: &str = "reference-cost";
 
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct DynamoDefaultParams {
+pub struct ReferenceCostParams {
     pub overlap_score_credit: f64,
     pub overlap_score_credit_decay: f64,
     pub prefill_load_scale: f64,
@@ -39,7 +36,7 @@ pub struct DynamoDefaultParams {
     pub tie_break: TieBreak,
 }
 
-impl Default for DynamoDefaultParams {
+impl Default for ReferenceCostParams {
     fn default() -> Self {
         Self {
             overlap_score_credit: 1.0,
@@ -54,7 +51,7 @@ impl Default for DynamoDefaultParams {
     }
 }
 
-impl DynamoDefaultParams {
+impl ReferenceCostParams {
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
             ("overlap_score_credit", self.overlap_score_credit),
@@ -80,11 +77,11 @@ impl DynamoDefaultParams {
 }
 
 #[derive(Debug)]
-struct DynamoDefaultScorer {
-    params: DynamoDefaultParams,
+struct ReferenceCostScorer {
+    params: ReferenceCostParams,
 }
 
-impl WorkerScorer for DynamoDefaultScorer {
+impl WorkerScorer for ReferenceCostScorer {
     fn score(
         &self,
         request: &RequestInputs<'_>,
@@ -152,12 +149,12 @@ impl WorkerPicker for LowestCostPicker {
     }
 }
 
-pub(super) fn policy(params: DynamoDefaultParams) -> WorkerSelectionPolicy {
+pub(super) fn policy(params: ReferenceCostParams) -> WorkerSelectionPolicy {
     WorkerSelectionPolicy::new(
         POLICY_NAME,
         Needs::FLEET_WITH_LOADS,
         Vec::new(),
-        vec![Box::new(DynamoDefaultScorer { params })],
+        vec![Box::new(ReferenceCostScorer { params })],
         Box::new(LowestCostPicker {
             temperature: params.router_temperature,
             tie_break: params.tie_break,

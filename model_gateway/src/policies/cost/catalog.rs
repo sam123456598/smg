@@ -1,23 +1,20 @@
 //! The policy catalog: names, parameters, construction.
 //!
-//! Parameters are YAML (JSON is YAML) text, for example
-//! `--selection-policy ramjet --selection-policy-params '{alpha: 2.0, basis: absolute}'`.
-//! Unknown parameters are rejected, so a typo cannot silently fall back to a default.
+//! Parameters are YAML (JSON is YAML) text; unknown parameters are rejected, so a typo cannot
+//! silently fall back to a default. The product ships one selection policy, the cache-aware
+//! default; the `bench-policies` feature adds the replay harness's comparison baseline.
 
-use super::{default, dualmap, dynamo, llm_d, policy::WorkerSelectionPolicy, ramjet};
+#[cfg(feature = "bench-policies")]
+use super::reference_cost;
+use super::{default, policy::WorkerSelectionPolicy};
 
 /// The policy used when none is configured: the pre-policy cache-aware decision.
 pub const DEFAULT_POLICY: &str = default::POLICY_NAME;
 
-pub const POLICY_NAMES: &[&str] = &[
-    default::POLICY_NAME,
-    dynamo::POLICY_NAME,
-    llm_d::OPTIMIZED_BASELINE,
-    llm_d::PRECISE_PREFIX,
-    llm_d::STICKY_UNTIL_SATURATED,
-    ramjet::POLICY_NAME,
-    dualmap::POLICY_NAME,
-];
+#[cfg(not(feature = "bench-policies"))]
+pub const POLICY_NAMES: &[&str] = &[default::POLICY_NAME];
+#[cfg(feature = "bench-policies")]
+pub const POLICY_NAMES: &[&str] = &[default::POLICY_NAME, reference_cost::POLICY_NAME];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -27,6 +24,7 @@ pub enum CatalogError {
     Parameters { name: String, message: String },
 }
 
+#[cfg(feature = "bench-policies")]
 fn parse<T: Default + serde::de::DeserializeOwned>(
     name: &str,
     params: Option<&str>,
@@ -40,28 +38,6 @@ fn parse<T: Default + serde::de::DeserializeOwned>(
     }
 }
 
-fn validated<T>(
-    name: &str,
-    params: T,
-    check: impl Fn(&T) -> Result<(), String>,
-) -> Result<T, CatalogError> {
-    check(&params).map_err(|message| CatalogError::Parameters {
-        name: name.to_string(),
-        message,
-    })?;
-    Ok(params)
-}
-
-fn llm_d_policy(
-    name: &'static str,
-    preset: llm_d::LlmDParams,
-    params: Option<&str>,
-) -> Result<WorkerSelectionPolicy, CatalogError> {
-    let patch = parse::<llm_d::LlmDParamsPatch>(name, params)?;
-    let p = validated(name, preset.apply(&patch), |p| p.validate())?;
-    Ok(llm_d::policy(name, p))
-}
-
 /// The default policy at the given cache-aware temperature; it takes no parameters and cannot
 /// fail to build.
 pub fn default_policy(selection_temperature: f32) -> WorkerSelectionPolicy {
@@ -69,7 +45,7 @@ pub fn default_policy(selection_temperature: f32) -> WorkerSelectionPolicy {
 }
 
 /// Build a policy by name. `selection_temperature` is the cache-aware temperature the default
-/// policy keeps using; the ported policies carry their own temperature in their parameters.
+/// policy keeps using.
 pub fn build(
     name: &str,
     params: Option<&str>,
@@ -85,40 +61,14 @@ pub fn build(
             }
             Ok(default::policy(selection_temperature))
         }
-        dynamo::POLICY_NAME => {
-            let p = validated(
-                name,
-                parse::<dynamo::DynamoDefaultParams>(name, params)?,
-                |p| p.validate(),
-            )?;
-            Ok(dynamo::policy(p))
-        }
-        llm_d::OPTIMIZED_BASELINE => llm_d_policy(
-            llm_d::OPTIMIZED_BASELINE,
-            llm_d::LlmDParams::optimized_baseline(),
-            params,
-        ),
-        llm_d::PRECISE_PREFIX => llm_d_policy(
-            llm_d::PRECISE_PREFIX,
-            llm_d::LlmDParams::precise_prefix(),
-            params,
-        ),
-        llm_d::STICKY_UNTIL_SATURATED => llm_d_policy(
-            llm_d::STICKY_UNTIL_SATURATED,
-            llm_d::LlmDParams::sticky_until_saturated(),
-            params,
-        ),
-        ramjet::POLICY_NAME => {
-            let p = validated(name, parse::<ramjet::RamjetParams>(name, params)?, |p| {
-                p.validate()
+        #[cfg(feature = "bench-policies")]
+        reference_cost::POLICY_NAME => {
+            let p: reference_cost::ReferenceCostParams = parse(name, params)?;
+            p.validate().map_err(|message| CatalogError::Parameters {
+                name: name.to_string(),
+                message,
             })?;
-            Ok(ramjet::policy(p))
-        }
-        dualmap::POLICY_NAME => {
-            let p = validated(name, parse::<dualmap::DualMapParams>(name, params)?, |p| {
-                p.validate()
-            })?;
-            Ok(dualmap::policy(p))
+            Ok(reference_cost::policy(p))
         }
         other => Err(CatalogError::Unknown(other.to_string())),
     }
@@ -137,21 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn parameters_are_parsed_and_checked() {
-        assert!(build("ramjet", Some("{alpha: 2.5, basis: absolute}"), 0.0).is_ok());
-        assert!(matches!(
-            build("ramjet", Some("{alphaa: 2.5}"), 0.0),
-            Err(CatalogError::Parameters { .. })
-        ));
-        assert!(matches!(
-            build(
-                "llm-d-sticky-until-saturated",
-                Some("{affinity_threshold: 1.5}"),
-                0.0
-            ),
-            Err(CatalogError::Parameters { .. })
-        ));
-        assert!(build("llm-d-precise-prefix", Some("{prefix_weight: 1}"), 0.0).is_ok());
+    fn unknown_names_and_stray_parameters_are_rejected() {
         assert!(matches!(
             build("nope", None, 0.0),
             Err(CatalogError::Unknown(_))
@@ -159,6 +95,29 @@ mod tests {
         assert!(matches!(
             build(DEFAULT_POLICY, Some("{x: 1}"), 0.0),
             Err(CatalogError::Parameters { .. })
+        ));
+    }
+
+    #[cfg(feature = "bench-policies")]
+    #[test]
+    fn the_bench_baseline_takes_json_parameters_and_checks_them() {
+        assert!(build("reference-cost", Some(r#"{"router_temperature":0.5}"#), 0.0).is_ok());
+        assert!(matches!(
+            build("reference-cost", Some("{overlap_score_credit: -1}"), 0.0),
+            Err(CatalogError::Parameters { .. })
+        ));
+        assert!(matches!(
+            build("reference-cost", Some("{alphaa: 2.5}"), 0.0),
+            Err(CatalogError::Parameters { .. })
+        ));
+    }
+
+    #[cfg(not(feature = "bench-policies"))]
+    #[test]
+    fn the_bench_baseline_is_not_selectable_without_the_feature() {
+        assert!(matches!(
+            build("reference-cost", None, 0.0),
+            Err(CatalogError::Unknown(_))
         ));
     }
 }

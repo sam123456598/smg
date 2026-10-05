@@ -347,8 +347,8 @@ struct CliArgs {
 
     /// Worker selection policy for cache_aware, run over the per-worker
     /// inputs the router gathers (prefix overlap, in-flight requests,
-    /// backend load reports): cache-aware-default (the affinity-group
-    /// decision), dynamo-default, llm-d-optimized-baseline, ramjet, dualmap
+    /// backend load reports); cache-aware-default is the affinity-group
+    /// decision
     #[arg(
         long,
         default_value = "cache-aware-default",
@@ -356,9 +356,8 @@ struct CliArgs {
     )]
     selection_policy: String,
 
-    /// YAML/JSON parameters for --selection-policy, e.g.
-    /// '{alpha: 2.0, basis: absolute}' for ramjet; each policy documents its
-    /// own and rejects unknown ones
+    /// YAML/JSON parameters for --selection-policy; each policy documents
+    /// its own and rejects unknown ones
     #[arg(long, help_heading = "Routing Policy")]
     selection_policy_params: Option<String>,
 

@@ -4,8 +4,8 @@
 //! Between a dispatch and the engine's first KV event (or load report) the index and the load
 //! snapshot are stale by exactly that request. Under a burst of sibling requests (best-of-N, agent
 //! fan-out, replayed sessions) that window is enough to herd them all onto one worker. This keeps
-//! two short-lived views, in the spirit of Dynamo's predict-on-route side index and its
-//! active-sequence booking:
+//! two short-lived views, in the spirit of a predict-on-route side index and an active-sequence
+//! booking:
 //!
 //! - **booked prefill**: the predicted uncached tokens of each dispatched request, charged to the
 //!   chosen worker until it completes or the booking expires;
