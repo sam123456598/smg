@@ -91,7 +91,7 @@ const WORD_CHUNK: usize = 1 << WORD_CHUNK_BITS;
 const WORD_DIR: usize = 1 << 12;
 /// Hash array capacities: multiples of 8 up to 128, then powers of two.
 const SMALL_ARRAY_CLASSES: usize = 16;
-const ARRAY_CLASSES: usize = SMALL_ARRAY_CLASSES + 13;
+const ARRAY_CLASSES: usize = SMALL_ARRAY_CLASSES + 4 * 13;
 /// Child table slot counts: powers of two from 2.
 const MIN_TABLE_SLOTS: usize = 2;
 const TABLE_CLASSES: usize = 27;
@@ -109,13 +109,18 @@ pub struct BlockRef {
 
 pub use crate::lane_map::RunBlockMap;
 
-/// Hash array capacity class: `8, 16, .., 128, 256, 512, ..`.
+/// Hash array capacity class: `8, 16, .., 128` in steps of 8, then four classes per octave
+/// (`160, 192, 224, 256, 320, ..`), so an array wastes at most a quarter of its words to the
+/// class, not half; a run of 140 blocks with its slack lands in 160, not 256.
 fn array_class(capacity: usize) -> usize {
     if capacity <= 8 * SMALL_ARRAY_CLASSES {
         capacity.div_ceil(8).max(1) - 1
     } else {
+        // `capacity` in `(low, 2 * low]` with `low` a power of two from 128 up.
         let bits = usize::BITS - (capacity - 1).leading_zeros();
-        SMALL_ARRAY_CLASSES + (bits as usize - 8)
+        let low = 1usize << (bits - 1);
+        let quarter = (capacity - low).div_ceil(low / 4).max(1) - 1;
+        SMALL_ARRAY_CLASSES + 4 * (bits as usize - 8) + quarter
     }
 }
 
@@ -123,7 +128,9 @@ fn class_capacity(class: usize) -> usize {
     if class < SMALL_ARRAY_CLASSES {
         8 * (class + 1)
     } else {
-        1 << (class - SMALL_ARRAY_CLASSES + 8)
+        let above = class - SMALL_ARRAY_CLASSES;
+        let low = 1usize << (7 + above / 4);
+        low + (above % 4 + 1) * (low / 4)
     }
 }
 
