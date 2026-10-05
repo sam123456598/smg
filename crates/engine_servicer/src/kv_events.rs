@@ -24,11 +24,17 @@
 //! ROUTER, the mock engine's too); what the replay cannot give leaves a hole
 //! in the window, counted, which a subscriber skips the way the live stream
 //! did. A payload that does not decode relays as an empty batch under its
-//! sequence, so nobody sees a gap for it. A publisher restart (its sequence
-//! going backwards on the same socket) starts a new incarnation: the history
-//! is cleared, live subscribers end with `DATA_LOSS`, and the gateway clears
-//! and resubscribes from zero, where the new incarnation's complete history
-//! is waiting for it.
+//! sequence, so nobody sees a gap for it.
+//!
+//! A publisher restart is read the same way on every wire, from three signs
+//! (vLLM and SGLang count from 0 per process; SGLang's first batch after a
+//! start carries `AllBlocksCleared`, vLLM's does not): the sequence goes
+//! backwards on the same socket; the engine's startup clear arrives under a
+//! sequence the relay already passed; the counter is back at 0 or 1 after a
+//! cursor above them. Each starts a new incarnation: the history is cleared,
+//! live subscribers end with `DATA_LOSS`, and the gateway clears and
+//! resubscribes from zero, where the new incarnation's complete history is
+//! waiting for it. A repeated sequence without a clear is a duplicate.
 //!
 //! `SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor` turns on the relay's
 //! engine-hash verification ([`crate::engine_hash`]); mismatches are counted,
@@ -60,7 +66,7 @@ use zeromq::{
 
 use crate::{
     kv_history::{History, Window},
-    kv_wire::{low64_big_endian, Normalizer, WireBatch},
+    kv_wire::{low64_big_endian, Normalizer, WireBatch, WireEvent},
     BoxStream,
 };
 
@@ -202,23 +208,59 @@ enum Admission {
     Accept,
     Duplicate,
     Gap { from: u64, to: u64 },
-    Restart { last: u64 },
+    Restart { reason: RestartReason, last: u64 },
+}
+
+/// What showed that the publisher started over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartReason {
+    /// The sequence went backwards on the same socket.
+    SequenceRegression,
+    /// The engine's startup `AllBlocksCleared` arrived under a sequence the
+    /// relay had already passed (SGLang's first batch after a start).
+    StartupClear,
+    /// The counter is back at 0 or 1 after a cursor above them (the mock
+    /// engine's publisher restart, a vLLM process restart).
+    CounterRestarted,
+}
+
+impl RestartReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SequenceRegression => "sequence_regression",
+            Self::StartupClear => "startup_clear",
+            Self::CounterRestarted => "counter_restarted",
+        }
+    }
 }
 
 impl Shared {
-    fn admit(&self, seq: u64) -> Admission {
-        match self.cursor {
-            None => Admission::Accept,
-            Some(last) if seq == last + 1 => Admission::Accept,
-            Some(last) if seq > last + 1 => Admission::Gap {
+    /// Classify `seq` against the cursor; `startup_clear` says the batch
+    /// begins with the engine's `AllBlocksCleared`.
+    fn admit(&self, seq: u64, startup_clear: bool) -> Admission {
+        let Some(last) = self.cursor else {
+            return Admission::Accept;
+        };
+        if seq == last + 1 {
+            return Admission::Accept;
+        }
+        if seq > last + 1 {
+            return Admission::Gap {
                 from: last + 1,
                 to: seq - 1,
-            },
-            // The publisher counts from 0 per process: a sequence below the
-            // cursor on the same socket is a new incarnation.
-            Some(last) if seq < last => Admission::Restart { last },
-            Some(_) => Admission::Duplicate,
+            };
         }
+        let restart = |reason| Admission::Restart { reason, last };
+        if seq <= 1 && last >= 2 {
+            return restart(RestartReason::CounterRestarted);
+        }
+        if seq < last {
+            return restart(RestartReason::SequenceRegression);
+        }
+        if startup_clear {
+            return restart(RestartReason::StartupClear);
+        }
+        Admission::Duplicate
     }
 
     /// Start a new incarnation: the window is the old publisher's.
@@ -536,16 +578,21 @@ async fn run(config: RelayConfig, shared: Arc<Mutex<Shared>>, live: broadcast::S
             continue;
         };
         let decoded = decode(payload, sequence);
-        let mut admission = lock(&shared).admit(sequence);
+        let startup_clear = matches!(
+            &decoded,
+            Decoded::Batch(batch)
+                if matches!(batch.events.first(), Some(WireEvent::AllBlocksCleared { .. }))
+        );
+        let mut admission = lock(&shared).admit(sequence, startup_clear);
         if let Admission::Gap { from, to } = admission {
             relay.recover_gap(from..=to).await;
             // The replay may have run past the live sequence.
-            admission = lock(&shared).admit(sequence);
+            admission = lock(&shared).admit(sequence, startup_clear);
         }
         match admission {
             Admission::Accept => relay.relay(sequence, decoded),
             Admission::Gap { .. } | Admission::Duplicate => {}
-            Admission::Restart { last } => {
+            Admission::Restart { reason, last } => {
                 let (generation, counts) = {
                     let mut shared = lock(&shared);
                     let generation = shared.restart();
@@ -556,8 +603,9 @@ async fn run(config: RelayConfig, shared: Arc<Mutex<Shared>>, live: broadcast::S
                     sequence,
                     last,
                     generation,
+                    reason = reason.as_str(),
                     ?counts,
-                    "KV event publisher restarted its sequence; live subscribers end with DATA_LOSS"
+                    "KV event publisher restarted; live subscribers end with DATA_LOSS"
                 );
                 let _ = live.send(Live::Restart { generation });
                 relay.normalizer = Normalizer::from_env();
@@ -1356,6 +1404,127 @@ mod tests {
         assert_eq!(read(&mut fresh).await.sequence_number, 0);
         lab.publish(1, &batch2).await;
         assert_eq!(read(&mut fresh).await.sequence_number, 1);
+    }
+
+    fn cleared_payload() -> Vec<u8> {
+        let batch = serde_json::json!([1700000002.0, [{"type": "AllBlocksCleared"}], 0]);
+        rmp_serde::to_vec_named(&batch).expect("encodes")
+    }
+
+    #[test]
+    fn restart_rules_read_the_same_on_every_wire() {
+        let mut shared = Shared {
+            history: History::new(10, usize::MAX),
+            cursor: Some(500),
+            generation: 0,
+            counts: RelayCounts::default(),
+            failed: None,
+        };
+        let restart = |reason| Admission::Restart { reason, last: 500 };
+        assert_eq!(shared.admit(501, false), Admission::Accept);
+        assert_eq!(
+            shared.admit(501, true),
+            Admission::Accept,
+            "a flush continues the sequence"
+        );
+        assert_eq!(
+            shared.admit(503, false),
+            Admission::Gap { from: 501, to: 502 }
+        );
+        assert_eq!(shared.admit(500, false), Admission::Duplicate);
+        assert_eq!(
+            shared.admit(500, true),
+            restart(RestartReason::StartupClear)
+        );
+        assert_eq!(
+            shared.admit(499, false),
+            restart(RestartReason::SequenceRegression)
+        );
+        assert_eq!(
+            shared.admit(0, false),
+            restart(RestartReason::CounterRestarted)
+        );
+        assert_eq!(
+            shared.admit(1, true),
+            restart(RestartReason::CounterRestarted)
+        );
+        // Under a cursor of 1, a repeated 1 is a duplicate unless it clears.
+        shared.cursor = Some(1);
+        assert_eq!(shared.admit(1, false), Admission::Duplicate);
+        assert_eq!(
+            shared.admit(1, true),
+            Admission::Restart {
+                reason: RestartReason::StartupClear,
+                last: 1
+            }
+        );
+        assert_eq!(
+            shared.admit(0, false),
+            Admission::Restart {
+                reason: RestartReason::SequenceRegression,
+                last: 1
+            }
+        );
+        shared.cursor = None;
+        assert_eq!(
+            shared.admit(7, true),
+            Admission::Accept,
+            "no cursor yet: anything goes"
+        );
+    }
+
+    /// SGLang's first batch after a start carries `AllBlocksCleared`; under a
+    /// sequence the relay already passed it is a restart, not a duplicate.
+    #[tokio::test]
+    async fn the_engines_startup_clear_under_a_passed_cursor_is_a_restart() {
+        let mut lab = start_lab(100, false).await;
+        lab.prime().await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        for sequence in 1..=3 {
+            lab.publish(sequence, &batch2).await;
+        }
+        lab.wait_relayed(4).await;
+        let mut stream = lab.subscribe(3).expect("caught up");
+        // A repeated sequence without a clear is a duplicate.
+        lab.publish(3, &batch2).await;
+        lab.publish(4, &batch2).await;
+        assert_eq!(read(&mut stream).await.sequence_number, 4);
+
+        // The engine comes back and its startup clear lands on a sequence
+        // the relay already passed.
+        lab.publish(2, &cleared_payload()).await;
+        let status = read_error(&mut stream).await;
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert_eq!(lab.relay.counts().publisher_restarts, 1);
+        let mut fresh = lab.subscribe(0).expect("live");
+        lab.publish(3, &batch2).await;
+        assert_eq!(read(&mut fresh).await.sequence_number, 3);
+    }
+
+    /// A counter back at 0 or 1 after a cursor above them is a restart even
+    /// when nothing else says so (the mock engine's restart-publisher hook,
+    /// a vLLM process restart: no clear on that wire).
+    #[tokio::test]
+    async fn a_counter_back_at_its_start_is_a_restart() {
+        let mut lab = start_lab(100, false).await;
+        lab.prime().await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        for sequence in 1..=5 {
+            lab.publish(sequence, &batch2).await;
+        }
+        lab.wait_relayed(6).await;
+        let mut stream = lab.subscribe(5).expect("caught up");
+        lab.publish(1, &batch2).await;
+        let status = read_error(&mut stream).await;
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        read_end(&mut stream).await;
+        // The new incarnation started at 1, not 0: its window is not complete
+        // from the publisher's first batch, so a fresh subscriber goes live.
+        let mut fresh = lab.subscribe(0).expect("live");
+        lab.publish(2, &batch2).await;
+        assert_eq!(read(&mut fresh).await.sequence_number, 2);
+        let mut resumed = lab.subscribe(1).expect("inside the new window");
+        assert_eq!(read(&mut resumed).await.sequence_number, 2);
     }
 
     #[tokio::test]
