@@ -2354,6 +2354,12 @@ impl WorkerRegistry {
         if new_status == WorkerStatus::Ready {
             // The warm-up slice (cache_aware) counts from here.
             worker.note_admitted();
+            // A worker promoted back from a demotion returns with a closed
+            // circuit breaker: the failures that opened it belong to the
+            // outage its probes just ended.
+            if matches!(old_status, WorkerStatus::NotReady | WorkerStatus::Failed) {
+                worker.reset_circuit_breaker();
+            }
         }
 
         let _ = self.event_tx.send(WorkerEvent::StatusChanged {
@@ -3778,6 +3784,35 @@ mod tests {
         assert_eq!(current.status(), WorkerStatus::Ready);
         assert_eq!(current.priority(), 99);
         assert_eq!(current.revision(), stale_revision + 1);
+    }
+
+    #[test]
+    fn test_promotion_back_to_ready_closes_the_circuit_breaker() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+        let worker_id = registry.register(worker.clone()).unwrap();
+        let revision = worker.revision();
+        assert!(registry
+            .transition_status_if_revision(&worker_id, revision, WorkerStatus::NotReady)
+            .is_some());
+        for _ in 0..8 {
+            worker.record_circuit_breaker_outcome(false);
+        }
+        assert!(!worker.circuit_breaker_can_execute());
+
+        assert!(registry
+            .transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready)
+            .is_some());
+        assert!(
+            worker.circuit_breaker_can_execute(),
+            "a worker that returns starts with a closed breaker"
+        );
     }
 
     #[test]

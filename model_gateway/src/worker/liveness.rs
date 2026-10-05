@@ -277,6 +277,14 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
             info!(worker_url = %worker.url(), cause, "Worker re-admitted by liveness");
             worker.note_admitted();
             if let Some(previous) = previous {
+                // The outage's connection failures opened the circuit breaker
+                // as well, and it would hold the worker out of routing for
+                // its timeout (30 s by default) and reopen on one error from
+                // a stale channel. The contact that clears the veto says the
+                // worker is back; fresh failures reopen the breaker as usual.
+                if previous == StallReason::Unreachable {
+                    worker.reset_circuit_breaker();
+                }
                 Metrics::set_worker_stalled(worker.url(), previous.as_str(), false);
             }
         }
@@ -288,7 +296,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
 
     fn worker() -> Arc<dyn Worker> {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
@@ -352,6 +360,29 @@ mod tests {
         on_contact(&w);
         assert!(w.stall_reason().is_none());
         assert!(!w.routing_state().stalled);
+    }
+
+    #[test]
+    fn a_contact_that_clears_the_unreachable_veto_closes_the_breaker() {
+        let w: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+        for _ in 0..8 {
+            w.record_circuit_breaker_outcome(false);
+        }
+        assert!(
+            !w.circuit_breaker_can_execute(),
+            "the outage's failures opened the breaker"
+        );
+        set(&w, Some(StallReason::Unreachable), "test");
+        on_contact(&w);
+        assert!(w.stall_reason().is_none());
+        assert!(
+            w.circuit_breaker_can_execute(),
+            "back in routing at once, breaker closed"
+        );
     }
 
     #[test]

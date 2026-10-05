@@ -616,6 +616,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// successful contact, instead of at its next scheduled probe.
     fn signal_connected(&self) {}
 
+    /// Close the circuit breaker: the worker has returned (a liveness veto
+    /// cleared by a contact, or health promoted it back to Ready) and the
+    /// failures that opened it belong to the outage. It reopens on fresh
+    /// failures like any closed breaker.
+    fn reset_circuit_breaker(&self) {}
+
     /// Record that the worker just became routable (promotion to Ready, or a
     /// liveness veto cleared); the warm-up slice counts from here.
     fn note_admitted(&self) {}
@@ -2062,6 +2068,10 @@ impl Worker for BasicWorker {
                 revision: self.revision(),
             });
         }
+    }
+
+    fn reset_circuit_breaker(&self) {
+        self.circuit_breaker.load().reset();
     }
 
     fn note_admitted(&self) {
