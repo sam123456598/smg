@@ -10,7 +10,9 @@ The command template runs one trial. Placeholders: `{rate}` (block ops per secon
 with `--offered-block-ops-per-sec`), `{window_ms}` (for a harness driven by the window; needs
 `--total-block-ops`), `{json}` (result path), `{point}` and `{trial}` (indices). Each trial runs
 under the lock file (flock), with a foreign-load sample before and after it recorded in the
-output.
+output. A trial whose generator could not issue on schedule counts as not kept up and is marked
+`G` in the log and "generator invalid" in the table, so a bracket that ends on the generator's
+ceiling rather than the indexer's is visible as such.
 """
 
 from __future__ import annotations
@@ -213,6 +215,7 @@ def main() -> int:
         points.append({"rate": rate, "passed": passed, "trials": trials, "replaced": replaced})
         line = ", ".join(
             f"{t.get('ratio', 0) * 100:.1f}%{'' if t['kept_up'] else '!'}"
+            + ("" if t.get("generator_valid", True) else " G")
             + (" FL" if t["foreign_load"] else "")
             for t in trials
         )
@@ -262,7 +265,14 @@ def main() -> int:
     ]
     for i, p in enumerate(points):
         ok = [t for t in p["trials"] if "ratio" in t]
-        ratios = ", ".join(f"{t['ratio'] * 100:.1f}%" for t in ok) or "failed"
+        ratios = (
+            ", ".join(
+                f"{t['ratio'] * 100:.1f}%"
+                + ("" if t.get("generator_valid", True) else " (generator invalid)")
+                for t in ok
+            )
+            or "failed"
+        )
         p50 = span([t["lookup_p50_us"] for t in ok], 1) if ok else "-"
         p99 = span([t["lookup_p99_us"] for t in ok], 0) if ok else "-"
         flagged = sum(1 for t in p["trials"] if t["foreign_load"])
