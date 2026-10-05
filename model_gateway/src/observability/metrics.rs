@@ -333,6 +333,10 @@ pub(crate) fn init_metrics() {
          (panic, join_error, intern_failed)"
     );
     describe_counter!(
+        "smg_kv_event_subscriptions_total",
+        "KV event streams connected, by worker; a reconnect counts again"
+    );
+    describe_counter!(
         "smg_kv_event_batches_total",
         "KV event batches by worker and disposition (applied, stale, tail_overflow)"
     );
@@ -1568,6 +1572,16 @@ impl Metrics {
             "smg_kv_event_subscription_failures_total",
             "worker" => worker_interned,
             "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Count a KV event stream connected: the first time and every reconnect,
+    /// so a drill can time a resubscription without reading the log.
+    pub fn record_kv_event_subscription(worker_url: &str) {
+        counter!(
+            "smg_kv_event_subscriptions_total",
+            "worker" => intern_string(worker_url)
         )
         .increment(1);
     }

@@ -53,8 +53,29 @@ const PRUNE_INTERVAL_SECS: u64 = 30;
 /// Initial reconnection delay after stream failure.
 const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 
-/// How long a subscription call may take to answer with headers.
-const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(5);
+/// Resolves when the worker is heard from (see `Worker::contact_wake`), or
+/// never for a worker without a notifier.
+async fn woken(wake: Option<&Arc<tokio::sync::Notify>>) {
+    match wake {
+        Some(notify) => notify.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// How long a subscription call may take to answer with headers. A port that
+/// accepts but does not serve yet (an engine still starting) hangs the call.
+const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// A contact with the worker while a subscription call is pending (a poll
+/// answered, a probe passed) says the worker serves now: a call still without
+/// an answer this long after the contact is abandoned and retried. A live
+/// server answers in milliseconds, so the contacts of a healthy worker (every
+/// token it streams is one) never cut a call short.
+const SUBSCRIBE_RETRY_GRACE: Duration = Duration::from_millis(500);
+
+/// The least a reconnect waits, contact or not: a server that keeps closing
+/// the stream of a worker that is otherwise talking must not be hammered.
+const RECONNECT_FLOOR: Duration = Duration::from_millis(INITIAL_RECONNECT_DELAY_MS);
 
 /// Maximum backoff between subscription attempts. Kept short: a worker that
 /// restarts is healthy again within a few seconds, and until the stream is
@@ -530,17 +551,28 @@ impl KvEventMonitor {
             }
         };
         let mut state = WorkerStreamState::default();
+        // A contact with the worker (a poll answered, a probe passed) ends the
+        // reconnect backoff early: a worker that is back gets its stream back
+        // at once instead of after the remaining delay.
+        let wake = worker.contact_wake();
         let mut reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
         let mut block_size_learned = false;
 
         /// Sleep with shutdown check. Returns `true` if shutdown was signaled.
+        /// A contact with the worker ends the sleep early, but never before
+        /// `RECONNECT_FLOOR`.
         macro_rules! sleep_or_shutdown {
-            ($delay:expr, $rx:expr) => {
+            ($delay:expr, $rx:expr) => {{
+                let delay: Duration = $delay;
                 tokio::select! {
-                    _ = tokio::time::sleep($delay) => false,
+                    _ = tokio::time::sleep(delay) => false,
+                    () = async {
+                        tokio::time::sleep(delay.min(RECONNECT_FLOOR)).await;
+                        woken(wake.as_ref()).await;
+                    } => false,
                     _ = &mut *$rx => true,
                 }
-            };
+            }};
         }
 
         loop {
@@ -590,16 +622,22 @@ impl KvEventMonitor {
             // A live server answers a subscription with headers at once; one
             // that does not within the deadline is unreachable (a half-open
             // connection behind a partition), and must not hang the loop.
-            let subscribed = tokio::time::timeout(
-                SUBSCRIBE_DEADLINE,
-                backend_client.subscribe_kv_events(start_seq),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(tonic::Status::unavailable(format!(
-                    "SubscribeKvEvents did not answer within {SUBSCRIBE_DEADLINE:?}"
-                )))
-            });
+            let subscribed = tokio::select! {
+                attempt = tokio::time::timeout(
+                    SUBSCRIBE_DEADLINE,
+                    backend_client.subscribe_kv_events(start_seq),
+                ) => attempt.unwrap_or_else(|_| {
+                    Err(tonic::Status::unavailable(format!(
+                        "SubscribeKvEvents did not answer within {SUBSCRIBE_DEADLINE:?}"
+                    )))
+                }),
+                // The worker was heard from on another path (a poll, a probe)
+                // and this call still hangs: a fresh one will land.
+                () = async {
+                    woken(wake.as_ref()).await;
+                    tokio::time::sleep(SUBSCRIBE_RETRY_GRACE).await;
+                } => continue,
+            };
             let stream = match subscribed {
                 Ok(stream) => {
                     info!(
@@ -607,6 +645,7 @@ impl KvEventMonitor {
                         start_seq,
                         "KV event stream connected"
                     );
+                    Metrics::record_kv_event_subscription(&worker_url);
                     reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                     state.reconnected();
                     liveness::on_contact(&worker);

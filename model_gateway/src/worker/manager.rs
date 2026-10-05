@@ -603,10 +603,12 @@ async fn recv_connect_signal(
     }
 }
 
-/// Promote a worker whose backend handshake just completed, without waiting
-/// for its next scheduled poll. Resolves the URL to a live worker id and flips
-/// the status through the revision-checked setter, so a signal that lost a race
-/// with a same-URL replacement — or a worker already removed — is discarded.
+/// Promote a worker whose backend handshake just completed, or that the
+/// health checker demoted and that has just answered a contact (see
+/// `worker::liveness::on_contact`), without waiting for its next scheduled
+/// poll. Resolves the URL to a live worker id and flips the status through the
+/// revision-checked setter, so a signal that lost a race with a same-URL
+/// replacement — or a worker already removed — is discarded.
 fn apply_connect_signal(
     registry: &Arc<WorkerRegistry>,
     connected: WorkerConnected,
@@ -618,6 +620,16 @@ fn apply_connect_signal(
         debug!(worker_url = %url, "Connect signal for an unknown worker; ignoring");
         return;
     };
+    // A Failed worker under removal is on its way out: the contact that
+    // signalled it was a last poll, not a return.
+    if config.remove_unhealthy
+        && registry
+            .get(&worker_id)
+            .is_some_and(|worker| worker.status() == WorkerStatus::Failed)
+    {
+        debug!(worker_url = %url, "Connect signal for a worker being removed; ignoring");
+        return;
+    }
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
             debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");

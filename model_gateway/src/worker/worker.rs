@@ -20,7 +20,7 @@ use openai_protocol::{
 };
 use smg_grpc_client::common_proto;
 use tokio::{
-    sync::{mpsc, OnceCell},
+    sync::{mpsc, Notify, OnceCell},
     task::AbortHandle,
     time,
 };
@@ -605,6 +605,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn swap_load_sample(&self, _load: usize) -> usize {
         0
     }
+
+    /// A notifier fired on every contact with the worker, for loops that back
+    /// off from it and should retry as soon as it is heard from again.
+    fn contact_wake(&self) -> Option<Arc<Notify>> {
+        None
+    }
+
+    /// Ask the health manager to promote the worker now, on the strength of a
+    /// successful contact, instead of at its next scheduled probe.
+    fn signal_connected(&self) {}
 
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
     /// reads status, load, processed and the overload veto together so the hot
@@ -1288,6 +1298,9 @@ pub struct WorkerRuntime {
     transport_failed: AtomicBool,
     /// In-flight count at the previous liveness sweep.
     last_load_sample: AtomicUsize,
+    /// Woken on every contact, so a loop backing off from this worker (the
+    /// KV event subscriber) retries the moment the worker is heard from.
+    contact_wake: Arc<Notify>,
 }
 
 impl WorkerRuntime {
@@ -1309,6 +1322,7 @@ impl WorkerRuntime {
             last_waiting_reqs: AtomicI64::new(0),
             transport_failed: AtomicBool::new(false),
             last_load_sample: AtomicUsize::new(0),
+            contact_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -1336,6 +1350,7 @@ impl WorkerRuntime {
         self.last_contact_ms
             .store(super::liveness::now_ms(), Ordering::Relaxed);
         self.transport_failed.store(false, Ordering::Relaxed);
+        self.contact_wake.notify_one();
     }
 
     pub fn note_token_progress(&self) {
@@ -1343,6 +1358,13 @@ impl WorkerRuntime {
         self.last_token_ms.store(now, Ordering::Relaxed);
         self.last_contact_ms.store(now, Ordering::Relaxed);
         self.transport_failed.store(false, Ordering::Relaxed);
+        self.contact_wake.notify_one();
+    }
+
+    /// The notifier [`Self::note_contact`] fires; `notify_one` semantics, so
+    /// a contact that happens before anyone waits is not lost.
+    pub fn contact_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.contact_wake)
     }
 
     pub fn contact_age(&self) -> Duration {
@@ -1966,6 +1988,19 @@ impl Worker for BasicWorker {
 
     fn swap_load_sample(&self, load: usize) -> usize {
         self.runtime.load().swap_load_sample(load)
+    }
+
+    fn contact_wake(&self) -> Option<Arc<Notify>> {
+        Some(self.runtime.load().contact_wake())
+    }
+
+    fn signal_connected(&self) {
+        if let Some(tx) = &self.connect_signal_tx {
+            let _ = tx.send(WorkerConnected {
+                url: self.url().to_string(),
+                revision: self.revision(),
+            });
+        }
     }
 
     fn is_available(&self) -> bool {

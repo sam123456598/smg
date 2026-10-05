@@ -27,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
 use super::{worker::StallReason, Worker};
@@ -85,6 +86,14 @@ pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
     worker.note_contact();
     if worker.stall_reason() == Some(StallReason::Unreachable) {
         set(worker, None, "contact");
+    }
+    // A worker the health checker demoted while it was gone has just
+    // answered: promote it now rather than at its next scheduled probe.
+    if matches!(
+        worker.status(),
+        WorkerStatus::NotReady | WorkerStatus::Failed
+    ) {
+        worker.signal_connected();
     }
 }
 
@@ -229,6 +238,8 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
     use super::*;
     use crate::worker::BasicWorkerBuilder;
 
@@ -308,6 +319,24 @@ mod tests {
         );
         on_token_progress(&w);
         assert!(w.stall_reason().is_none());
+    }
+
+    #[test]
+    fn contact_asks_for_promotion_of_a_demoted_worker() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let w: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .connect_signal_tx(tx)
+                .build(),
+        );
+        on_contact(&w);
+        assert!(rx.try_recv().is_err(), "a Ready worker needs no promotion");
+        w.set_status(WorkerStatus::NotReady);
+        on_contact(&w);
+        let signal = rx
+            .try_recv()
+            .expect("a demoted worker that answers is signalled");
+        assert_eq!(signal.url, "http://w1:8000");
     }
 
     #[test]
