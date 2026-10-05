@@ -96,6 +96,16 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Seconds without any contact from a worker (a load poll, a health probe,
+    /// a KV event, a response) after which a transport failure excludes it
+    /// from routing; the first successful contact re-admits it.
+    #[serde(default = "default_worker_stall_secs")]
+    pub worker_stall_secs: u64,
+    /// Seconds without a token or a completion from a worker that still
+    /// answers polls, with requests in flight and a growing queue, after which
+    /// new requests stop being routed to it until it makes progress.
+    #[serde(default = "default_worker_wedge_secs")]
+    pub worker_wedge_secs: u64,
     /// How long a disaggregated (PD) dispatch waits for a slot in the decode
     /// engine's running window before shedding. Must stay well under the
     /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
@@ -392,6 +402,14 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_worker_stall_secs() -> u64 {
+    2
+}
+
+fn default_worker_wedge_secs() -> u64 {
+    3
 }
 
 fn default_pd_admission_wait_secs() -> u64 {
@@ -1201,6 +1219,8 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            worker_stall_secs: default_worker_stall_secs(),
+            worker_wedge_secs: default_worker_wedge_secs(),
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
             worker_overload_protection: false,

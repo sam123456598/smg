@@ -69,6 +69,7 @@ use crate::{
     policies::PolicyRegistry,
     worker::{
         event::WorkerEvent,
+        liveness,
         load_state::{LoadReceiver, LoadSnapshot, LoadState},
         ConnectionMode, Worker, WorkerRegistry,
     },
@@ -337,6 +338,7 @@ pub struct WorkerMonitor {
     group_handles: Mutex<HashMap<WorkerGroupKey, GroupState>>,
     event_task: Mutex<Option<JoinHandle<()>>>,
     eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
+    liveness_sweep_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Debounce window for batching worker evictions into one snapshot rebuild.
@@ -379,6 +381,7 @@ impl WorkerMonitor {
             group_handles: Mutex::new(HashMap::new()),
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
+            liveness_sweep_task: Mutex::new(None),
         }
     }
 
@@ -448,6 +451,18 @@ impl WorkerMonitor {
         });
 
         *self.eviction_flush_task.lock() = Some(flush_handle);
+
+        // The liveness sweep: vetoes a worker that stayed silent for the stall
+        // threshold after a transport failure (see `worker::liveness::sweep`).
+        let monitor = Arc::downgrade(self);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "liveness sweep runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted in Drop"
+        )]
+        let sweep_handle = tokio::spawn(async move {
+            liveness_sweep_loop(monitor).await;
+        });
+        *self.liveness_sweep_task.lock() = Some(sweep_handle);
     }
 
     /// Stop every per-group polling loop and clear the shared load
@@ -693,6 +708,7 @@ impl WorkerMonitor {
             }
         }
         if response.is_some() {
+            liveness::on_contact(worker);
             return response;
         }
 
@@ -844,11 +860,31 @@ impl WorkerMonitor {
             }
         };
 
-        match backend_client.get_loads().await {
-            Ok(load) if !load.loads.is_empty() => Some(load),
-            Ok(_) => None,
-            Err(e) => {
+        // A deadline, so one half-open connection cannot stall the whole
+        // group's poll (the group awaits every worker's poll together). A
+        // poll that times out is a slow worker, not a dead one: the keepalive
+        // on the connection is what reports those.
+        match tokio::time::timeout(LOAD_POLL_DEADLINE, backend_client.get_loads()).await {
+            Ok(Ok(load)) if !load.loads.is_empty() => {
+                liveness::on_contact(worker);
+                Some(load)
+            }
+            Ok(Ok(_)) => {
+                liveness::on_contact(worker);
+                None
+            }
+            Ok(Err(e)) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.url());
+                if liveness::is_transport_failure(e.code()) {
+                    liveness::on_contact_failed(worker, "load poll");
+                }
+                None
+            }
+            Err(_) => {
+                debug!(
+                    "backend GetLoads for {} did not answer within {LOAD_POLL_DEADLINE:?}",
+                    worker.url()
+                );
                 None
             }
         }
@@ -861,6 +897,9 @@ impl Drop for WorkerMonitor {
             handle.abort();
         }
         if let Some(handle) = self.eviction_flush_task.get_mut().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.liveness_sweep_task.get_mut().take() {
             handle.abort();
         }
         for (_, state) in self.group_handles.get_mut().drain() {
@@ -1013,6 +1052,26 @@ async fn run_event_loop(
 /// as `run_event_loop`. The temporary `Arc` is upgraded after the
 /// timer tick and dropped before the next tick so the monitor's
 /// `Drop` is reachable.
+/// How long a backend load poll may take before the tick moves on without it.
+const LOAD_POLL_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Run [`liveness::sweep`] over every registered worker every quarter second.
+async fn liveness_sweep_loop(monitor: Weak<WorkerMonitor>) {
+    let mut ticker = tokio::time::interval(liveness::SWEEP_INTERVAL);
+    loop {
+        ticker.tick().await;
+        let Some(monitor) = monitor.upgrade() else {
+            return;
+        };
+        for worker in monitor
+            .worker_registry
+            .get_workers_filtered(None, None, None, None, false)
+        {
+            liveness::sweep(&worker);
+        }
+    }
+}
+
 async fn group_monitor_loop(
     monitor: Weak<WorkerMonitor>,
     group_key: WorkerGroupKey,

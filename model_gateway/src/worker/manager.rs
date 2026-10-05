@@ -28,6 +28,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     worker::{
         event::{WorkerConnected, WorkerEvent},
+        liveness,
         load_state::LoadSnapshot,
         metrics_aggregator::{self, MetricPack},
         registry::{WorkerDescriptor, WorkerId},
@@ -543,6 +544,9 @@ async fn apply_probe_completion(
             metrics_labels::CB_FAILURE
         },
     );
+    if probe_ok {
+        liveness::on_contact(&worker);
+    }
 
     let Some(((), transition)) =
         registry.apply_if_revision(&worker_id, expected_revision, |current_worker| {

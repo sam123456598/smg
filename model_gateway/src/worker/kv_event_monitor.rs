@@ -33,7 +33,10 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use super::kv_event_recovery::{Admission, RankState, ResyncReason};
+use super::{
+    kv_event_recovery::{Admission, RankState, ResyncReason},
+    liveness,
+};
 use crate::{
     observability::metrics::Metrics,
     policies::utils::PeriodicTask,
@@ -49,6 +52,9 @@ const PRUNE_INTERVAL_SECS: u64 = 30;
 
 /// Initial reconnection delay after stream failure.
 const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
+
+/// How long a subscription call may take to answer with headers.
+const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Maximum backoff between subscription attempts. Kept short: a worker that
 /// restarts is healthy again within a few seconds, and until the stream is
@@ -581,7 +587,20 @@ impl KvEventMonitor {
             };
 
             let start_seq = state.resume_sequence();
-            let stream = match backend_client.subscribe_kv_events(start_seq).await {
+            // A live server answers a subscription with headers at once; one
+            // that does not within the deadline is unreachable (a half-open
+            // connection behind a partition), and must not hang the loop.
+            let subscribed = tokio::time::timeout(
+                SUBSCRIBE_DEADLINE,
+                backend_client.subscribe_kv_events(start_seq),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(tonic::Status::unavailable(format!(
+                    "SubscribeKvEvents did not answer within {SUBSCRIBE_DEADLINE:?}"
+                )))
+            });
+            let stream = match subscribed {
                 Ok(stream) => {
                     info!(
                         worker_url = %worker_url,
@@ -590,6 +609,7 @@ impl KvEventMonitor {
                     );
                     reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                     state.reconnected();
+                    liveness::on_contact(&worker);
                     stream
                 }
                 Err(e) => {
@@ -621,6 +641,9 @@ impl KvEventMonitor {
                         reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                         continue;
                     }
+                    if liveness::is_transport_failure(e.code()) {
+                        liveness::on_contact_failed(&worker, "kv subscribe");
+                    }
                     warn!(
                         worker_url = %worker_url,
                         error = %e,
@@ -641,6 +664,7 @@ impl KvEventMonitor {
             };
 
             let on_batch = |batch: &KvEventBatch| {
+                liveness::on_contact(&worker);
                 Self::learn_block_size(&block_sizes, &model_id, &mut block_size_learned, batch);
             };
             let stream_result = tokio::select! {
@@ -695,6 +719,9 @@ impl KvEventMonitor {
                         );
                         reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                         continue;
+                    }
+                    if liveness::is_transport_failure(e.code()) {
+                        liveness::on_contact_failed(&worker, "kv stream");
                     }
                     warn!(
                         worker_url = %worker_url,

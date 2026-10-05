@@ -2,7 +2,7 @@ use std::{
     any::Any,
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::Duration,
@@ -517,14 +517,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Check if the worker is available (healthy + circuit closed/half-open +
     /// not vetoed by the absolute overload guard).
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker_can_execute() && !self.is_overloaded()
+        self.is_healthy()
+            && self.circuit_breaker_can_execute()
+            && !self.is_overloaded()
+            && self.stall_reason().is_none()
     }
 
     /// [`Self::is_healthy`] fused with the overload veto. For the hash policies,
     /// which route on health alone and never consult the circuit breaker;
     /// `BasicWorker` overrides it to read both under a single runtime guard.
     fn is_healthy_and_eligible(&self) -> bool {
-        self.is_healthy() && !self.is_overloaded()
+        self.is_healthy() && !self.is_overloaded() && self.stall_reason().is_none()
     }
 
     /// Whether the absolute overload guard currently vetoes this worker.
@@ -544,6 +547,56 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         false
     }
 
+    /// Why the liveness tracker vetoes this worker, if it does.
+    fn stall_reason(&self) -> Option<StallReason> {
+        None
+    }
+
+    /// Set or clear the liveness veto, returning `true` when it changed.
+    /// Route writes through [`super::liveness`], which logs and counts the
+    /// transition.
+    fn set_stall(&self, _reason: Option<StallReason>) -> bool {
+        false
+    }
+
+    /// Record a successful interaction with the worker (a poll answered, a
+    /// probe passed, an event batch, a response).
+    fn note_contact(&self) {}
+
+    /// Record a token or a completion from the worker.
+    fn note_token_progress(&self) {}
+
+    /// Record a transport failure (a poll, probe or stream that failed on the
+    /// connection); cleared by the next contact.
+    fn note_transport_failure(&self) {}
+
+    /// Whether a transport failure happened since the last contact.
+    fn transport_failure_pending(&self) -> bool {
+        false
+    }
+
+    /// Time since the last successful contact.
+    fn contact_age(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Time since the last token or completion.
+    fn token_progress_age(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Store the engine's reported waiting-queue depth, returning the previous
+    /// value.
+    fn swap_waiting_reqs(&self, _waiting: i64) -> i64 {
+        0
+    }
+
+    /// Store the in-flight count seen by the liveness sweep, returning the
+    /// previous sample.
+    fn swap_load_sample(&self, _load: usize) -> usize {
+        0
+    }
+
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
     /// reads status, load, processed and the overload veto together so the hot
     /// path takes one `ArcSwap` guard per backing cell per worker instead of one
@@ -556,6 +609,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             load: self.load(),
             processed: self.processed_requests(),
             overloaded: self.is_overloaded(),
+            stalled: self.stall_reason().is_some(),
         }
     }
 
@@ -1137,6 +1191,35 @@ impl WorkerMetadata {
 }
 
 /// One-shot routing snapshot — see [`Worker::routing_state`].
+/// Why the liveness tracker vetoes a worker (see [`super::liveness`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StallReason {
+    /// Its transport fails and nothing has been heard from it for the stall
+    /// threshold.
+    Unreachable = 1,
+    /// It answers polls but holds requests that make no progress while its
+    /// queue grows.
+    Wedged = 2,
+}
+
+impl StallReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Wedged => "wedged",
+        }
+    }
+
+    const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Unreachable),
+            2 => Some(Self::Wedged),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RoutingState {
     /// `status == Ready`.
@@ -1149,6 +1232,8 @@ pub struct RoutingState {
     pub processed: usize,
     /// Absolute overload veto, set by the load monitor at ingestion time.
     pub overloaded: bool,
+    /// Liveness veto: unreachable or wedged (see [`super::liveness`]).
+    pub stalled: bool,
 }
 
 impl RoutingState {
@@ -1156,7 +1241,7 @@ impl RoutingState {
     /// gather pass already performed: every field rides the one guard
     /// [`Worker::routing_state`] took.
     pub const fn eligible(self) -> bool {
-        self.healthy && self.can_execute && !self.overloaded
+        self.healthy && self.can_execute && !self.overloaded && !self.stalled
     }
 }
 
@@ -1182,6 +1267,18 @@ pub struct WorkerRuntime {
     /// so selection reads it under the guard it already holds, and so a
     /// same-URL replacement inherits it with the rest of the shared runtime.
     overloaded: AtomicBool,
+    /// Liveness veto, a [`StallReason`] as `u8` (0 = none).
+    stall: AtomicU8,
+    /// Last successful contact and last token or completion, in
+    /// [`super::liveness::now_ms`] milliseconds.
+    last_contact_ms: AtomicU64,
+    last_token_ms: AtomicU64,
+    /// Waiting-queue depth from the previous load report.
+    last_waiting_reqs: AtomicI64,
+    /// A transport failure happened since the last contact.
+    transport_failed: AtomicBool,
+    /// In-flight count at the previous liveness sweep.
+    last_load_sample: AtomicUsize,
 }
 
 impl WorkerRuntime {
@@ -1197,7 +1294,66 @@ impl WorkerRuntime {
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
             overloaded: AtomicBool::new(false),
+            stall: AtomicU8::new(0),
+            last_contact_ms: AtomicU64::new(super::liveness::now_ms()),
+            last_token_ms: AtomicU64::new(super::liveness::now_ms()),
+            last_waiting_reqs: AtomicI64::new(0),
+            transport_failed: AtomicBool::new(false),
+            last_load_sample: AtomicUsize::new(0),
         }
+    }
+
+    // ── Liveness ────────────────────────────────────────────────────
+
+    pub fn note_transport_failure(&self) {
+        self.transport_failed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn transport_failure_pending(&self) -> bool {
+        self.transport_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn stall_reason(&self) -> Option<StallReason> {
+        StallReason::from_u8(self.stall.load(Ordering::Acquire))
+    }
+
+    /// Set or clear the veto; `true` when it changed.
+    pub fn set_stall(&self, reason: Option<StallReason>) -> bool {
+        let next = reason.map_or(0, |reason| reason as u8);
+        self.stall.swap(next, Ordering::AcqRel) != next
+    }
+
+    pub fn note_contact(&self) {
+        self.last_contact_ms
+            .store(super::liveness::now_ms(), Ordering::Relaxed);
+        self.transport_failed.store(false, Ordering::Relaxed);
+    }
+
+    pub fn note_token_progress(&self) {
+        let now = super::liveness::now_ms();
+        self.last_token_ms.store(now, Ordering::Relaxed);
+        self.last_contact_ms.store(now, Ordering::Relaxed);
+        self.transport_failed.store(false, Ordering::Relaxed);
+    }
+
+    pub fn contact_age(&self) -> Duration {
+        Self::age_of(self.last_contact_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn token_progress_age(&self) -> Duration {
+        Self::age_of(self.last_token_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
+        self.last_waiting_reqs.swap(waiting, Ordering::Relaxed)
+    }
+
+    pub fn swap_load_sample(&self, load: usize) -> usize {
+        self.last_load_sample.swap(load, Ordering::Relaxed)
+    }
+
+    fn age_of(stamp_ms: u64) -> Duration {
+        Duration::from_millis(super::liveness::now_ms().saturating_sub(stamp_ms))
     }
 
     // ── Lifecycle status ────────────────────────────────────────────
@@ -1749,18 +1905,59 @@ impl Worker for BasicWorker {
         self.runtime.load().set_overloaded(overloaded)
     }
 
+    fn stall_reason(&self) -> Option<StallReason> {
+        self.runtime.load().stall_reason()
+    }
+
+    fn set_stall(&self, reason: Option<StallReason>) -> bool {
+        self.runtime.load().set_stall(reason)
+    }
+
+    fn note_contact(&self) {
+        self.runtime.load().note_contact();
+    }
+
+    fn note_token_progress(&self) {
+        self.runtime.load().note_token_progress();
+    }
+
+    fn note_transport_failure(&self) {
+        self.runtime.load().note_transport_failure();
+    }
+
+    fn transport_failure_pending(&self) -> bool {
+        self.runtime.load().transport_failure_pending()
+    }
+
+    fn contact_age(&self) -> Duration {
+        self.runtime.load().contact_age()
+    }
+
+    fn token_progress_age(&self) -> Duration {
+        self.runtime.load().token_progress_age()
+    }
+
+    fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
+        self.runtime.load().swap_waiting_reqs(waiting)
+    }
+
+    fn swap_load_sample(&self, load: usize) -> usize {
+        self.runtime.load().swap_load_sample(load)
+    }
+
     fn is_available(&self) -> bool {
         // Same two guards the pre-veto version took (`is_healthy` +
-        // `circuit_breaker_can_execute`): the veto rides the runtime guard.
+        // `circuit_breaker_can_execute`): the vetoes ride the runtime guard.
         let rt = self.runtime.load();
         rt.status() == WorkerStatus::Ready
             && !rt.is_overloaded()
+            && rt.stall_reason().is_none()
             && self.circuit_breaker.load().can_execute()
     }
 
     fn is_healthy_and_eligible(&self) -> bool {
         let rt = self.runtime.load();
-        rt.status() == WorkerStatus::Ready && !rt.is_overloaded()
+        rt.status() == WorkerStatus::Ready && !rt.is_overloaded() && rt.stall_reason().is_none()
     }
 
     fn routing_state(&self) -> RoutingState {
@@ -1774,6 +1971,7 @@ impl Worker for BasicWorker {
             load: rt.load(),
             processed: rt.processed_requests(),
             overloaded: rt.is_overloaded(),
+            stalled: rt.stall_reason().is_some(),
         }
     }
 
@@ -2173,6 +2371,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         load: worker.load(),
         http2: metadata.http2,
         pd_pairing,
+        stalled: worker
+            .stall_reason()
+            .map(|reason| reason.as_str().to_string()),
         engine_load: None,
         job_status: None,
     }

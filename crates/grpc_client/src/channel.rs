@@ -33,6 +33,14 @@ pub fn normalize_grpc_endpoint(endpoint: &str) -> String {
 /// Matches the upstream HTTP client's connect timeout in `AppContext`.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// HTTP/2 keepalive: a ping every second, answered within a second, so a
+/// worker that dies, freezes or falls behind a partition fails every stream
+/// on its connection within about two seconds. The gateway's liveness veto
+/// turns that into exclusion from routing.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(1);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(5);
+
 /// Connect a `tonic::Channel` to the given endpoint with the SMG-standard
 /// keep-alive and HTTP/2 window profile applied, using
 /// [`DEFAULT_CONNECT_TIMEOUT`].
@@ -68,10 +76,10 @@ fn configured_endpoint(
     let http_endpoint = normalize_grpc_endpoint(endpoint);
     Ok(Endpoint::from_shared(http_endpoint)?
         .connect_timeout(connect_timeout)
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
         .keep_alive_while_idle(true)
-        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .tcp_keepalive(Some(TCP_KEEPALIVE))
         .tcp_nodelay(true)
         .http2_adaptive_window(false)
         // 16MB stream window, 32MB connection window — sized for the

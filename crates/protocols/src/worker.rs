@@ -939,6 +939,12 @@ pub struct WorkerInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pd_pairing: Option<String>,
 
+    /// Why the gateway's liveness tracker currently keeps the worker out of
+    /// routing (`unreachable` or `wedged`) while its health status stands;
+    /// absent when it is routable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<String>,
+
     /// The worker's last polled engine load, as published by the load
     /// monitor. `None` when load monitoring has produced nothing for this
     /// worker yet. Unrelated to `load` above, which counts in-flight
@@ -962,6 +968,7 @@ impl WorkerInfo {
             load: 0,
             http2: false,
             pd_pairing: None,
+            stalled: None,
             engine_load: None,
             job_status,
         }

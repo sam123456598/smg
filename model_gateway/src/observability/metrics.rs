@@ -366,6 +366,14 @@ pub(crate) fn init_metrics() {
         "smg_workers_overloaded",
         "Workers currently flagged overloaded and excluded from routing, by model"
     );
+    describe_gauge!(
+        "smg_worker_stalled",
+        "Liveness veto on a worker: 1 while routing skips it, by worker and reason"
+    );
+    describe_counter!(
+        "smg_worker_stall_transitions_total",
+        "Times the liveness veto was set on a worker, by worker and reason"
+    );
     describe_counter!(
         "smg_worker_overload_shed_total",
         "Requests shed because every worker for the model is overloaded, by stage \
@@ -1496,6 +1504,26 @@ impl Metrics {
             "worker" => worker_interned
         )
         .set(count as f64);
+    }
+
+    /// Flip the liveness veto gauge for a worker; count the transition when
+    /// the veto is set.
+    pub fn set_worker_stalled(worker_url: &str, reason: &'static str, stalled: bool) {
+        let worker = intern_string(worker_url);
+        gauge!(
+            "smg_worker_stalled",
+            "worker" => Arc::clone(&worker),
+            "reason" => reason
+        )
+        .set(if stalled { 1.0 } else { 0.0 });
+        if stalled {
+            counter!(
+                "smg_worker_stall_transitions_total",
+                "worker" => worker,
+                "reason" => reason
+            )
+            .increment(1);
+        }
     }
 
     /// Set worker health status

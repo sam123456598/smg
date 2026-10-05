@@ -595,6 +595,18 @@ struct CliArgs {
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// Seconds without any contact from a worker (a load poll, a health probe,
+    /// a KV event, a response) after which a transport failure excludes it
+    /// from routing; the first successful contact re-admits it.
+    #[arg(long, default_value_t = 2, help_heading = "Load Monitoring")]
+    worker_stall_secs: u64,
+
+    /// Seconds without a token or a completion from a worker that still
+    /// answers polls, with requests in flight and a growing queue, after which
+    /// new requests stop being routed to it until it makes progress.
+    #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
+    worker_wedge_secs: u64,
+
     /// Only poll worker loads when a load-aware routing policy,
     /// --engine-metrics, or worker overload protection needs the data. By
     /// default every worker group is polled from registration onward; this
@@ -1960,6 +1972,8 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .worker_stall_secs(self.worker_stall_secs)
+            .worker_wedge_secs(self.worker_wedge_secs)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
             .worker_overload_protection(self.worker_overload_protection)

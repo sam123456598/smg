@@ -266,6 +266,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_stall_secs(mut self, secs: u64) -> Self {
+        self.config.worker_stall_secs = secs;
+        self
+    }
+
+    pub fn worker_wedge_secs(mut self, secs: u64) -> Self {
+        self.config.worker_wedge_secs = secs;
+        self
+    }
+
     pub fn pd_admission_wait_secs(mut self, secs: u64) -> Self {
         self.config.pd_admission_wait_secs = secs;
         self

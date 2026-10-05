@@ -30,8 +30,8 @@ use crate::{
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
-        WorkerService,
+        liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
+        WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, WorkflowEngines},
 };
@@ -687,6 +687,11 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        // Progress-based liveness thresholds (see `worker::liveness`).
+        liveness::configure(
+            Duration::from_secs(config.worker_stall_secs),
+            Duration::from_secs(config.worker_wedge_secs),
+        );
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
