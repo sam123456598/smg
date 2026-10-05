@@ -287,6 +287,11 @@ impl WordArena {
         self.word(data - 2)
     }
 
+    /// Words an array can hold: the class it was given, which may be larger than asked for.
+    fn array_capacity(&self, data: u32) -> usize {
+        unpack(self.array_header(data).load(Ordering::Relaxed)).1 as usize
+    }
+
     /// One more run shares this array.
     fn array_retain(&self, data: u32) {
         self.word(data - 1).fetch_add(1, Ordering::Relaxed);
@@ -2224,7 +2229,7 @@ impl RunIndex {
                         .alloc_array(&contents, capacity_for(contents.len()));
                     let engine = self
                         .arena
-                        .alloc_array(&engines, capacity_for(engines.len()));
+                        .alloc_array(&engines, self.arena.array_capacity(block));
                     let new_id = self.slab.alloc(
                         0,
                         run_id,
@@ -2461,7 +2466,7 @@ impl RunIndex {
                 .alloc_array(&contents, capacity_for(contents.len()));
             let engine = self
                 .arena
-                .alloc_array(&engines, capacity_for(engines.len()));
+                .alloc_array(&engines, self.arena.array_capacity(block));
             let new_id = self.slab.alloc(
                 run.start() + len,
                 run_id,
@@ -2544,9 +2549,11 @@ impl RunIndex {
             .collect();
         grown_engines.extend_from_slice(engines);
         let new_block = self.arena.alloc_array(&grown, capacity_for(grown.len()));
+        // The engine array must hold at least what the content array can: an in-place append
+        // claims room from the content array's header and writes both.
         let new_engine = self
             .arena
-            .alloc_array(&grown_engines, capacity_for(grown_engines.len()));
+            .alloc_array(&grown_engines, self.arena.array_capacity(new_block));
         run.begin_update();
         run.block.store(new_block, Ordering::Relaxed);
         run.base.store(0, Ordering::Relaxed);
@@ -3446,6 +3453,63 @@ mod tests {
         assert_eq!(scores(&index, &held), vec![(w, 12)]);
     }
 
+    /// A content array recycled from a larger class gets an engine-hash twin of at least that
+    /// capacity, so an in-place append (which claims room from the content header and writes
+    /// both arrays) never runs past the twin into the words behind it.
+    #[test]
+    fn the_engine_twin_is_as_large_as_a_recycled_content_array() {
+        let index = RunIndex::with_max_workers(8);
+        let w = index.intern_worker("w").expect("id");
+        let mut mw = RunBlockMap::default();
+        // One freed array two classes above what 140 blocks ask for: the content array takes
+        // it, the twin must not come out smaller.
+        let big = index.arena.alloc_array(&[0; 200], 200);
+        index.arena.array_release(big);
+        let chain: Vec<ContentHash> = (0..200).map(|p| content(9, p)).collect();
+        let blocks = blocks_of(&chain);
+        index
+            .apply_stored(w, &blocks[..140], None, &mut mw)
+            .expect("first store");
+        let verify = |at: BlockRef, key: SequenceHash| index.engine_hash_at(at) == Some(key.0);
+        let run_id = mw
+            .get(blocks[0].seq_hash, |at| verify(at, blocks[0].seq_hash))
+            .expect("mapped")
+            .run;
+        let run = index.slab.run(run_id);
+        let (block, engine) = (
+            run.block.load(Ordering::Relaxed),
+            run.engine.load(Ordering::Relaxed),
+        );
+        assert_eq!(block, big, "the recycled array was taken");
+        assert!(
+            index.arena.array_capacity(engine) >= index.arena.array_capacity(block),
+            "twin {} words, content {}",
+            index.arena.array_capacity(engine),
+            index.arena.array_capacity(block)
+        );
+        // Words bumped right behind the twin: an overflowing append would land here.
+        let guard = index.arena.alloc_array(&[7; 8], 8);
+        index
+            .apply_stored(w, &blocks[140..], Some(blocks[139].seq_hash), &mut mw)
+            .expect("append");
+        assert_eq!(run.len(), 200, "appended in place");
+        assert_eq!(
+            run.block.load(Ordering::Relaxed),
+            block,
+            "same content array"
+        );
+        for (slot, word) in index.arena.words(guard, 8).iter().enumerate() {
+            assert_eq!(
+                word.load(Ordering::Relaxed),
+                7,
+                "guard word {slot} overwritten"
+            );
+        }
+        for block in &blocks {
+            assert!(index.is_held(&mw, block.seq_hash), "{:?}", block.seq_hash);
+        }
+    }
+
     /// The race the release harness caught: a split of the parent between a store walk's plan
     /// and its lock-free claim must make the insert give up, not link the child after the new
     /// end. Replayed deterministically: plan (take the version), split, then try the insert.
@@ -3475,7 +3539,9 @@ mod tests {
         // The child prepared for blocks after the old end must not be linked after the new one.
         let contents = [content(3, 0).0, content(3, 1).0];
         let block = index.arena.alloc_array(&contents, capacity_for(2));
-        let engine = index.arena.alloc_array(&[30, 31], capacity_for(2));
+        let engine = index
+            .arena
+            .alloc_array(&[30, 31], index.arena.array_capacity(block));
         let child = index.slab.alloc(
             0,
             parent,
