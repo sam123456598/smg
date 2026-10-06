@@ -217,3 +217,55 @@ so the decode utilisation is the same number before and after the fix; the admis
 not bind at that pool (in-flight demand p90 127-162k per worker against 676k, and 0.008 of reuse on the tighter
 pool), so the full-pool table above stands and is not re-run. The restricted pool is re-run with the fixed mock
 (`t9dec`), and its table follows.
+
+## Restricted pool with the decode reference fixed (t9deck, 2026-10-05 21:45-22:05)
+
+Six locked runs with the batch-6 mock (`~/smg-perf/bin/leap-int/mock-worker-dec`, sha256 6d8ddc16...: tail-first
+free, admission gate, decode utilisation read against the calibration's 676,128 tokens), same gateway, replayer,
+rows and settings as the two series above.
+
+| metric | cache_aware mock | hardware | ratio | round_robin mock | hardware | ratio | direction (ca-rr) mock / hw |
+|---|---|---|---|---|---|---|---|
+| req/s | 16.44 | 14.80 | 1.11 | 16.65 | 16.60 | 1.00 | - / - |
+| goodput req/s | 12.73 | 7.04 | 1.81 (!) | 13.80 | 11.88 | 1.16 (!) | - / - |
+| within SLO % | 77.4 | 47.8 | 1.62 (!) | 82.9 | 71.5 | 1.16 (!) | - / - |
+| strict SLO % | 39.0 | 33.0 | 1.18 (!) | 24.0 | 33.0 | 0.73 (!) | + / 0 (differs) |
+| prefix reuse | 0.38 | 0.37 | 1.03 | 0.37 | 0.36 | 1.02 | + / + |
+| TTFT mean ms | 557.8 | 4065.0 | 0.14 (!) | 226.7 | 641.0 | 0.35 (!) | + / + |
+| TTFT p50 | 212.0 | 821.0 | 0.26 (!) | 200.1 | 245.0 | 0.82 (!) | + / + |
+| TTFT p90 | 1342.2 | 13217.0 | 0.10 (!) | 407.4 | 1838.0 | 0.22 (!) | + / + |
+| TTFT p99 | 5970.1 | 24479.0 | 0.24 (!) | 710.1 | 4787.0 | 0.15 (!) | + / + |
+| ITL mean ms | 15.5 | 26.1 | 0.59 (!) | 26.1 | 26.9 | 0.97 | - / - |
+| ITL p90 | 24.4 | 66.1 | 0.37 (!) | 61.4 | 68.5 | 0.90 | - / - |
+| ITL p99 | 110.6 | 198.1 | 0.56 (!) | 216.1 | 223.0 | 0.97 | - / - |
+| e2e p50 ms | 528.3 | 3599.0 | 0.15 (!) | 642.8 | 1258.0 | 0.51 (!) | - / + (differs) |
+| e2e p99 | 12276.9 | 30061.0 | 0.41 (!) | 7005.0 | 10317.0 | 0.68 (!) | + / + |
+
+Within 15%: 7 of 28 (11 of 28 within 25%); direction agreement 12 of 14. Per run:
+
+| run | ok / errors | req/s | goodput | within SLO | strict | reuse | TTFT mean / p50 / p90 / p99 (ms) | mean ITL mean / p90 / p99 (ms) | e2e p50 / p99 (ms) | hit/oracle |
+|---|---|---|---|---|---|---|---|---|---|---|
+| cache_aware r1 | 1950 / 50 | 16.56 | 13.28 | 80.2 % | 43.6 % | 0.379 | 517 / 222 / 1110 / 4982 | 11.9 / 17.2 / 56.9 | 454 / 11761 | 0.999 |
+| cache_aware r2 | 1950 / 50 | 16.18 | 12.29 | 75.9 % | 36.7 % | 0.375 | 674 / 219 / 1873 / 7638 | 13.8 / 24.1 / 55.1 | 521 / 13671 | 0.997 |
+| cache_aware r3 | 1950 / 50 | 16.57 | 12.62 | 76.2 % | 36.7 % | 0.382 | 483 / 196 / 1044 / 5290 | 20.8 / 31.9 / 219.8 | 610 / 11398 | 0.998 |
+| round_robin r1 | 1950 / 50 | 16.65 | 13.76 | 82.7 % | 23.9 % | 0.369 | 228 / 207 / 404 / 704 | 26.4 / 63.6 / 216.4 | 646 / 7057 | 0.974 |
+| round_robin r2 | 1950 / 50 | 16.64 | 13.75 | 82.7 % | 23.3 % | 0.369 | 229 / 198 / 412 / 730 | 25.7 / 59.4 / 215.3 | 651 / 7180 | 0.973 |
+| round_robin r3 | 1950 / 50 | 16.66 | 13.87 | 83.2 % | 24.7 % | 0.371 | 223 / 195 / 406 / 696 | 26.2 / 61.1 / 216.7 | 631 / 6779 | 0.973 |
+
+Reading. The saturation is gone: round robin's admission wait fell from p50 223-431 / p90 4,700-5,300 ms to p50 134 /
+p90 213 ms, preemptions from 17-28 to 0-1 per run, and the throughput rows meet the fleet within 16% (goodput
+1.16, within-SLO 1.16, req/s 1.00) with the reuse gap closed (0.370 against 0.363) and the decode step right (ITL
+mean 0.97, p90 0.90, p99 0.97). The policy ordering now agrees with the fleet on goodput and within-SLO (round
+robin ahead on both). What is left points the other way: at this pool the mock pays nothing the full pool does not
+(its round robin rows equal its full-pool rows, 13.8 req/s and a 407 ms p90), while the fleet lost 2.4 req/s and
+grew a 1.8 s p90 and a 4.8 s p99 between the pools; and the fleet's `cache_aware` collapse (7.0 req/s, p90 13 s:
+repeats sent to the credited worker whose blocks were long evicted, with removals announced late) does not happen
+on the mock, whose index stays exact (hit/oracle 0.998) and whose hot worker takes 1,057 of 1,950 requests with
+12 preemptions and a 1.1 s p90. Three candidates for that residual, none of them a blind mock change: the
+removal timing the gateway sees from vLLM (announced on reuse, 180k-590k per worker per run on the fleet, against
+the mock's pass-end publication at eviction), the cost of vLLM's preemptions and partial-prefix recomputation
+under pressure (the fleet's counter is not visible on the servicer path), and the fleet's effective capacity at
+12,000 blocks (what else holds blocks). A per-second scrape of vLLM's KV usage, preemption and queue counters
+during one restricted-pool run decides between them; until then T9 holds at the full pool (18 of 28 within 15%,
+ordering reproduced) and at the restricted pool on throughput, reuse and decode (round robin within 16%), not on
+the tails or on `cache_aware`.
