@@ -290,6 +290,27 @@ agent, a load generator). Excluding cores 26 and 35 from the lane mask did not s
 so the full mask stays. At 750 ms the competitor still keeps up (99.8% of 427M); its capacity is
 the 300 ms row.
 
+### The competitor at its branch head (re-measured when its branch moves)
+
+ai-dynamo/dynamo `rupei/crtc-writer-lookup` moved from `50bdb355f8` (every row above) to
+`2b20fc1d35` on 2026-10-05: in the bench binary, an idle event lane now frees graveyard garbage
+in `GRAVEYARD_NODES_PER_TASK` chunks while its channel stays empty instead of draining it all at
+once (`drain_graveyard_while`), and crossbeam-epoch moves to 0.9.21; the other changes (a jemalloc
+preload and huge-page opt-outs for the Python extension's heap, docs) are outside the binary. Rebuilt
+with the same out-of-tree patches and features, competitor layout, 3 trials per point (21:10-21:45,
+host load 27-50 with other users' jobs on the measurement cores): under local memory the kept-up
+point is unchanged (859.7M passes 99.5-99.6%, 923.9M fails 97.2-99.5%); under `--interleave=all`
+the first pass failed the published 682.2M point (99.5%, 98.5%, 98.9%), a bracket then gave 590.8M
+kept up / 634.9M failing (one trial at 92.4% under foreign load) and a 20-trial series at 590.8M
+read 587.9M [585.2, 588.5], 14 of 19 kept up with 10 of 29 attempts discarded, p50 3.5 / p99 14.0
+us; but an interleaved same-session control of the two binaries afterwards kept up 3 of 3 for both
+at 682.2M (old 99.2-99.6%, new 99.2-99.3%) and at 590.8M (99.1-99.7% both) with identical lookup
+latencies (p50 3.2-3.6, p99 13-15 us). The head's code change has no measurable effect on the
+competitor's sustained point or latencies; the first-pass failure and the lower bracket were the
+host's foreign load during those minutes, and the published 682.2M row stands for the new head
+until a quiet-host bracket replaces it (results: `competitor-head/`, `bisect-dynamo-head2b20`,
+`protocol/dynamo-sustained-head2b20`, with provenance).
+
 ## Scaled layout: equal backend cores and same-binary rows
 
 The competitor layout gives the two harnesses different lane sets and leaves the generator as the
