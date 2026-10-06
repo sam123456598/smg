@@ -384,6 +384,15 @@ pub(crate) fn init_metrics() {
         "Age of a KV event batch when applied: now minus the publisher timestamp, by worker"
     );
     describe_counter!(
+        "smg_kv_event_parentless_stores_total",
+        "Stores whose parent block the index did not hold for the worker, placed as a \
+         new chain from the root instead (a parent evicted, dropped, or cleared), by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_parentless_blocks_total",
+        "Blocks of the parent-less stores, by worker"
+    );
+    describe_counter!(
         "smg_kv_event_blocks_total",
         "Blocks named by applied KV events, by worker and op (stored, removed)"
     );
@@ -1742,6 +1751,15 @@ impl Metrics {
             "op" => op
         )
         .increment(blocks as u64);
+    }
+
+    /// Count the stores a batch placed without their parent (as new chains
+    /// from the root) and the blocks they carried.
+    pub fn record_kv_event_parentless(worker_url: &str, stores: u64, blocks: u64) {
+        let worker = intern_string(worker_url);
+        counter!("smg_kv_event_parentless_stores_total", "worker" => worker.clone())
+            .increment(stores);
+        counter!("smg_kv_event_parentless_blocks_total", "worker" => worker).increment(blocks);
     }
 
     /// Time to apply one batch to the index.

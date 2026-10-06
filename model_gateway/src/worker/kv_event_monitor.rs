@@ -1072,6 +1072,7 @@ impl KvEventMonitor {
 
         on_batch(batch);
         let started = Instant::now();
+        let counters_before = state.index.counters;
         let (mut stored_blocks, mut removed_blocks) = (0usize, 0usize);
         for event in &batch.events {
             match &event.data {
@@ -1084,6 +1085,7 @@ impl KvEventMonitor {
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
         Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
+        Self::record_parentless(worker_url, &state.index.counters, &counters_before);
         if stored_blocks > 0 {
             Metrics::record_kv_event_blocks(worker_url, "stored", stored_blocks);
         }
@@ -1159,9 +1161,11 @@ impl KvEventMonitor {
             cursor.mark_degraded();
         }
         on_batch(batch);
+        let counters_before = state.index.counters;
         for event in &batch.events {
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
+        Self::record_parentless(worker_url, &state.index.counters, &counters_before);
         Self::record_lag(worker_url, batch.timestamp);
         Metrics::record_kv_event_batch(worker_url, "snapshot");
         if let Some(progress) = &mut state.snapshot {
@@ -1191,6 +1195,18 @@ impl KvEventMonitor {
             if *other != rank {
                 cursor.reset();
             }
+        }
+    }
+
+    /// Publish the parent-less stores a batch produced, if any.
+    fn record_parentless(
+        worker_url: &str,
+        after: &WorkerIndexCounters,
+        before: &WorkerIndexCounters,
+    ) {
+        let (stores, blocks) = after.parentless_since(before);
+        if stores > 0 {
+            Metrics::record_kv_event_parentless(worker_url, stores, blocks);
         }
     }
 
@@ -1300,6 +1316,8 @@ impl KvEventMonitor {
             Ok(()) => {}
             Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound) => {
                 // Cold start or parent evicted — retry without parent to start a new chain.
+                worker_blocks.counters.parentless_stores += 1;
+                worker_blocks.counters.parentless_blocks += blocks.len() as u64;
                 if let Err(e) =
                     indexer.apply_stored(worker_id, &blocks, None, &mut worker_blocks.blocks)
                 {
@@ -1422,6 +1440,22 @@ pub(crate) struct WorkerIndexCounters {
     pub(crate) duplicate_copies: u64,
     /// Copy counts that hit [`COPIES_CAP`].
     pub(crate) capped_copies: u64,
+    /// Stores whose parent the index did not hold, placed as a new chain from
+    /// the root instead, and the blocks they carried. Every one duplicates
+    /// content the chain may already hold further down, so a rising count is
+    /// where fragmentation of the run index is looked for first.
+    pub(crate) parentless_stores: u64,
+    pub(crate) parentless_blocks: u64,
+}
+
+impl WorkerIndexCounters {
+    /// Parent-less stores and blocks this state saw since `before`.
+    fn parentless_since(&self, before: &Self) -> (u64, u64) {
+        (
+            self.parentless_stores - before.parentless_stores,
+            self.parentless_blocks - before.parentless_blocks,
+        )
+    }
 }
 
 /// Physical copies of one block per tier, all of the worker's ranks pooled:
@@ -2172,6 +2206,52 @@ mod tests {
             assert!(gauge(&handle, "smg_kv_index_arena_bytes", "run").is_some_and(|b| b > 0.0));
             assert!(gauge(&handle, "smg_kv_index_slab_bytes", "run").is_some_and(|b| b > 0.0));
             assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "pos"), None);
+        });
+    }
+
+    /// A store whose parent the index does not hold is placed from the root
+    /// and counted, per worker, so a soak can see how much of a chain's
+    /// content arrives detached (where the run index fragments first).
+    #[test]
+    fn parentless_stores_are_counted_per_worker() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn counter(handle: &PrometheusHandle, name: &str) -> Option<f64> {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                None
+            );
+            // The parent of this store was never seen (dropped or evicted).
+            sim.deliver(&batch(2, None, vec![stored(Some(99), &[3, 4, 5])]));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_blocks_total"),
+                Some(3.0)
+            );
+            assert_eq!(sim.state.index.counters.parentless_stores, 1);
+            // A chained store after a held parent is not counted.
+            sim.deliver(&batch(3, None, vec![stored(Some(2), &[6])]));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                Some(1.0)
+            );
+            sim.assert_matches_reference();
         });
     }
 
