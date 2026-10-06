@@ -403,6 +403,9 @@ impl fmt::Debug for KvIndex {
 }
 
 #[cfg(test)]
+mod exactness;
+
+#[cfg(test)]
 mod reference {
     //! The reference indexer behind the [`KvIndex`](super::KvIndex) surface:
     //! interning and the per-worker membership set the other variants keep in
