@@ -1381,9 +1381,10 @@ impl CacheAwarePolicy {
         self.select_expected_wait(workers, &candidates, info)
     }
 
-    /// The healthy workers under the count-pressure gate. Every worker
-    /// trips it only for an empty fleet (the lightest worker never clears
-    /// the mean), but the guard keeps a selection from returning no worker.
+    /// The healthy workers under the count-pressure gate. The lightest worker
+    /// never clears the snapshot mean, but `avg_load` and the per-worker load
+    /// re-read can disagree under concurrent dispatch, so the guard keeps a
+    /// selection from returning no worker.
     fn ungated_candidates(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1755,43 +1756,19 @@ impl CacheAwarePolicy {
         // Hash mode keys on token ids; untokenized requests stay load-balanced.
         // Unpartitioned heads are stripped of marker material like the tree
         // keys, so the placement key spaces stay disjoint by construction too.
-        let tokens = match info.cache_namespace {
+        let tokens: &[u32] = match info.cache_namespace {
             Some(_) => info.tokens,
             None => info.tokens.map(CacheNamespace::unpartitioned_tokens),
-        };
-        let Some(tokens) = tokens.filter(|t| !t.is_empty()) else {
-            return self.hash_expected_wait(
-                workers,
-                info,
-                healthy_indices,
-                model_id,
-                "expected_wait_fallback",
-                &[],
-                &[],
-                now,
-            );
-        };
-
+        }
+        .unwrap_or(&[]);
         let applicable_end = self
             .config
             .cache_boundaries
             .partition_point(|&p| p <= tokens.len());
         let applicable = &self.config.cache_boundaries[..applicable_end];
 
-        // Head-only traffic must stay load-balanced.
-        if applicable.is_empty() {
-            return self.hash_expected_wait(
-                workers,
-                info,
-                healthy_indices,
-                model_id,
-                "short_request",
-                tokens,
-                applicable,
-                now,
-            );
-        }
-
+        // Backend KV pressure sheds fleet-wide ahead of any count gate, as the
+        // tree path does for every request it routes.
         if self.is_kv_imbalanced(workers, healthy_indices) {
             return self.hash_expected_wait(
                 workers,
@@ -1799,6 +1776,27 @@ impl CacheAwarePolicy {
                 healthy_indices,
                 model_id,
                 "kv_pressure_expected_wait",
+                tokens,
+                applicable,
+                now,
+            );
+        }
+
+        // Untokenized or head-only traffic has no holder to find: it stays
+        // load-balanced, bounded by the count-pressure gate like a tree miss.
+        if applicable.is_empty() {
+            let candidates = self.ungated_candidates(workers, healthy_indices, avg_load);
+            let branch = if tokens.is_empty() {
+                "expected_wait_fallback"
+            } else {
+                "short_request"
+            };
+            return self.hash_expected_wait(
+                workers,
+                info,
+                &candidates,
+                model_id,
+                branch,
                 tokens,
                 applicable,
                 now,
@@ -3540,6 +3538,33 @@ mod tests {
         for i in 0..8u32 {
             let head = [i, i, i, i, 9];
             let idx = route_tokens(&policy, &workers, &head);
+            workers[idx].increment_load();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
+    }
+
+    /// Hash mode keys on token ids, so every HTTP-router request is a miss
+    /// there; the same bound applies.
+    #[test]
+    fn hash_untokenized_burst_is_bounded_by_the_count_pressure_gate() {
+        let policy = CacheAwarePolicy::with_config(gate_at_mean(hash_config(&[4])));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&skewed_rate_loads(&workers));
+
+        let mut picks = [0usize; 2];
+        for i in 0..8 {
+            let text = format!("{i} novel prompt with nothing in common");
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(&text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             workers[idx].increment_load();
             picks[idx] += 1;
         }
