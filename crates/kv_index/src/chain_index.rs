@@ -1282,6 +1282,10 @@ pub struct ChainIndex {
     /// Stores whose blocks carried the engine hashes the index holds for other content.
     landing_mismatches: AtomicUsize,
     /// Blocks a store moved to another place for their worker (the old membership released).
+    /// Coverage words a lookup has to read: enough for the highest worker id interned so far
+    /// (ids are handed out densely and reused), at most `words`. An index sized for a thousand
+    /// workers that serves eight reads one word per run instead of sixteen.
+    live_words: AtomicUsize,
     moved_hashes: AtomicUsize,
     /// Splits by cause and runs unlinked, always counted (one relaxed increment per split or
     /// death): the fragmentation figures a churn harness and the gateway's gauges read.
@@ -1426,6 +1430,7 @@ impl ChainIndex {
                 .collect(),
             engine_conflicts: AtomicUsize::new(0),
             landing_mismatches: AtomicUsize::new(0),
+            live_words: AtomicUsize::new(0),
             moved_hashes: AtomicUsize::new(0),
             splits_branch: AtomicUsize::new(0),
             splits_hole: AtomicUsize::new(0),
@@ -1541,7 +1546,12 @@ impl ChainIndex {
                     Some(id) => id,
                     None if registry.names.len() < self.max_workers => {
                         registry.names.push(None);
-                        (registry.names.len() - 1) as u32
+                        let id = (registry.names.len() - 1) as u32;
+                        // Published before the id can hold anything: the worker's first store
+                        // comes after this returns.
+                        self.live_words
+                            .fetch_max(id as usize / 64 + 1, Ordering::Release);
+                        id
                     }
                     None => return Err(WorkerIdExhausted),
                 };
@@ -3122,7 +3132,10 @@ impl ChainIndex {
         mut report: impl FnMut(u32, u32),
     ) -> usize {
         let (mut run_id, mut expected) = entry;
-        let words = self.words;
+        // Only the words that can carry a holder: reading all sixteen of a thousand-worker
+        // index per run visited, and sweeping them three times, was most of a lookup's cost
+        // in a fleet of eight.
+        let words = self.live_words.load(Ordering::Acquire).min(self.words);
         let mut alive = [0u64; MAX_WORDS];
         // The partial-holder entries of the run in hand live in a per-thread buffer: a walk
         // writes the prefix it then reads, so nothing is zeroed per lookup (the 8 KB this
@@ -3145,10 +3158,26 @@ impl ChainIndex {
                     .zip(hashes)
                     .take_while(|(content, slot)| hash_of(content) == slot.load(Ordering::Relaxed))
                     .count();
-                // Partial holders before the coverage words: a worker moving from a prefix to the
-                // whole run gains its bit before it loses its entry, so this order never misses it.
+                let coverage = self.slab.coverage(run_id);
+                let mut held = [0u64; MAX_WORDS];
+                for (word, slot) in held[..words].iter_mut().zip(coverage) {
+                    *word = slot.load(Ordering::Relaxed);
+                }
+                // The partial-holder table is another line of the arena: read it only when it
+                // can change the answer, that is at the first run (every entry is a holder there)
+                // or when a worker still alive does not hold this whole run. A worker moving from
+                // a prefix to the whole run gains its bit before it loses its entry, so the
+                // coverage word is read again after the table and both reads count: a bit seen
+                // either time makes the worker whole, and an entry gone by the table read means
+                // its bit was set before the second read.
                 let mut partials = 0usize;
-                if window.partials != NONE {
+                if window.partials != NONE
+                    && (position == 0
+                        || alive[..words]
+                            .iter()
+                            .zip(&held)
+                            .any(|(word, whole)| word & !whole != 0))
+                {
                     let (_, used) = self.arena.partials_shape(window.partials);
                     for slot in self.arena.words(window.partials + 2, used) {
                         let entry = slot.load(Ordering::Relaxed);
@@ -3157,11 +3186,9 @@ impl ChainIndex {
                             partials += 1;
                         }
                     }
-                }
-                let coverage = self.slab.coverage(run_id);
-                let mut held = [0u64; MAX_WORDS];
-                for (word, slot) in held[..words].iter_mut().zip(coverage) {
-                    *word = slot.load(Ordering::Relaxed);
+                    for (word, slot) in held[..words].iter_mut().zip(coverage) {
+                        *word |= slot.load(Ordering::Relaxed);
+                    }
                 }
                 let next = if position + matched < content_hashes.len() {
                     // The request goes on past what matched here: a child may continue the run
