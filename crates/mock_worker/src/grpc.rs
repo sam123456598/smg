@@ -5,9 +5,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
-use futures::{stream, Stream};
+use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -19,7 +20,7 @@ use ts::{
 
 use crate::{
     config::Config,
-    engine::{self, Engine, NewRequest},
+    engine::{self, Engine, LoadsLike, NewRequest},
 };
 
 /// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
@@ -262,10 +263,15 @@ impl TokenSpeedScheduler for MockScheduler {
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
         match &self.engine {
-            // Realistic mode with prefix caching: stream the engine's KV events.
+            // Realistic mode with prefix caching: stream the engine's KV events,
+            // each carrying the load record a servicer attaches.
             Some(engine) if engine.kv_enabled() => {
                 let start = request.into_inner().start_sequence_number;
-                Ok(Response::new(engine.subscribe_kv(start)))
+                Ok(Response::new(with_load_records(
+                    engine.clone(),
+                    self.cfg.loads_like,
+                    engine.subscribe_kv(start),
+                )))
             }
             // Otherwise Unimplemented makes the gateway's KvEventMonitor give up
             // cleanly (no idle per-worker task), exactly as before this RPC existed.
@@ -374,6 +380,159 @@ fn generate_stream(
 }
 
 /// Map an engine load snapshot to the TokenSpeed `SchedulerLoad` wire type.
+/// The load record the engine's `GetLoads` figures make, as reported for
+/// `loads_like` (the vLLM shape has no queued token-work).
+fn load_record(
+    snapshot: &engine::LoadSnapshot,
+    like: LoadsLike,
+    sample: u64,
+) -> common::EngineLoad {
+    let unsigned = |value: i32| u32::try_from(value).unwrap_or(0);
+    common::EngineLoad {
+        running_requests: unsigned(snapshot.num_running_reqs),
+        waiting_requests: unsigned(snapshot.num_waiting_reqs),
+        waiting_uncached_tokens: matches!(like, LoadsLike::Mock)
+            .then(|| unsigned(snapshot.num_waiting_uncached_tokens)),
+        token_usage: snapshot.token_usage,
+        gen_throughput: snapshot.gen_throughput,
+        max_running_requests: unsigned(snapshot.max_running_requests),
+        age_ms: 0,
+        sample,
+        load_only: false,
+    }
+}
+
+/// Whether a record moved enough from `last` to be worth a `load_only`
+/// batch: the Rust relay's rule (any queue, running or window change, KV
+/// usage by half a percent, the rate by 5 % or 50 tokens per second).
+fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
+    last.running_requests != current.running_requests
+        || last.waiting_requests != current.waiting_requests
+        || last.waiting_uncached_tokens != current.waiting_uncached_tokens
+        || last.max_running_requests != current.max_running_requests
+        || (last.token_usage - current.token_usage).abs() > 0.005
+        || {
+            let delta = (last.gen_throughput - current.gen_throughput).abs();
+            delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
+        }
+}
+
+/// How often the stream checks the record while no batch flows, the silence
+/// after which a heartbeat goes out, and the heartbeat interval once the
+/// engine has been idle for two of them: the Rust relay's figures.
+const LOAD_TICK: Duration = Duration::from_millis(100);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
+
+struct LoadRecords {
+    stream: KvEventStream,
+    engine: engine::Engine,
+    like: LoadsLike,
+    last_seq: u64,
+    last_rank: Option<i32>,
+    last_record: Option<common::EngineLoad>,
+    last_sent_at: Instant,
+    idle_heartbeats: u32,
+    sample: u64,
+}
+
+enum Waited {
+    Item(Option<Result<common::KvEventBatch, Status>>),
+    Tick,
+}
+
+impl LoadRecords {
+    fn record(&mut self, load_only: bool) -> common::EngineLoad {
+        self.sample += 1;
+        let snapshot = self.engine.load().as_reported_by(self.like);
+        let mut record = load_record(&snapshot, self.like, self.sample);
+        record.load_only = load_only;
+        self.last_record = Some(record);
+        record
+    }
+
+    /// A `load_only` batch when the record moved since the last one sent, or
+    /// after the heartbeat interval of silence (the backoff interval after two
+    /// unchanged heartbeats); it repeats the last sequence sent, as the
+    /// gateway expects.
+    fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
+        let current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
+        let changed = self
+            .last_record
+            .as_ref()
+            .is_none_or(|last| load_changed(last, &current));
+        let due_after = if self.idle_heartbeats >= 2 {
+            HEARTBEAT_BACKOFF
+        } else {
+            HEARTBEAT_INTERVAL
+        };
+        if !changed && self.last_sent_at.elapsed() < due_after {
+            return None;
+        }
+        let record = self.record(true);
+        self.last_sent_at = Instant::now();
+        self.idle_heartbeats = if changed {
+            0
+        } else {
+            self.idle_heartbeats.saturating_add(1)
+        };
+        Some(common::KvEventBatch {
+            sequence_number: self.last_seq,
+            timestamp: engine::unix_seconds(),
+            events: Vec::new(),
+            dp_rank: self.last_rank,
+            snapshot: None,
+            load: Some(record),
+        })
+    }
+}
+
+/// `stream` with the engine's load record on every batch and `load_only`
+/// batches while the engine is quiet, as the Rust servicer's relay sends
+/// them (`crates/engine_servicer/src/kv_events.rs`).
+fn with_load_records(
+    engine: engine::Engine,
+    like: LoadsLike,
+    stream: KvEventStream,
+) -> KvEventStream {
+    let records = LoadRecords {
+        stream,
+        engine,
+        like,
+        last_seq: 0,
+        last_rank: Some(0),
+        last_record: None,
+        last_sent_at: Instant::now(),
+        idle_heartbeats: 0,
+        sample: 0,
+    };
+    Box::pin(stream::unfold(records, |mut records| async move {
+        loop {
+            let waited = tokio::select! {
+                item = records.stream.next() => Waited::Item(item),
+                () = tokio::time::sleep(LOAD_TICK) => Waited::Tick,
+            };
+            match waited {
+                Waited::Item(None) => return None,
+                Waited::Item(Some(Err(status))) => return Some((Err(status), records)),
+                Waited::Item(Some(Ok(mut batch))) => {
+                    records.last_seq = batch.sequence_number;
+                    records.last_rank = batch.dp_rank;
+                    records.last_sent_at = Instant::now();
+                    records.idle_heartbeats = 0;
+                    batch.load = Some(records.record(false));
+                    return Some((Ok(batch), records));
+                }
+                Waited::Tick => {
+                    if let Some(batch) = records.load_only_batch() {
+                        return Some((Ok(batch), records));
+                    }
+                }
+            }
+        }
+    }))
+}
+
 fn snapshot_to_scheduler_load(s: &engine::LoadSnapshot) -> ts::SchedulerLoad {
     ts::SchedulerLoad {
         dp_rank: 0,

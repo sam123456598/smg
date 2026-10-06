@@ -70,6 +70,16 @@
 //! resubscribes from zero, where the new incarnation's complete history is
 //! waiting for it. A repeated sequence without a clear is a duplicate.
 //!
+//! Every batch a subscriber receives carries the servicer's load record
+//! ([`LoadSource`], the figures `GetLoads` answers with, as `KvEventBatch.
+//! load`), and a subscriber hears from the relay even when the publisher is
+//! quiet: a batch with no events and the last sequence repeated, marked
+//! `load_only`, goes out when the record changed (checked every
+//! `load_tick`, 100 ms) and as a heartbeat after `heartbeat_interval` (1 s)
+//! of silence, backing off to `heartbeat_backoff` (5 s) once the engine has
+//! been idle for two heartbeats. The gateway feeds the record where its
+//! `GetLoads` poll goes and admits nothing from a `load_only` batch.
+//!
 //! `SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor` turns on the relay's
 //! engine-hash verification ([`crate::engine_hash`]); mismatches are counted,
 //! never dropped. The relay's counters ([`RelayCounts`]) are logged on every
@@ -83,7 +93,7 @@
 use std::{
     collections::VecDeque,
     ops::RangeInclusive,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -134,6 +144,12 @@ const PRIME_RETRY: Duration = Duration::from_secs(1);
 /// Live batches a slow subscriber may fall behind before it is refilled from
 /// the history.
 const LIVE_CHANNEL: usize = 4_096;
+/// How often a subscriber's stream checks the load record for a change.
+pub const DEFAULT_LOAD_TICK: Duration = Duration::from_millis(100);
+/// Silence after which a `load_only` heartbeat goes out.
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// The heartbeat interval once the engine has been idle for two heartbeats.
+pub const DEFAULT_HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
 /// The replay socket's end marker, eight 0xff bytes on both wires.
 const END_SEQUENCE: [u8; 8] = [0xff; 8];
 
@@ -149,6 +165,13 @@ pub struct RelayConfig {
     pub history_bytes: usize,
     /// How long a replay reply may take before the rest of a gap is lost.
     pub replay_timeout: Duration,
+    /// How often a subscriber's stream checks the load record for a change
+    /// while no batch flows.
+    pub load_tick: Duration,
+    /// Silence after which a `load_only` heartbeat goes out.
+    pub heartbeat_interval: Duration,
+    /// The heartbeat interval after two heartbeats with an unchanged record.
+    pub heartbeat_backoff: Duration,
 }
 
 impl RelayConfig {
@@ -168,8 +191,61 @@ impl RelayConfig {
             history_batches: env_usize(HISTORY_BATCHES_ENV, DEFAULT_HISTORY_BATCHES),
             history_bytes: env_usize(HISTORY_BYTES_ENV, DEFAULT_HISTORY_BYTES),
             replay_timeout: DEFAULT_REPLAY_TIMEOUT,
+            load_tick: DEFAULT_LOAD_TICK,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            heartbeat_backoff: DEFAULT_HEARTBEAT_BACKOFF,
         }
     }
+}
+
+/// Where the relay reads the engine's load for the record it attaches to
+/// every batch: the servicer's `GetLoads` bookkeeping.
+pub trait LoadSource: Send + Sync {
+    /// The load for `dp_rank` (the batch's rank; `None` for a publisher that
+    /// names none) as `GetLoads` would report it now, or `None` while nothing
+    /// is known (the engine is not up yet). `sample` and `load_only` are the
+    /// relay's to set.
+    fn load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
+}
+
+/// An [`EngineLoad`](common::EngineLoad) from the fields a `GetLoads` rank
+/// entry carries; `waiting_uncached_tokens` is `None` when the servicer
+/// cannot tell (the proto keeps that distinct from 0).
+pub fn engine_load(
+    running: i32,
+    waiting: i32,
+    waiting_uncached_tokens: Option<i32>,
+    token_usage: f64,
+    gen_throughput: f64,
+    max_running_requests: i32,
+) -> common::EngineLoad {
+    let unsigned = |value: i32| u32::try_from(value).unwrap_or(0);
+    common::EngineLoad {
+        running_requests: unsigned(running),
+        waiting_requests: unsigned(waiting),
+        waiting_uncached_tokens: waiting_uncached_tokens.map(unsigned),
+        token_usage,
+        gen_throughput,
+        max_running_requests: unsigned(max_running_requests),
+        age_ms: 0,
+        sample: 0,
+        load_only: false,
+    }
+}
+
+/// Whether a record moved enough from `last` to be worth a `load_only`
+/// batch: any queue, running or window change, KV usage by half a percent,
+/// the rate by 5 % or 50 tokens per second.
+fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
+    last.running_requests != current.running_requests
+        || last.waiting_requests != current.waiting_requests
+        || last.waiting_uncached_tokens != current.waiting_uncached_tokens
+        || last.max_running_requests != current.max_running_requests
+        || (last.token_usage - current.token_usage).abs() > 0.005
+        || {
+            let delta = (last.gen_throughput - current.gen_throughput).abs();
+            delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
+        }
 }
 
 /// Whether [`RELAY_START_ENV`] set to `value` keeps the start at boot.
@@ -362,6 +438,9 @@ pub struct KvEventRelay {
     /// A subscriber came while the relay holds nothing: the publisher task
     /// asks the engine's replay for the publisher's start again.
     prime_request: Arc<Notify>,
+    /// The servicer's load, attached to every batch sent; none until the
+    /// servicer installs it.
+    load_source: OnceLock<Arc<dyn LoadSource>>,
 }
 
 impl Drop for KvEventRelay {
@@ -407,7 +486,14 @@ impl KvEventRelay {
             live,
             task: Mutex::new(None),
             prime_request: Arc::new(Notify::new()),
+            load_source: OnceLock::new(),
         })
+    }
+
+    /// Install where the load record on every sent batch comes from (once;
+    /// a second call is ignored).
+    pub fn set_load_source(&self, source: Arc<dyn LoadSource>) {
+        let _ = self.load_source.set(source);
     }
 
     /// The relay for an engine's publisher, or `None` when events are off
@@ -631,6 +717,15 @@ impl KvEventRelay {
             shared: Arc::clone(&self.shared),
             endpoint: self.config.endpoint.clone(),
             done: false,
+            source: self.load_source.get().cloned(),
+            load_tick: self.config.load_tick,
+            heartbeat_interval: self.config.heartbeat_interval,
+            heartbeat_backoff: self.config.heartbeat_backoff,
+            last_rank: None,
+            last_record: None,
+            last_sent_at: Instant::now(),
+            idle_heartbeats: 0,
+            sample: 0,
         };
         Ok(Box::pin(stream::unfold(
             subscriber,
@@ -684,9 +779,85 @@ struct Subscriber {
     shared: Arc<Mutex<Shared>>,
     endpoint: String,
     done: bool,
+    /// The servicer's load for the record on every batch; `None` sends
+    /// batches without one and no `load_only` batches.
+    source: Option<Arc<dyn LoadSource>>,
+    load_tick: Duration,
+    heartbeat_interval: Duration,
+    heartbeat_backoff: Duration,
+    /// The rank of the last batch sent: what a `load_only` batch names.
+    last_rank: Option<i32>,
+    /// The last record sent, for the change check.
+    last_record: Option<common::EngineLoad>,
+    /// When the last batch of any kind went out.
+    last_sent_at: Instant,
+    /// Heartbeats in a row with an unchanged record.
+    idle_heartbeats: u32,
+    /// Records sent on this stream.
+    sample: u64,
+}
+
+/// What the live wait ended with.
+enum Waited {
+    Live(Result<Live, broadcast::error::RecvError>),
+    Tick,
 }
 
 impl Subscriber {
+    /// Attach the load record to a batch about to go out and note it went.
+    fn stamped(&mut self, mut batch: common::KvEventBatch) -> common::KvEventBatch {
+        self.last_rank = batch.dp_rank;
+        self.last_sent_at = Instant::now();
+        self.idle_heartbeats = 0;
+        batch.load = self.record(batch.dp_rank, false);
+        batch
+    }
+
+    /// The next record for `rank` from the source, numbered.
+    fn record(&mut self, rank: Option<i32>, load_only: bool) -> Option<common::EngineLoad> {
+        let mut record = self.source.as_ref()?.load(rank)?;
+        self.sample += 1;
+        record.sample = self.sample;
+        record.load_only = load_only;
+        self.last_record = Some(record);
+        Some(record)
+    }
+
+    /// A `load_only` batch when the record moved since the last one sent,
+    /// or when the stream has been silent for the heartbeat interval (the
+    /// backoff interval after two unchanged heartbeats); `None` otherwise.
+    fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
+        let current = self.source.as_ref()?.load(self.last_rank)?;
+        let changed = self
+            .last_record
+            .as_ref()
+            .is_none_or(|last| load_changed(last, &current));
+        let due_after = if self.idle_heartbeats >= 2 {
+            self.heartbeat_backoff
+        } else {
+            self.heartbeat_interval
+        };
+        if !changed && self.last_sent_at.elapsed() < due_after {
+            return None;
+        }
+        let rank = self.last_rank;
+        let record = self.record(rank, true)?;
+        self.last_sent_at = Instant::now();
+        self.idle_heartbeats = if changed {
+            0
+        } else {
+            self.idle_heartbeats.saturating_add(1)
+        };
+        Some(common::KvEventBatch {
+            sequence_number: self.last_sent.unwrap_or(0),
+            timestamp: unix_seconds(),
+            events: Vec::new(),
+            dp_rank: rank,
+            snapshot: None,
+            load: Some(record),
+        })
+    }
+
     async fn next(&mut self) -> Option<Item> {
         if self.done {
             return None;
@@ -717,7 +888,7 @@ impl Subscriber {
                 }
                 SnapshotPhase::Serving(chunks) => {
                     if let Some(chunk) = chunks.next_chunk() {
-                        return Some(Ok(chunk));
+                        return Some(Ok(self.stamped(chunk)));
                     }
                     self.snapshot = SnapshotPhase::None;
                 }
@@ -725,9 +896,27 @@ impl Subscriber {
             }
             if let Some(batch) = self.replay.pop_front() {
                 self.last_sent = Some(batch.sequence_number);
-                return Some(Ok((*batch).clone()));
+                return Some(Ok(self.stamped((*batch).clone())));
             }
-            match self.rx.recv().await {
+            let waited = if self.source.is_some() {
+                let tick = self.load_tick;
+                tokio::select! {
+                    received = self.rx.recv() => Waited::Live(received),
+                    () = tokio::time::sleep(tick) => Waited::Tick,
+                }
+            } else {
+                Waited::Live(self.rx.recv().await)
+            };
+            let received = match waited {
+                Waited::Tick => {
+                    if let Some(batch) = self.load_only_batch() {
+                        return Some(Ok(batch));
+                    }
+                    continue;
+                }
+                Waited::Live(received) => received,
+            };
+            match received {
                 Ok(Live::Batch(batch)) => {
                     if self
                         .last_sent
@@ -736,7 +925,7 @@ impl Subscriber {
                         continue;
                     }
                     self.last_sent = Some(batch.sequence_number);
-                    return Some(Ok((*batch).clone()));
+                    return Some(Ok(self.stamped((*batch).clone())));
                 }
                 Ok(Live::Restart { generation }) => {
                     self.done = true;
@@ -1299,7 +1488,10 @@ pub(crate) mod golden {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
 
     use futures::StreamExt;
     use smg_grpc_client::common_proto::{kv_cache_event, KvCacheLocality, KvCacheTier};
@@ -1517,6 +1709,9 @@ mod tests {
             history_batches,
             history_bytes: 64 << 20,
             replay_timeout: Duration::from_secs(2),
+            load_tick: DEFAULT_LOAD_TICK,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            heartbeat_backoff: DEFAULT_HEARTBEAT_BACKOFF,
         });
         relay.start();
         let mut lab = Lab {
@@ -1530,6 +1725,205 @@ mod tests {
             lab.answer_replay(0, &[]).await;
         }
         lab
+    }
+
+    /// A load source the tests steer: the record the relay attaches, and how
+    /// often it was asked.
+    struct StubLoads {
+        record: Mutex<common::EngineLoad>,
+        asked: AtomicU64,
+    }
+
+    impl StubLoads {
+        fn new(running: u32, waiting: u32) -> Arc<Self> {
+            Arc::new(Self {
+                record: Mutex::new(common::EngineLoad {
+                    running_requests: running,
+                    waiting_requests: waiting,
+                    waiting_uncached_tokens: Some(4_096),
+                    token_usage: 0.25,
+                    gen_throughput: 1_200.0,
+                    max_running_requests: 64,
+                    ..Default::default()
+                }),
+                asked: AtomicU64::new(0),
+            })
+        }
+
+        fn set(&self, running: u32, waiting: u32) {
+            let mut record = self.record.lock().unwrap_or_else(PoisonError::into_inner);
+            record.running_requests = running;
+            record.waiting_requests = waiting;
+        }
+    }
+
+    impl LoadSource for StubLoads {
+        fn load(&self, _dp_rank: Option<i32>) -> Option<common::EngineLoad> {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            Some(*self.record.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    /// A relay with a load source and short record intervals (`tick`,
+    /// heartbeat, backoff), primed with sequence 0.
+    async fn start_lab_with_loads(
+        loads: Arc<StubLoads>,
+        tick: Duration,
+        heartbeat: Duration,
+        backoff: Duration,
+    ) -> Lab {
+        let mut publisher = PubSocket::new();
+        let endpoint = publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("publisher binds")
+            .to_string();
+        let relay = KvEventRelay::new(RelayConfig {
+            endpoint,
+            replay_endpoint: None,
+            topic: "kv".to_string(),
+            history_batches: 100,
+            history_bytes: 64 << 20,
+            replay_timeout: Duration::from_secs(2),
+            load_tick: tick,
+            heartbeat_interval: heartbeat,
+            heartbeat_backoff: backoff,
+        });
+        relay.set_load_source(loads);
+        relay.start();
+        let mut lab = Lab {
+            publisher,
+            router: None,
+            relay,
+        };
+        lab.prime().await;
+        lab
+    }
+
+    fn record_of(batch: &common::KvEventBatch) -> &common::EngineLoad {
+        batch.load.as_ref().expect("a load record on the batch")
+    }
+
+    /// Every batch a subscriber receives, whether from the history, live or
+    /// a snapshot chunk, carries the servicer's load record, numbered per
+    /// stream; a relay without a source sends none.
+    #[tokio::test]
+    async fn every_batch_a_subscriber_receives_carries_the_load_record() {
+        let loads = StubLoads::new(3, 1);
+        let mut lab = start_lab_with_loads(
+            loads,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        lab.publish(1, &batch2).await;
+        lab.wait_relayed(2).await;
+        // History first (0 and 1), then live (2).
+        let mut stream = lab.subscribe(0).expect("history");
+        let first = read(&mut stream).await;
+        assert_eq!(first.sequence_number, 0);
+        let record = record_of(&first);
+        assert_eq!(
+            (
+                record.running_requests,
+                record.waiting_requests,
+                record.waiting_uncached_tokens,
+                record.sample,
+                record.load_only
+            ),
+            (3, 1, Some(4_096), 1, false)
+        );
+        assert_eq!(record_of(&read(&mut stream).await).sample, 2);
+        lab.publish(2, &batch2).await;
+        let live = read(&mut stream).await;
+        assert_eq!((live.sequence_number, record_of(&live).sample), (2, 3));
+        // A snapshot chunk (the window of this second lab has no start).
+        let mut rolled = start_lab_with_loads(
+            StubLoads::new(1, 0),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await;
+        rolled.publish(1, &batch2).await;
+        rolled.wait_relayed(2).await;
+        let mut whole = rolled.subscribe(0).expect("history");
+        assert_eq!(record_of(&read(&mut whole).await).running_requests, 1);
+        // No source: no record.
+        let mut plain = start_lab(10, false).await;
+        plain.prime().await;
+        let mut bare = plain.subscribe(0).expect("history");
+        assert!(read(&mut bare).await.load.is_none());
+    }
+
+    /// While the publisher is quiet the stream still speaks: a `load_only`
+    /// batch (no events, the last sequence repeated) when the record moved,
+    /// a heartbeat after the interval, and after two unchanged heartbeats
+    /// only every backoff interval.
+    #[tokio::test]
+    async fn a_quiet_publishers_stream_sends_load_only_batches_and_heartbeats() {
+        let loads = StubLoads::new(2, 0);
+        let mut lab = start_lab_with_loads(
+            Arc::clone(&loads),
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+            Duration::from_millis(600),
+        )
+        .await;
+        let mut stream = lab.subscribe(0).expect("history");
+        let first = read(&mut stream).await;
+        assert_eq!(first.sequence_number, 0);
+        // A change with no KV event: a load-only batch within a tick or two.
+        let started = Instant::now();
+        loads.set(5, 2);
+        let change = read(&mut stream).await;
+        let record = record_of(&change);
+        assert!(load_only_marker(&change), "{change:?}");
+        assert_eq!((change.sequence_number, change.events.len()), (0, 0));
+        assert_eq!((record.running_requests, record.waiting_requests), (5, 2));
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "the change took {:?}",
+            started.elapsed()
+        );
+        // Nothing changes: heartbeats at the interval, then at the backoff.
+        let mut gaps = Vec::new();
+        let mut last = Instant::now();
+        for _ in 0..4 {
+            let beat = read(&mut stream).await;
+            assert!(load_only_marker(&beat));
+            assert_eq!(record_of(&beat).running_requests, 5);
+            gaps.push(last.elapsed());
+            last = Instant::now();
+        }
+        assert!(
+            gaps[0] >= Duration::from_millis(150) && gaps[0] < Duration::from_millis(500),
+            "first heartbeat after {:?}",
+            gaps[0]
+        );
+        assert!(
+            gaps[1] < Duration::from_millis(500),
+            "second heartbeat after {:?}",
+            gaps[1]
+        );
+        assert!(
+            gaps[2] >= Duration::from_millis(500) && gaps[3] >= Duration::from_millis(500),
+            "backed off: {gaps:?}"
+        );
+        // A real batch resets the backoff and carries the record itself.
+        lab.publish(1, &golden::bytes(golden::BATCH2)).await;
+        let live = read(&mut stream).await;
+        assert_eq!(live.sequence_number, 1);
+        assert!(!load_only_marker(&live));
+        let beat = read(&mut stream).await;
+        assert!(load_only_marker(&beat));
+        assert_eq!(beat.sequence_number, 1, "repeats the last sequence sent");
+    }
+
+    fn load_only_marker(batch: &common::KvEventBatch) -> bool {
+        batch.load.as_ref().is_some_and(|load| load.load_only)
     }
 
     /// A relay whose replay socket is not bound yet: the relay keeps asking
@@ -1552,6 +1946,9 @@ mod tests {
             history_batches: 100,
             history_bytes: 64 << 20,
             replay_timeout: Duration::from_secs(2),
+            load_tick: DEFAULT_LOAD_TICK,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            heartbeat_backoff: DEFAULT_HEARTBEAT_BACKOFF,
         });
         relay.start();
         (
@@ -2562,6 +2959,7 @@ mod tests {
             }],
             dp_rank: Some(0),
             snapshot: None,
+            load: None,
         }
     }
 

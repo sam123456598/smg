@@ -1249,6 +1249,75 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Every relayed batch carries the servicer's load record: the figures
+/// `GetLoads` answers with, so the gateway reads the queue, running set, KV
+/// usage and window at every scheduler step.
+#[tokio::test]
+async fn relayed_batches_carry_the_servicers_load_record() {
+    use zeromq::{prelude::*, PubSocket};
+
+    let mut publisher = PubSocket::new();
+    let port = bound_port(
+        &publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("publisher binds")
+            .to_string(),
+    );
+    let mut model = model_info();
+    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_topic = "kv".to_string();
+    let mut h = harness(model, None).await;
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let batch1 = kv_events::golden::bytes(kv_events::golden::BATCH1);
+    let mut first = None;
+    for _ in 0..200 {
+        publisher
+            .send(kv_events::golden::frame(b"kv", 0, &batch1))
+            .await
+            .expect("publish");
+        if let Ok(item) = tokio::time::timeout(Duration::from_millis(50), stream.message()).await {
+            first = Some(item.expect("stream open").expect("a batch"));
+            break;
+        }
+    }
+    let first = first.expect("the subscription went live");
+    let record = first.load.expect("the batch carries the load record");
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .expect("loads")
+        .into_inner();
+    let rank0 = &loads.loads[0];
+    assert_eq!(
+        (
+            record.running_requests,
+            record.waiting_requests,
+            record.max_running_requests
+        ),
+        (
+            u32::try_from(rank0.num_running_reqs).unwrap(),
+            u32::try_from(rank0.num_waiting_reqs).unwrap(),
+            u32::try_from(rank0.max_running_requests).unwrap()
+        )
+    );
+    assert_eq!(
+        record.waiting_uncached_tokens,
+        Some(u32::try_from(rank0.num_waiting_uncached_tokens).unwrap()),
+        "the vLLM servicer estimates the queued token-work"
+    );
+    assert!((record.token_usage - rank0.token_usage).abs() < f64::EPSILON);
+    assert!(record.sample >= 1 && !record.load_only);
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The relay asks the engine's replay for the batches it missed before its
 /// subscription joined: a publisher already at sequence 3 when the servicer
 /// starts, whose replay covers 0..=3, leaves the window whole from the

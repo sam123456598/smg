@@ -1225,6 +1225,7 @@ impl WorkerManager {
             dp_rank_count: loads.len() as i32,
             aggregate: EngineAggregateMetricsSnapshot::from_ranks(&loads),
             loads,
+            sampled_at: None,
         }
     }
 
@@ -2197,6 +2198,7 @@ mod tests {
             dp_rank_count: loads.len() as i32,
             aggregate: None,
             loads,
+            sampled_at: None,
         }
     }
 

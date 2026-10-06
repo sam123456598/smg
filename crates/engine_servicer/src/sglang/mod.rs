@@ -119,6 +119,27 @@ pub struct SglangServicerConfig {
     pub engine_startup_timeout: Duration,
 }
 
+/// The servicer's `GetLoads` figures, read for the load record the relay
+/// attaches to every batch it streams.
+struct LoadFromState(std::sync::Weak<State>);
+
+impl crate::kv_events::LoadSource for LoadFromState {
+    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let state = self.0.upgrade()?;
+        let response = info::loads(&state, dp_rank).ok()?;
+        let load = response.loads.first()?;
+        // The engine reports no queued token-work on this wire yet.
+        Some(crate::kv_events::engine_load(
+            load.num_running_reqs,
+            load.num_waiting_reqs,
+            None,
+            load.token_usage,
+            load.gen_throughput,
+            load.max_running_requests,
+        ))
+    }
+}
+
 pub(super) struct State {
     pub(super) model: SglangModelInfo,
     /// The KV-event relay for the engine's ZMQ publisher; `None` when events
@@ -229,6 +250,9 @@ impl SglangServicerServer {
             started: Instant::now(),
             started_at: SystemTime::now(),
         });
+        if let Some(relay) = &state.kv_relay {
+            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
+        }
         let service = service::SglangService {
             state: Arc::clone(&state),
         };

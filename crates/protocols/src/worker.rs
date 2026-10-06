@@ -1462,6 +1462,14 @@ pub struct WorkerLoadResponse {
     pub loads: Vec<SchedulerLoadSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<EngineAggregateMetricsSnapshot>,
+    /// When the engine's state behind this report was sampled, on the
+    /// gateway's clock: the poll's receipt, or a pushed record's receipt
+    /// less its age and the one-way latency. A policy that books in-flight
+    /// work locally releases only what it dispatched before this instant.
+    /// Not serialized: it is meaningful only in the process that set it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sampled_at: Option<std::time::Instant>,
 }
 
 impl WorkerLoadResponse {

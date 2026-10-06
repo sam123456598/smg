@@ -223,6 +223,9 @@ fn relay_over_zmq() {
             history_batches: DEFAULT_HISTORY_BATCHES,
             history_bytes: DEFAULT_HISTORY_BYTES,
             replay_timeout: Duration::from_secs(2),
+            load_tick: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(1),
+            heartbeat_backoff: Duration::from_secs(5),
         });
         relay.start();
         let frame = |seq: u64, body: &[u8]| {

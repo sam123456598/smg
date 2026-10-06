@@ -14,7 +14,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,8 +25,8 @@ use kv_index::{
     ApplyError, SequenceHash, StoredBlock,
 };
 use smg_grpc_client::common_proto::{
-    kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheLocality,
-    KvCacheTier, KvEventBatch, KvSnapshotChunk,
+    kv_cache_event, EngineLoad, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent,
+    KvCacheLocality, KvCacheTier, KvEventBatch, KvSnapshotChunk,
 };
 use tokio::{
     sync::{oneshot, Mutex, Semaphore},
@@ -38,6 +38,7 @@ use super::{
     kv_event_recovery::{Admission, RankState, ResyncReason},
     kv_index_backend::{KvIndex, KvIndexKind, WorkerBlocks},
     liveness,
+    monitor::WorkerMonitor,
 };
 use crate::{
     observability::metrics::Metrics,
@@ -117,6 +118,10 @@ pub struct KvEventMonitor {
     /// Set once by [`start_prune_task`](Self::start_prune_task); sync mutex
     /// because it is touched only at startup, never on event paths.
     prune_task: parking_lot::Mutex<Option<PeriodicTask>>,
+    /// Where the load records on the event streams go (`KvEventBatch.load`):
+    /// the worker monitor, which treats them as polls. Weak: the monitors
+    /// are peers in the app context, neither owns the other.
+    load_sink: OnceLock<Weak<WorkerMonitor>>,
 }
 
 /// Tracks a single worker's subscription state.
@@ -227,12 +232,19 @@ impl KvEventMonitor {
             kind,
             jump_size,
             prune_task: parking_lot::Mutex::new(None),
+            load_sink: OnceLock::new(),
         }
     }
 
     /// The kind of index this monitor builds per model.
     pub fn kind(&self) -> KvIndexKind {
         self.kind
+    }
+
+    /// Route the load records on every worker's event stream to the worker
+    /// monitor (once; a later call is ignored).
+    pub fn set_load_sink(&self, monitor: &Arc<WorkerMonitor>) {
+        let _ = self.load_sink.set(Arc::downgrade(monitor));
     }
 
     /// Prune every model's positional indexer with the given bounds.
@@ -347,6 +359,7 @@ impl KvEventMonitor {
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let load_sink = self.load_sink.get().cloned();
         let loop_model_id = model_id.clone();
         let task_url = url.clone();
 
@@ -366,6 +379,7 @@ impl KvEventMonitor {
                 block_sizes,
                 loop_model_id,
                 shutdown_rx,
+                load_sink,
             ))
             .catch_unwind()
             .await;
@@ -586,6 +600,7 @@ impl KvEventMonitor {
         block_sizes: Arc<DashMap<String, usize>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
+        load_sink: Option<Weak<WorkerMonitor>>,
     ) {
         let worker_id = match indexer.intern_worker(&worker_url) {
             Ok(id) => id,
@@ -776,9 +791,21 @@ impl KvEventMonitor {
                 liveness::on_contact(&worker);
                 Self::learn_block_size(&block_sizes, &model_id, &mut block_size_learned, batch);
             };
+            // The load record on a batch is a poll of this worker, received now.
+            let on_load = |batch: &KvEventBatch, load: &EngineLoad| {
+                liveness::on_contact(&worker);
+                if let Some(monitor) = load_sink.as_ref().and_then(Weak::upgrade) {
+                    monitor.apply_pushed_load(
+                        &worker,
+                        batch.dp_rank.unwrap_or(0),
+                        load,
+                        Instant::now(),
+                    );
+                }
+            };
             let stream_result = tokio::select! {
                 result = Self::process_stream(
-                    stream, &worker_url, worker_id, &indexer, &mut state, on_batch,
+                    stream, &worker_url, worker_id, &indexer, &mut state, on_batch, on_load,
                 ) => result,
                 _ = &mut shutdown_rx => {
                     Self::remove_indexer_worker(
@@ -894,6 +921,7 @@ impl KvEventMonitor {
         indexer: &KvIndex,
         state: &mut WorkerStreamState,
         mut on_batch: impl FnMut(&KvEventBatch),
+        mut on_load: impl FnMut(&KvEventBatch, &EngineLoad),
     ) -> StreamResult {
         use tokio_stream::StreamExt;
 
@@ -902,6 +930,13 @@ impl KvEventMonitor {
                 Ok(batch) => batch,
                 Err(e) => return StreamResult::Error(e),
             };
+            if let Some(load) = &batch.load {
+                on_load(&batch, load);
+                if Self::is_load_only(&batch) {
+                    Metrics::record_kv_event_batch(worker_url, "load_only");
+                    continue;
+                }
+            }
             if let BatchOutcome::Gap { expected, received } =
                 Self::admit_batch(&batch, worker_url, worker_id, indexer, state, &mut on_batch)
             {
@@ -910,6 +945,12 @@ impl KvEventMonitor {
         }
 
         StreamResult::Ended
+    }
+
+    /// A batch that carries only a load record (`EngineLoad.load_only`): no
+    /// events, the last sequence repeated; it never enters admission.
+    fn is_load_only(batch: &KvEventBatch) -> bool {
+        batch.load.as_ref().is_some_and(|load| load.load_only)
     }
 
     /// Run one batch through its rank's admission cursor and apply it to the
@@ -2436,6 +2477,7 @@ mod tests {
             events,
             dp_rank: rank,
             snapshot: None,
+            load: None,
         }
     }
 
@@ -2932,6 +2974,7 @@ mod tests {
                         blocks,
                         unknown_before: 0,
                     }),
+                    load: None,
                 }
             })
             .collect()
@@ -3061,6 +3104,28 @@ mod tests {
         assert_eq!(sim.deliver(&next), BatchOutcome::Applied);
         sim.assert_matches_reference();
         assert_eq!(sim.reference.worker_block_count(sim.worker), 1);
+    }
+
+    /// A batch that carries only a load record repeats the last sequence and
+    /// has no events: it is recognised before admission, so it is neither a
+    /// duplicate nor a restart to the rank's cursor.
+    #[test]
+    fn a_load_only_batch_is_recognised_before_admission() {
+        let record = EngineLoad {
+            running_requests: 3,
+            load_only: true,
+            ..Default::default()
+        };
+        let mut only = batch(7, None, vec![]);
+        only.load = Some(record);
+        assert!(KvEventMonitor::is_load_only(&only));
+        let mut carrying = batch(8, None, vec![stored(None, &[1])]);
+        carrying.load = Some(EngineLoad {
+            load_only: false,
+            ..record
+        });
+        assert!(!KvEventMonitor::is_load_only(&carrying));
+        assert!(!KvEventMonitor::is_load_only(&batch(9, None, vec![])));
     }
 
     /// A snapshot whose relay joined the publisher late and could not replay

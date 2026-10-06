@@ -419,7 +419,7 @@ tiny `KvEventStreamInfo`) states `replay_supported`, `snapshot_supported`, `reta
 (replay buffer size) and `block_size`. The gateway uses them to pick a recovery path without a
 failed round trip and exposes them as metrics.
 
-### 6. Pushed load updates (design note, 2026-10-05; decision pending, nothing built)
+### 6. Pushed load updates (design note, 2026-10-05; option A built the same night, see the end)
 
 **Why.** The load-aware policies (`least_load`, `cache-aware-balanced`) score on five numbers the
 gateway polls per worker with `GetLoads` every `load_monitor_interval` (10 s by default): queued
@@ -484,7 +484,27 @@ sample (`age_ms` plus the gateway-side one-way latency, 20 ms covers it), so a r
 exactly once at every instant. A record older than the heartbeat bound demotes the worker to the
 "no fresh snapshot" scoring, never to zero load.
 
-**Recommendation to decide on.** A first: one optional message, the servicer already has the
+**Built (option A).** `KvEventBatch.load` (field 8) carries `EngineLoad {running_requests,
+waiting_requests, optional waiting_uncached_tokens (absent when the servicer cannot tell),
+token_usage (the poll's double), gen_throughput, max_running_requests, age_ms, sample, load_only}`.
+The Rust relay attaches it to every batch a subscriber receives (history, live and snapshot chunks)
+from a `LoadSource` each servicer installs over its own `GetLoads` figures (the vLLM servicer's
+queued token-work estimate included; SGLang and TokenSpeed report none yet), and while the
+publisher is quiet a subscriber's stream sends `load_only` batches (no events, the last sequence
+repeated): on a record change checked every 100 ms, and as a heartbeat after 1 s of silence,
+backing off to 5 s after two unchanged heartbeats; the mock worker's direct gRPC stream does the
+same from its `GetLoads` snapshot. The gateway's KV-event monitor hands every record to the worker
+monitor as a poll of that worker received now (`apply_pushed_load`): the rank's entry in the
+worker's report is replaced, the overload verdict, the wedged rule, the load-aware policies'
+`update_loads` and the `smg_engine_*` gauges run at once, and the shared load snapshot is
+republished in one rebuild per 100 ms window for every worker that pushed (the rebuild is O(fleet),
+the records arrive per scheduler step). Every `WorkerLoadResponse`, polled or pushed, now carries
+`sampled_at` (receipt time for a poll; receipt less `age_ms` and a 20 ms one-way margin for a
+record), which the policy lane's time-aware in-flight tally resets against. A `load_only` batch
+never enters admission (counted as `smg_kv_event_batches_total{disposition="load_only"}`); the
+poll stays as it was, the floor for workers whose servicer predates the field.
+
+**Recommendation, as decided.** A first: one optional message, the servicer already has the
 numbers and the per-worker stream, the gateway already owns one task per worker on that stream
 (`kv_event_monitor`) that can hand the record to the load state; B only if event-less gRPC engines
 need load pushing. Open choices for the policy lane: the field set (the five above plus

@@ -814,6 +814,7 @@ impl Normalizer {
             events,
             dp_rank: batch.dp_rank,
             snapshot: None,
+            load: None,
         }
     }
 

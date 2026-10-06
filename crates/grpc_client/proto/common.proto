@@ -30,6 +30,38 @@ message KvEventBatch {
   // batch the publisher sent (see KvSnapshotChunk). Fields 5 and 6 are left
   // for the publisher-epoch proposal in crates/kv_index/docs/recovery-protocol.md.
   KvSnapshotChunk snapshot = 7;
+  // The engine's load as the servicer knows it when it sends this batch (see
+  // EngineLoad); absent from servicers that predate the field.
+  EngineLoad load = 8;
+}
+
+// The servicer's load record, attached to every KvEventBatch it streams so a
+// subscriber learns the engine's queue, running set, KV usage and rate at
+// every scheduler step instead of at its GetLoads poll: the same numbers
+// GetLoads answers with, for the batch's dp_rank. A batch with `load_only`
+// set carries no events and repeats the last sequence sent on its stream;
+// the servicer sends one when the record changed without a KV event (an
+// admission served from cache, a completion), coalesced per stream, and as
+// a heartbeat while the engine is idle; the subscriber reads the load and
+// admits nothing.
+message EngineLoad {
+  uint32 running_requests = 1;
+  uint32 waiting_requests = 2;
+  // Queued token-work: prompt tokens of waiting requests not served from the
+  // prefix cache; absent when the servicer cannot tell (distinct from 0).
+  optional uint32 waiting_uncached_tokens = 3;
+  // KV-cache utilization in [0, 1], as GetLoads reports it.
+  double token_usage = 4;
+  // Tokens generated per second, as GetLoads reports it (0 when not known).
+  double gen_throughput = 5;
+  // The engine's admission window (max running requests); 0 when unknown.
+  uint32 max_running_requests = 6;
+  // Age of the sample behind this record in milliseconds (0 when the
+  // servicer reads the engine's current stats).
+  uint32 age_ms = 7;
+  // Monotonic per stream: the subscriber can order records.
+  uint64 sample = 8;
+  bool load_only = 9;
 }
 
 // One chunk of a state snapshot. A relay that keeps a bounded history serves a

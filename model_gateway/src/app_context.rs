@@ -796,6 +796,10 @@ impl AppContextBuilder {
                 kv_index = config.kv_index.as_str(),
                 "Created KV event monitor for event-driven cache-aware routing"
             );
+            // The load records on the event streams are polls of the worker.
+            if let Some(worker_monitor) = &self.worker_monitor {
+                monitor.set_load_sink(worker_monitor);
+            }
 
             // Optional indexer bounding: prune entries by last-touch TTL and/or
             // capacity ceiling. Both default off (unbounded, prior behavior).

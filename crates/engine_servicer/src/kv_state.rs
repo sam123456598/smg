@@ -539,6 +539,7 @@ impl SnapshotChunks {
                 blocks: self.blocks,
                 unknown_before: self.unknown_before,
             }),
+            load: None,
         })
     }
 }
@@ -731,6 +732,7 @@ mod tests {
             events,
             dp_rank: rank,
             snapshot: None,
+            load: None,
         }
     }
 

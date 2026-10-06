@@ -48,10 +48,10 @@
 //!    channel and merge in the fresh loads.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     sync::{Arc, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
@@ -61,7 +61,11 @@ use openai_protocol::worker::{
 };
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
-use tokio::{sync::broadcast, task::JoinHandle};
+use smg_grpc_client::common_proto::EngineLoad;
+use tokio::{
+    sync::{broadcast, Notify},
+    task::JoinHandle,
+};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -339,7 +343,25 @@ pub struct WorkerMonitor {
     event_task: Mutex<Option<JoinHandle<()>>>,
     eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
     liveness_sweep_task: Mutex<Option<JoinHandle<()>>>,
+    /// Load records pushed on the KV-event streams, per worker and rank,
+    /// merged into one report per worker the way a poll reports every rank.
+    pushed_ranks: Mutex<HashMap<String, BTreeMap<i32, SchedulerLoadSnapshot>>>,
+    /// Pushed reports waiting for the next coalesced snapshot publish.
+    pending_pushed: Mutex<HashMap<String, PushedReport>>,
+    pushed_notify: Arc<Notify>,
+    pushed_flush_task: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// A worker's report built from pushed records, with the worker it came from
+/// for the publish fence.
+type PushedReport = (Arc<dyn Worker>, Arc<WorkerLoadResponse>);
+
+/// A pushed record is sampled this much before its receipt on top of its own
+/// `age_ms`: the servicer-to-gateway one-way latency.
+const PUSHED_ONE_WAY_MARGIN: Duration = Duration::from_millis(20);
+/// Pushed reports are published into the shared snapshot in one rebuild per
+/// window: the rebuild is O(fleet), the records arrive per scheduler step.
+const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(100);
 
 /// Debounce window for batching worker evictions into one snapshot rebuild.
 /// Registry churn (a rollout, a scale-down) emits removals as a gradual
@@ -382,7 +404,139 @@ impl WorkerMonitor {
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
             liveness_sweep_task: Mutex::new(None),
+            pushed_ranks: Mutex::new(HashMap::new()),
+            pending_pushed: Mutex::new(HashMap::new()),
+            pushed_notify: Arc::new(Notify::new()),
+            pushed_flush_task: Mutex::new(None),
         }
+    }
+
+    /// A load record pushed on a worker's KV-event stream (`KvEventBatch.load`,
+    /// the servicer's `GetLoads` figures for `dp_rank`, received at
+    /// `received_at`): the same input as a poll of that worker. It replaces
+    /// the rank's entry in the worker's report, goes to the overload verdict,
+    /// the wedged rule, the load-aware policies and the `smg_engine_*` gauges
+    /// at once, and into the shared snapshot in the next coalesced publish.
+    /// The report's `sampled_at` is the receipt less the record's age and
+    /// the one-way margin, what a policy resets its in-flight tally against.
+    pub fn apply_pushed_load(
+        self: &Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        let age = Duration::from_millis(u64::from(record.age_ms)) + PUSHED_ONE_WAY_MARGIN;
+        let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
+        let url = worker.url().to_string();
+        let signed = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
+        let response = {
+            let mut pushed = self.pushed_ranks.lock();
+            let ranks = pushed.entry(url.clone()).or_default();
+            let previous = ranks.get(&dp_rank).cloned().unwrap_or_default();
+            ranks.insert(
+                dp_rank,
+                SchedulerLoadSnapshot {
+                    dp_rank,
+                    num_running_reqs: signed(record.running_requests),
+                    num_waiting_reqs: signed(record.waiting_requests),
+                    num_waiting_uncached_tokens: record.waiting_uncached_tokens.map_or(0, signed),
+                    num_total_reqs: signed(
+                        record
+                            .running_requests
+                            .saturating_add(record.waiting_requests),
+                    ),
+                    token_usage: record.token_usage,
+                    utilization: record.token_usage,
+                    gen_throughput: record.gen_throughput,
+                    max_running_requests: signed(record.max_running_requests),
+                    ..previous
+                },
+            );
+            Arc::new(WorkerLoadResponse {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                version: "pushed".to_string(),
+                dp_rank_count: i32::try_from(ranks.len()).unwrap_or(i32::MAX),
+                loads: ranks.values().cloned().collect(),
+                aggregate: None,
+                sampled_at: Some(sampled_at),
+            })
+        };
+        // What a poll does with a fresh report, minus the DP-rank token cache
+        // (a record carries no absolute token counts).
+        let overload = worker.metadata().overload;
+        if overload.is_enabled() {
+            self.worker_registry
+                .set_worker_overloaded(worker, overload.is_overloaded(&response));
+        }
+        let waiting: i64 = response
+            .loads
+            .iter()
+            .map(|rank| i64::from(rank.num_waiting_reqs))
+            .sum();
+        liveness::on_load_report(worker, waiting);
+        let single: HashMap<String, WorkerLoadResponse> =
+            HashMap::from([(url.clone(), (*response).clone())]);
+        for policy in self.policy_registry.get_all_load_aware_policies() {
+            policy.update_loads(&single);
+        }
+        Metrics::record_engine_load(&url, worker.model_id(), &response);
+        self.pending_pushed
+            .lock()
+            .insert(url, (Arc::clone(worker), response));
+        self.start_pushed_flusher();
+        self.pushed_notify.notify_one();
+    }
+
+    /// The coalescing publisher of pushed reports, started on the first one:
+    /// every window it moves what accumulated into the shared snapshot in one
+    /// rebuild. Holds the monitor weakly, like the eviction flusher.
+    fn start_pushed_flusher(self: &Arc<Self>) {
+        let mut task = self.pushed_flush_task.lock();
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let monitor = Arc::downgrade(self);
+        let notify = Arc::clone(&self.pushed_notify);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "ends when the monitor is dropped; nothing waits on it at shutdown"
+        )]
+        let handle = tokio::spawn(async move {
+            loop {
+                notify.notified().await;
+                tokio::time::sleep(PUSHED_PUBLISH_WINDOW).await;
+                let Some(monitor) = monitor.upgrade() else {
+                    return;
+                };
+                monitor.flush_pushed();
+            }
+        });
+        *task = Some(handle);
+    }
+
+    /// Publish every pushed report that accumulated since the last flush.
+    pub(crate) fn flush_pushed(&self) {
+        let pending: Vec<PushedReport> = self
+            .pending_pushed
+            .lock()
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let urls: Vec<String> = pending
+            .iter()
+            .map(|(worker, _)| worker.url().to_string())
+            .collect();
+        self.load_state.publish_group(&urls, pending);
+    }
+
+    /// Pushed reports waiting to be published (tests).
+    #[cfg(test)]
+    pub(crate) fn pending_pushed_len(&self) -> usize {
+        self.pending_pushed.lock().len()
     }
 
     /// The current published load snapshot — what routing is acting on, and
@@ -1165,7 +1319,8 @@ async fn group_monitor_loop(
                     .worker_registry
                     .set_worker_overloaded(&worker, verdict);
             }
-            if let Some(load) = response {
+            if let Some(mut load) = response {
+                load.sampled_at = Some(Instant::now());
                 // The wedged rule reads the queue depth off every report.
                 let waiting: i64 = load
                     .loads
@@ -1377,6 +1532,118 @@ mod worker_monitor_tests {
             false,
         ));
         (registry, monitor)
+    }
+
+    /// A pushed record is a poll of its worker: the rank's entry is replaced
+    /// (other ranks kept), `sampled_at` is the receipt less the record's age
+    /// and the one-way margin, and the shared snapshot sees it at the next
+    /// coalesced publish.
+    #[tokio::test]
+    async fn a_pushed_load_record_becomes_the_workers_report_at_the_next_publish() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let received = Instant::now();
+        let record = EngineLoad {
+            running_requests: 7,
+            waiting_requests: 2,
+            waiting_uncached_tokens: Some(3_000),
+            token_usage: 0.4,
+            gen_throughput: 900.0,
+            max_running_requests: 64,
+            age_ms: 30,
+            sample: 1,
+            load_only: false,
+        };
+        monitor.apply_pushed_load(&worker, 0, &record, received);
+        assert_eq!(monitor.pending_pushed_len(), 1);
+        assert!(
+            monitor
+                .load_state
+                .snapshot()
+                .get("grpc://w1:9000")
+                .is_none(),
+            "not published until the window closes"
+        );
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get("grpc://w1:9000").expect("published");
+        assert_eq!(report.version, "pushed");
+        assert_eq!(report.loads.len(), 1);
+        let rank0 = &report.loads[0];
+        assert_eq!(
+            (
+                rank0.dp_rank,
+                rank0.num_running_reqs,
+                rank0.num_waiting_reqs,
+                rank0.num_waiting_uncached_tokens,
+                rank0.num_total_reqs,
+                rank0.max_running_requests
+            ),
+            (0, 7, 2, 3_000, 9, 64)
+        );
+        assert!((rank0.token_usage - 0.4).abs() < f64::EPSILON);
+        assert!((rank0.gen_throughput - 900.0).abs() < f64::EPSILON);
+        let sampled_at = report.sampled_at.expect("sampled_at");
+        assert_eq!(
+            received.duration_since(sampled_at),
+            Duration::from_millis(30) + PUSHED_ONE_WAY_MARGIN
+        );
+        assert_eq!(monitor.pending_pushed_len(), 0);
+
+        // A second rank joins the report; a later record replaces only its rank.
+        monitor.apply_pushed_load(
+            &worker,
+            1,
+            &EngineLoad {
+                running_requests: 1,
+                waiting_uncached_tokens: None,
+                ..record
+            },
+            Instant::now(),
+        );
+        monitor.apply_pushed_load(
+            &worker,
+            0,
+            &EngineLoad {
+                running_requests: 8,
+                ..record
+            },
+            Instant::now(),
+        );
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get("grpc://w1:9000").expect("published");
+        let ranks: Vec<(i32, i32, i32)> = report
+            .loads
+            .iter()
+            .map(|rank| {
+                (
+                    rank.dp_rank,
+                    rank.num_running_reqs,
+                    rank.num_waiting_uncached_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(ranks, vec![(0, 8, 3_000), (1, 1, 0)]);
+        assert_eq!(report.dp_rank_count, 2);
+    }
+
+    /// A record for a worker the registry no longer holds as this incarnation
+    /// is dropped at publish by the fence, like a late poll.
+    #[tokio::test]
+    async fn a_pushed_record_from_a_replaced_worker_is_fenced_at_publish() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        registry.remove_by_url("grpc://w1:9000");
+        monitor.apply_pushed_load(&worker, 0, &EngineLoad::default(), Instant::now());
+        monitor.flush_pushed();
+        assert!(monitor
+            .load_state
+            .snapshot()
+            .get("grpc://w1:9000")
+            .is_none());
     }
 
     #[tokio::test]

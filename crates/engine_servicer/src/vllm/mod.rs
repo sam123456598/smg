@@ -181,6 +181,34 @@ pub(super) struct Stats {
     pub(super) generation_tokens: AtomicU64,
 }
 
+/// The servicer's `GetLoads` figures, read for the load record the relay
+/// attaches to every batch it streams.
+struct LoadFromState(std::sync::Weak<State>);
+
+impl crate::kv_events::LoadSource for LoadFromState {
+    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let state = self.0.upgrade()?;
+        let response = info::loads(&state).ok()?;
+        let rank = dp_rank.unwrap_or(0);
+        let load = response
+            .loads
+            .iter()
+            .find(|load| load.dp_rank == rank)
+            .or_else(|| response.loads.first())?;
+        // The queued token-work is this servicer's estimate for the first
+        // rank (see `info::loads`); the other ranks do not report it.
+        let estimated = response.loads.first().map(|first| first.dp_rank) == Some(load.dp_rank);
+        Some(crate::kv_events::engine_load(
+            load.num_running_reqs,
+            load.num_waiting_reqs,
+            estimated.then_some(load.num_waiting_uncached_tokens),
+            load.token_usage,
+            load.gen_throughput,
+            load.max_running_requests,
+        ))
+    }
+}
+
 pub(super) struct State {
     pub(super) model: VllmModelInfo,
     /// The KV-event relay for the engine's ZMQ publisher; `None` when events
@@ -318,6 +346,9 @@ impl VllmServicerServer {
             started: Instant::now(),
             media: config.media_processor.map(MediaGate::new),
         });
+        if let Some(relay) = &state.kv_relay {
+            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
+        }
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }

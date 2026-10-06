@@ -291,6 +291,7 @@ pub fn startup_cleared() -> common::KvEventBatch {
         }],
         dp_rank: None,
         snapshot: None,
+        load: None,
     }
 }
 
@@ -530,6 +531,7 @@ mod tests {
             ],
             dp_rank: Some(0),
             snapshot: None,
+            load: None,
         }
     }
 

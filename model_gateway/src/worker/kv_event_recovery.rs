@@ -333,6 +333,7 @@ mod tests {
             events: vec![],
             dp_rank: None,
             snapshot: None,
+            load: None,
         }
     }
 
