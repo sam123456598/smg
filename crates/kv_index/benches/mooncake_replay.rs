@@ -34,17 +34,18 @@ use std::{
     collections::BTreeMap,
     hint::black_box,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Barrier, Mutex,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, ValueEnum};
 use kv_index::{
-    ChainBlockMap, ContentHash, PositionalIndexer, ReferenceIndexer, SequenceHash,
-    ShardedChainIndex, StoredBlock, WorkerBlockMap,
+    ChainBlockMap, Claimed, ContentHash, Control, LaneHooks, LanePool, LanePoolConfig,
+    PositionalIndexer, QueueFull, ReferenceIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
+    WorkerBlockMap,
 };
 use rustc_hash::FxHashMap;
 use serde_json::json;
@@ -359,6 +360,12 @@ trait ReplayBackend: Send + Sync + 'static {
         hashes: &[SequenceHash],
     ) -> bool;
     fn apply_cleared(&self, lane: &mut Self::Lane, worker: (u64, u32)) -> bool;
+    /// The shard an event lane's workers live in (its socket under `--shards` with pinned
+    /// lanes); the lane pools of `--lane-scheduling stealing` are one per shard, so a stolen
+    /// worker is always applied by a lane of its own shard.
+    fn lane_shard(&self, _lane: usize, _cpus: &[usize]) -> usize {
+        0
+    }
     /// Answer one lookup; the return value is only consumed by `black_box`.
     fn lookup(&self, hashes: &[ContentHash]) -> usize;
     /// Shards a lookup can be fanned out over under `--lookups per-shard`; one when the backend
@@ -398,6 +405,8 @@ enum Payload {
 
 struct EventMsg {
     id: u32,
+    /// The worker's slot (its rank of first appearance in the corpus), the lane pool's key.
+    slot: u32,
     payload: Payload,
 }
 
@@ -516,6 +525,10 @@ impl ReplayBackend for Chain {
             shard: self.shard_for(lane, cpus),
             workers: FxHashMap::default(),
         }
+    }
+
+    fn lane_shard(&self, lane: usize, cpus: &[usize]) -> usize {
+        self.shard_for(lane, cpus)
     }
 
     fn report(&self) -> Option<String> {
@@ -984,6 +997,16 @@ struct LanePlacement {
     local_memory: bool,
 }
 
+/// What an event lane thread returns: its completions, its thread CPU time, the part of it
+/// spent inside the apply calls (the rest is the lane's own loop, or the pool's overhead under
+/// `--lane-scheduling stealing`), and the minor page faults it took during the run.
+struct LaneOutcome {
+    completions: Vec<EventCompletion>,
+    cpu_ns: u64,
+    apply_ns: u64,
+    minor_faults: u64,
+}
+
 fn event_lane_worker<B: ReplayBackend>(
     backend: Arc<B>,
     receiver: mpsc::Receiver<EventMsg>,
@@ -991,14 +1014,45 @@ fn event_lane_worker<B: ReplayBackend>(
     epoch: Instant,
     placement: LanePlacement,
     expected: usize,
-) -> (Vec<EventCompletion>, u64) {
+) -> LaneOutcome {
+    place_lane(&placement);
+    let LanePlacement {
+        index: lane_index,
+        cpus,
+        ..
+    } = placement;
+    let cpu_started = thread_cpu_time_ns();
+    let faults_started = thread_minor_faults();
+    let mut lane = backend.new_lane_for(lane_index, &cpus);
+    let mut completions = Vec::with_capacity(expected);
+    let mut apply_ns = 0u64;
+    while let Ok(EventMsg { id, payload, .. }) = receiver.recv() {
+        let started = Instant::now();
+        let ok = apply_event(&*backend, &mut lane, &corpus, id, payload);
+        apply_ns += started.elapsed().as_nanos() as u64;
+        completions.push(EventCompletion {
+            id,
+            finished_ns: elapsed_ns(epoch),
+            ok,
+        });
+    }
+    LaneOutcome {
+        completions,
+        cpu_ns: thread_cpu_time_ns().saturating_sub(cpu_started),
+        apply_ns,
+        minor_faults: thread_minor_faults().saturating_sub(faults_started),
+    }
+}
+
+/// Pin an event lane's thread and set its memory policy as its placement says.
+fn place_lane(placement: &LanePlacement) {
     let LanePlacement {
         index: lane_index,
         cpus,
         local_memory,
     } = placement;
-    let _ = pin_current_thread(&cpus);
-    if local_memory {
+    let _ = pin_current_thread(cpus);
+    if *local_memory {
         match cpus.first().and_then(|&cpu| node_of_cpu(cpu)) {
             Some(node) => {
                 if let Err(err) = prefer_node(node) {
@@ -1012,13 +1066,21 @@ fn event_lane_worker<B: ReplayBackend>(
             ),
         }
     }
-    let cpu_started = thread_cpu_time_ns();
-    let mut lane = backend.new_lane_for(lane_index, &cpus);
-    let mut completions = Vec::with_capacity(expected);
-    while let Ok(EventMsg { id, payload }) = receiver.recv() {
+}
+
+/// Apply one event to the backend through a lane's (or a worker's) state; `false` when the
+/// backend rejected it.
+fn apply_event<B: ReplayBackend>(
+    backend: &B,
+    lane: &mut B::Lane,
+    corpus: &Corpus,
+    id: u32,
+    payload: Payload,
+) -> bool {
+    {
         let op = &corpus.ops[id as usize];
         let worker = (op.worker, op.dp_rank());
-        let ok = match (&op.kind, payload) {
+        match (&op.kind, payload) {
             (&OpKind::Stored { parent, .. }, Payload::Stored(wire)) => {
                 // The adapter's copy, wire records into this crate's blocks; the payload is
                 // freed after the apply, as a lane frees the event it was handed.
@@ -1029,7 +1091,7 @@ fn event_lane_worker<B: ReplayBackend>(
                         content_hash: ContentHash(block.tokens_hash),
                     })
                     .collect();
-                let ok = backend.apply_stored(&mut lane, worker, &owned, parent.map(SequenceHash));
+                let ok = backend.apply_stored(lane, worker, &owned, parent.map(SequenceHash));
                 drop(wire);
                 ok
             }
@@ -1039,7 +1101,7 @@ fn event_lane_worker<B: ReplayBackend>(
                 },
                 Payload::None,
             ) => backend.apply_stored(
-                &mut lane,
+                lane,
                 worker,
                 &corpus.blocks[start as usize..start as usize + len as usize],
                 parent.map(SequenceHash),
@@ -1047,28 +1109,222 @@ fn event_lane_worker<B: ReplayBackend>(
             (&OpKind::Removed { .. }, Payload::Removed(wire)) => {
                 let owned: Vec<SequenceHash> =
                     wire.iter().map(|&hash| SequenceHash(hash)).collect();
-                let ok = backend.apply_removed(&mut lane, worker, &owned);
+                let ok = backend.apply_removed(lane, worker, &owned);
                 drop(wire);
                 ok
             }
             (&OpKind::Removed { start, len, .. }, Payload::None) => backend.apply_removed(
-                &mut lane,
+                lane,
                 worker,
                 &corpus.removed[start as usize..start as usize + len as usize],
             ),
-            (&OpKind::Cleared { .. }, _) => backend.apply_cleared(&mut lane, worker),
+            (&OpKind::Cleared { .. }, _) => backend.apply_cleared(lane, worker),
             _ => false,
-        };
-        completions.push(EventCompletion {
-            id,
-            finished_ns: elapsed_ns(epoch),
+        }
+    }
+}
+
+/// How long a pooled lane blocks on its channel when nothing is ready anywhere in its pool.
+const POOL_WAIT_STEALABLE: Duration = Duration::from_micros(100);
+const POOL_WAIT_QUIET: Duration = Duration::from_millis(1);
+
+/// An event lane under `--lane-scheduling stealing`: a lane of its shard's `LanePool`. It drains
+/// its own channel into the pool's per-worker queues (its ingress is unchanged: the issuer still
+/// sends a worker's events to the worker's home lane) and serves ready workers from any lane of
+/// the pool, whole workers at a time, so a worker's events keep their order while a quiet lane
+/// works off a stalled lane's backlog. The per-worker state is a backend lane state holding that
+/// one worker, created by whichever lane of the pool first serves it, which under pinned lanes is
+/// on the worker's own shard.
+struct PoolLane<'a, B: ReplayBackend> {
+    backend: &'a B,
+    corpus: &'a Corpus,
+    receiver: mpsc::Receiver<EventMsg>,
+    pool: &'a LanePool<B::Lane, EventMsg>,
+    /// This lane's index within its pool.
+    lane: usize,
+    /// This lane's index among all event lanes (what `new_lane_for` places by).
+    lane_index: usize,
+    cpus: Arc<[usize]>,
+    epoch: Instant,
+    /// Lanes of this pool whose channel is still open; the pool is done when it is zero and
+    /// nothing is queued or held.
+    open_channels: &'a AtomicUsize,
+    held_total: &'a AtomicUsize,
+    closed: bool,
+    /// An event the pool refused (the worker's queue at its cap), re-offered before reading on.
+    held: Option<EventMsg>,
+    completions: Vec<EventCompletion>,
+    enqueue_ns: u64,
+    stealable_idle_turns: u64,
+    apply_ns: u64,
+}
+
+impl<B: ReplayBackend> PoolLane<'_, B> {
+    fn offer(&mut self, msg: EventMsg) {
+        let started = Instant::now();
+        let refused = self.pool.enqueue(self.lane, msg.slot, msg);
+        self.enqueue_ns += started.elapsed().as_nanos() as u64;
+        if let Err(QueueFull(msg)) = refused {
+            self.held = Some(msg);
+            self.held_total.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn close(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            self.open_channels.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn control(&self) -> Control {
+        if self.open_channels.load(Ordering::Acquire) == 0
+            && self.held_total.load(Ordering::Acquire) == 0
+            && self.pool.queued() == 0
+        {
+            Control::Stop
+        } else {
+            Control::Continue
+        }
+    }
+}
+
+impl<B: ReplayBackend> LaneHooks<B::Lane, EventMsg> for PoolLane<'_, B> {
+    fn apply(&mut self, claimed: Claimed<'_, B::Lane>, msg: EventMsg) {
+        let (backend, lane_index, cpus) = (self.backend, self.lane_index, &self.cpus);
+        let state = claimed
+            .state
+            .get_or_insert_with(|| backend.new_lane_for(lane_index, cpus));
+        let started = Instant::now();
+        let ok = apply_event(backend, state, self.corpus, msg.id, msg.payload);
+        self.apply_ns += started.elapsed().as_nanos() as u64;
+        self.completions.push(EventCompletion {
+            id: msg.id,
+            finished_ns: elapsed_ns(self.epoch),
             ok,
         });
     }
-    (
-        completions,
-        thread_cpu_time_ns().saturating_sub(cpu_started),
-    )
+
+    fn pump(&mut self) -> Control {
+        if let Some(msg) = self.held.take() {
+            self.held_total.fetch_sub(1, Ordering::AcqRel);
+            self.offer(msg);
+            if self.held.is_some() {
+                return Control::Continue;
+            }
+        }
+        if self.closed {
+            return self.control();
+        }
+        loop {
+            match self.receiver.try_recv() {
+                Ok(msg) => {
+                    self.offer(msg);
+                    if self.held.is_some() {
+                        return Control::Continue;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return Control::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.close();
+                    return self.control();
+                }
+            }
+        }
+    }
+
+    fn wait(&mut self) -> Control {
+        let stealable = self.pool.has_stealable();
+        if stealable {
+            // Nothing was ready or stealable for this lane this turn, yet some lane is flagged.
+            self.stealable_idle_turns += 1;
+        }
+        let timeout = if stealable {
+            POOL_WAIT_STEALABLE
+        } else {
+            POOL_WAIT_QUIET
+        };
+        if self.closed || self.held.is_some() {
+            self.pool.park_lane(self.lane, timeout);
+            return self.control();
+        }
+        match self.receiver.recv_timeout(timeout) {
+            Ok(msg) => {
+                self.offer(msg);
+                Control::Continue
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Control::Continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.close();
+                self.control()
+            }
+        }
+    }
+}
+
+/// The pool of one shard's event lanes and the counters its lanes share.
+struct ShardPool<B: ReplayBackend> {
+    pool: LanePool<B::Lane, EventMsg>,
+    open_channels: AtomicUsize,
+    held_total: AtomicUsize,
+    /// Time the lanes spent inside `enqueue` (the worker queue's lock and the ready list's),
+    /// summed: a producer-side convoy on a stolen worker's queue shows up here.
+    enqueue_ns: AtomicU64,
+    /// Turns on which a lane found nothing to serve or steal while the pool still reported a
+    /// stealable lane: a stealable flag left set on a lane that is not running shows up here.
+    stealable_idle_turns: AtomicU64,
+}
+
+#[expect(clippy::too_many_arguments)]
+fn event_lane_worker_pooled<B: ReplayBackend>(
+    backend: Arc<B>,
+    receiver: mpsc::Receiver<EventMsg>,
+    corpus: Arc<Corpus>,
+    epoch: Instant,
+    placement: LanePlacement,
+    expected: usize,
+    shard_pool: Arc<ShardPool<B>>,
+    pool_lane: usize,
+) -> LaneOutcome {
+    place_lane(&placement);
+    let LanePlacement {
+        index: lane_index,
+        cpus,
+        ..
+    } = placement;
+    let cpu_started = thread_cpu_time_ns();
+    let faults_started = thread_minor_faults();
+    let mut hooks = PoolLane {
+        backend: &*backend,
+        corpus: &corpus,
+        receiver,
+        pool: &shard_pool.pool,
+        lane: pool_lane,
+        lane_index,
+        cpus,
+        epoch,
+        open_channels: &shard_pool.open_channels,
+        held_total: &shard_pool.held_total,
+        closed: false,
+        held: None,
+        completions: Vec::with_capacity(expected),
+        enqueue_ns: 0,
+        stealable_idle_turns: 0,
+        apply_ns: 0,
+    };
+    shard_pool.pool.run_lane(pool_lane, &mut hooks);
+    shard_pool
+        .enqueue_ns
+        .fetch_add(hooks.enqueue_ns, Ordering::Relaxed);
+    shard_pool
+        .stealable_idle_turns
+        .fetch_add(hooks.stealable_idle_turns, Ordering::Relaxed);
+    LaneOutcome {
+        completions: hooks.completions,
+        cpu_ns: thread_cpu_time_ns().saturating_sub(cpu_started),
+        apply_ns: hooks.apply_ns,
+        minor_faults: thread_minor_faults().saturating_sub(faults_started),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1213,6 +1469,18 @@ fn prefer_node(node: usize) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Minor page faults taken by the calling thread so far (`getrusage(RUSAGE_THREAD)`), so a lane's
+/// record can say whether its time went into faulting in memory; 0 when the call fails.
+fn thread_minor_faults() -> u64 {
+    // SAFETY: rusage is plain data and getrusage writes the whole struct on success.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+    if rc != 0 {
+        return 0;
+    }
+    u64::try_from(usage.ru_minflt).unwrap_or(0)
+}
+
 fn thread_cpu_time_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -1353,6 +1621,7 @@ struct EventDispatch {
     id: u32,
     group: u32,
     lane: u16,
+    slot: u32,
     payload: Payload,
 }
 
@@ -1393,6 +1662,7 @@ fn issue_events(
             };
             let message = EventMsg {
                 id: entry.id,
+                slot: entry.slot,
                 payload: entry.payload,
             };
             if senders[entry.lane as usize].send(message).is_err() {
@@ -1449,8 +1719,9 @@ enum Queries {
 enum LaneScheduling {
     /// Every event lane applies its own workers' events, in order, and nothing else (today).
     Owned,
-    /// A lane whose queue is empty takes a waiting worker from a lane that has fallen behind by
-    /// `--steal-after` events; needs a lane pool with a `steal_after` setting.
+    /// Each shard's event lanes form one lane pool: an idle lane serves any ready worker of
+    /// its shard, and takes one from a lane that is not running once `--steal-after` events
+    /// are queued behind it.
     Stealing,
 }
 
@@ -1536,14 +1807,16 @@ struct Args {
     /// in its own pinned thread (payloads on the issuer's socket).
     #[arg(long, value_enum, default_value = "main")]
     payload_home: PayloadHome,
-    /// How event lanes share work: `owned` (each lane applies its own workers only) or
-    /// `stealing` (an idle lane takes a worker from a lane that has fallen behind by
-    /// `--steal-after` events). Recorded in the result; `stealing` with a non-zero
-    /// `--steal-after` needs a lane pool that takes the setting.
+    /// How event lanes share work: `owned` (each lane applies its own workers only, as a
+    /// channel per lane) or `stealing` (the event lanes of each shard are the lanes of one
+    /// `LanePool`: any lane serves any ready worker of its shard, whole workers at a time, and a
+    /// lane that is not running loses a worker once its backlog is `--steal-after` events deep).
+    /// Recorded in the result with the pools' counters.
     #[arg(long, value_enum, default_value = "owned")]
     lane_scheduling: LaneScheduling,
-    /// Events a lane may fall behind by before another lane steals one of its workers under
-    /// `--lane-scheduling stealing`; 0 (the default) means no stealing.
+    /// Under `--lane-scheduling stealing`: events a ready worker may have queued on a lane that
+    /// is not serving before another lane takes it (the pool's `steal_after`); 0 keeps the
+    /// pool's serving-lane rule alone.
     #[arg(long, default_value = "0")]
     steal_after: usize,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
@@ -1603,14 +1876,6 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    // The pool that hands a fallen-behind lane's worker to an idle one is the index's; until its
-    // `steal_after` setting exists this build runs lanes as owners, and says so rather than
-    // measuring something else under the stealing label.
-    anyhow::ensure!(
-        !(args.lane_scheduling == LaneScheduling::Stealing && args.steal_after > 0),
-        "--lane-scheduling stealing with --steal-after {} needs a lane pool that takes steal_after; this build has none (use --steal-after 0, which runs owned lanes)",
-        args.steal_after
-    );
     let corpus = load_corpus(&args.corpus)?;
     let window_ns = match (args.benchmark_duration_ms, args.offered_block_ops_per_sec) {
         (Some(ms), _) => ms * 1_000_000,
@@ -1797,7 +2062,8 @@ fn run<B: ReplayBackend>(
     let mut lane_capacities = vec![0usize; args.query_lanes];
     let mut deadline_query_counts: Vec<u32> = Vec::new();
     let mut previous_deadline = None;
-    let mut event_lane_of: FxHashMap<(u64, u32), u16> = FxHashMap::default();
+    // A worker's slot is its rank of first appearance; its lane is the slot modulo the lane count.
+    let mut event_lane_of: FxHashMap<(u64, u32), u32> = FxHashMap::default();
     let mut event_lane_expected = vec![0usize; args.event_lanes];
     let mut query_dispatch: Vec<Vec<(u32, u32, u16)>> = vec![Vec::new(); query_issuers];
     let mut event_dispatch: Vec<Vec<EventDispatch>> =
@@ -1823,10 +2089,11 @@ fn run<B: ReplayBackend>(
                 target as u16,
             ));
         } else {
-            let next = event_lane_of.len();
-            let lane = *event_lane_of
+            let next = event_lane_of.len() as u32;
+            let slot = *event_lane_of
                 .entry((op.worker, op.dp_rank()))
-                .or_insert((next % args.event_lanes) as u16);
+                .or_insert(next);
+            let lane = (slot as usize % args.event_lanes) as u16;
             event_lane_expected[lane as usize] += 1;
             let shard = if args.issuer_by_lane {
                 (lane as usize) * issuer_threads / args.event_lanes
@@ -1844,6 +2111,7 @@ fn run<B: ReplayBackend>(
                 id: op.id,
                 group,
                 lane,
+                slot,
                 payload,
             });
         }
@@ -1860,7 +2128,7 @@ fn run<B: ReplayBackend>(
         libc::malloc_trim(0);
     }
     if args.pre_run_quiescence_ms > 0 {
-        thread::sleep(std::time::Duration::from_millis(args.pre_run_quiescence_ms));
+        thread::sleep(Duration::from_millis(args.pre_run_quiescence_ms));
     }
     let corpus = Arc::new(corpus);
     // Page-touch the corpus once.
@@ -1949,25 +2217,75 @@ fn run<B: ReplayBackend>(
             thread::yield_now();
         }
     }
+    let lane_cpus: Vec<Arc<[usize]>> = (0..args.event_lanes)
+        .map(|idx| {
+            if args.pin_event_lanes && !backend_cpus.is_empty() {
+                Arc::from(vec![backend_cpus[idx % backend_cpus.len()]])
+            } else {
+                Arc::clone(&backend_cpus)
+            }
+        })
+        .collect();
+    // Under `--lane-scheduling stealing` the event lanes of each shard are the lanes of one
+    // pool, so a worker is only ever applied by a lane of its own shard; the pool index of a lane
+    // is its rank among its shard's lanes.
+    let stealing = args.lane_scheduling == LaneScheduling::Stealing;
+    let lane_shard: Vec<usize> = (0..args.event_lanes)
+        .map(|idx| backend.lane_shard(idx, &lane_cpus[idx]))
+        .collect();
+    let shard_count = lane_shard.iter().copied().max().map_or(1, |s| s + 1);
+    let mut pool_lane_index = vec![0usize; args.event_lanes];
+    let mut lanes_per_shard = vec![0usize; shard_count];
+    for (idx, &shard) in lane_shard.iter().enumerate() {
+        pool_lane_index[idx] = lanes_per_shard[shard];
+        lanes_per_shard[shard] += 1;
+    }
+    let shard_pools: Vec<Option<Arc<ShardPool<B>>>> = lanes_per_shard
+        .iter()
+        .map(|&lanes| {
+            (stealing && lanes > 0).then(|| {
+                Arc::new(ShardPool {
+                    pool: LanePool::new(LanePoolConfig {
+                        lanes,
+                        max_workers: event_lane_of.len().max(1),
+                        // Never refuse: the harness's own queues are unbounded, and a refusal
+                        // here would only move an event into the lane's held slot.
+                        depth_cap: corpus.totals.events().try_into().unwrap_or(usize::MAX),
+                        batch: 32,
+                        steal_after: args.steal_after,
+                    }),
+                    open_channels: AtomicUsize::new(lanes),
+                    held_total: AtomicUsize::new(0),
+                    enqueue_ns: AtomicU64::new(0),
+                    stealable_idle_turns: AtomicU64::new(0),
+                })
+            })
+        })
+        .collect();
     let mut senders = Vec::with_capacity(args.event_lanes);
     let mut event_threads = Vec::with_capacity(args.event_lanes);
     for (idx, &expected) in event_lane_expected.iter().enumerate() {
         let (tx, rx) = mpsc::channel::<EventMsg>();
         senders.push(tx);
-        let cpus: Arc<[usize]> = if args.pin_event_lanes && !backend_cpus.is_empty() {
-            Arc::from(vec![backend_cpus[idx % backend_cpus.len()]])
-        } else {
-            Arc::clone(&backend_cpus)
-        };
         let (backend, corpus) = (Arc::clone(&backend), Arc::clone(&corpus));
         let placement = LanePlacement {
             index: idx,
-            cpus,
+            cpus: Arc::clone(&lane_cpus[idx]),
             local_memory: matches!(args.lane_memory, LaneMemory::Local),
         };
-        event_threads.push(thread::spawn(move || {
-            event_lane_worker(backend, rx, corpus, epoch, placement, expected)
-        }));
+        match shard_pools[lane_shard[idx]].as_ref().map(Arc::clone) {
+            Some(shard_pool) => {
+                let pool_lane = pool_lane_index[idx];
+                event_threads.push(thread::spawn(move || {
+                    event_lane_worker_pooled(
+                        backend, rx, corpus, epoch, placement, expected, shard_pool, pool_lane,
+                    )
+                }));
+            }
+            None => event_threads.push(thread::spawn(move || {
+                event_lane_worker(backend, rx, corpus, epoch, placement, expected)
+            })),
+        }
     }
 
     let shared = Shared {
@@ -2066,10 +2384,15 @@ fn run<B: ReplayBackend>(
         fan_stats[index % fan].add(&output.fan);
         query_results.push(output.completions);
     }
-    let (event_results, event_lane_cpu_ns): (Vec<Vec<EventCompletion>>, Vec<u64>) = event_threads
+    let outcomes: Vec<LaneOutcome> = event_threads
         .into_iter()
         .map(|h| h.join().expect("event lane panicked"))
-        .unzip();
+        .collect();
+    let event_lane_cpu_ns: Vec<u64> = outcomes.iter().map(|o| o.cpu_ns).collect();
+    let event_lane_apply_ms: Vec<f64> = outcomes.iter().map(|o| o.apply_ns as f64 / 1e6).collect();
+    let event_lane_minor_faults: Vec<u64> = outcomes.iter().map(|o| o.minor_faults).collect();
+    let event_results: Vec<Vec<EventCompletion>> =
+        outcomes.into_iter().map(|o| o.completions).collect();
 
     // Merge issue records.
     let n = corpus.ops.len();
@@ -2115,7 +2438,10 @@ fn run<B: ReplayBackend>(
         }
     }
     let mut event_done: Vec<Option<EventCompletion>> = vec![None; n];
-    let mut actual_by_worker: BTreeMap<(u64, u32), Vec<u32>> = BTreeMap::new();
+    // A worker's events in the order they were applied: by finish time, since under
+    // `--lane-scheduling stealing` a worker's events are applied by more than one lane (one at
+    // a time, so finish order is apply order) and its completions sit in several lanes' lists.
+    let mut actual_by_worker: BTreeMap<(u64, u32), Vec<(u64, u32)>> = BTreeMap::new();
     let mut failed_events = 0usize;
     for completions in &event_results {
         for c in completions {
@@ -2123,7 +2449,7 @@ fn run<B: ReplayBackend>(
             actual_by_worker
                 .entry((op.worker, op.dp_rank()))
                 .or_default()
-                .push(c.id);
+                .push((c.finished_ns, c.id));
             if !c.ok {
                 failed_events += 1;
             }
@@ -2132,6 +2458,13 @@ fn run<B: ReplayBackend>(
             }
         }
     }
+    let actual_by_worker: BTreeMap<(u64, u32), Vec<u32>> = actual_by_worker
+        .into_iter()
+        .map(|(worker, mut done)| {
+            done.sort_unstable();
+            (worker, done.into_iter().map(|(_, id)| id).collect())
+        })
+        .collect();
     let mut expected_by_worker: BTreeMap<(u64, u32), Vec<u32>> = BTreeMap::new();
     for op in corpus.ops.iter().filter(|op| !op.is_query()) {
         expected_by_worker
@@ -2267,6 +2600,31 @@ fn run<B: ReplayBackend>(
         "payload_home": format!("{:?}", args.payload_home).to_lowercase(),
         "lane_scheduling": format!("{:?}", args.lane_scheduling).to_lowercase(),
         "steal_after": args.steal_after,
+        "lane_pool": stealing.then(|| {
+            shard_pools
+                .iter()
+                .enumerate()
+                .filter_map(|(shard, pool)| pool.as_ref().map(|pool| (shard, pool)))
+                .map(|(shard, shard_pool)| {
+                    let m = shard_pool.pool.metrics();
+                    json!({
+                        "shard": shard,
+                        "lanes": shard_pool.pool.config().lanes,
+                        "steal_after": shard_pool.pool.config().steal_after,
+                        "enqueued": m.enqueued,
+                        "applied": m.applied,
+                        "rejected": m.rejected,
+                        "steals": m.steals,
+                        "max_depth": m.max_depth,
+                        "max_queued": m.max_queued,
+                        "busy_ms": m.busy_ns as f64 / 1e6,
+                        "idle_ms": m.idle_ns as f64 / 1e6,
+                        "enqueue_wait_ms": shard_pool.enqueue_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                        "stealable_idle_turns": shard_pool.stealable_idle_turns.load(Ordering::Relaxed),
+                    })
+                })
+                .collect::<Vec<_>>()
+        }),
         "lookup_fanout": (fan > 1).then(|| json!({
             "fan": fan,
             "groups": lookup_groups,
@@ -2346,6 +2704,8 @@ fn run<B: ReplayBackend>(
         "pin_event_lanes": args.pin_event_lanes,
         "issuer_by_lane": args.issuer_by_lane,
         "event_lane_cpu_ms": event_lane_cpu_ms,
+        "event_lane_apply_ms": event_lane_apply_ms,
+        "event_lane_minor_faults": event_lane_minor_faults,
         "event_lane_events": event_lane_events,
         "event_lane_last_finished_ms": event_lane_last_finished_ms,
         "query_lane_cpu_ms_total": query_lane_cpu_ns as f64 / 1e6,
