@@ -788,8 +788,11 @@ impl AppContextBuilder {
             };
 
         if is_cache_aware {
-            let monitor = Arc::new(KvEventMonitor::new(None));
-            debug!("Created KV event monitor for event-driven cache-aware routing");
+            let monitor = Arc::new(KvEventMonitor::with_kind(config.kv_index, None));
+            debug!(
+                kv_index = config.kv_index.as_str(),
+                "Created KV event monitor for event-driven cache-aware routing"
+            );
 
             // Optional indexer bounding: prune entries by last-touch TTL and/or
             // capacity ceiling. Both default off (unbounded, prior behavior).

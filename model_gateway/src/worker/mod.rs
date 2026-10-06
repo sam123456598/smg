@@ -11,6 +11,7 @@ pub mod hash_ring;
 pub mod http_client;
 pub mod kv_event_monitor;
 mod kv_event_recovery;
+pub mod kv_index_backend;
 pub(crate) mod liveness;
 pub(crate) mod load_state;
 pub mod manager;
@@ -44,6 +45,7 @@ pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
 pub use kv_event_monitor::KvEventMonitor;
+pub use kv_index_backend::{KvIndex, WorkerBlocks};
 pub use manager::WorkerManager;
 pub use monitor::{WorkerLoadManager, WorkerMonitor};
 // Re-export UNKNOWN_MODEL_ID from protocols

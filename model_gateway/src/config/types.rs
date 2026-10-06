@@ -164,6 +164,11 @@ pub struct RouterConfig {
     /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_max_entries: Option<usize>,
+    /// Which event-driven KV index cache-aware routing reads: the positional
+    /// indexer (default) or the run-compressed index. The prune bounds above
+    /// apply to the positional indexer only.
+    #[serde(default)]
+    pub kv_index: KvIndexKind,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
     /// load-aware routing policy is active. Successful routing-owned polls are
     /// always re-exported without an additional Engine RPC.
@@ -728,6 +733,39 @@ impl Default for RoutingKeyOverrideConfig {
     }
 }
 
+/// The event-driven KV index behind cache-aware routing (`--kv-index`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvIndexKind {
+    /// The positional indexer: one entry per `(position, content hash)`,
+    /// probed per block of a request (default).
+    #[default]
+    Positional,
+    /// The run-compressed index: chains stored as runs with per-run worker
+    /// coverage; lock-free, store-free lookups, memory proportional to the
+    /// blocks the engines report.
+    Run,
+}
+
+impl KvIndexKind {
+    /// Parse from a case-insensitive string (`positional` | `run`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "positional" => Some(Self::Positional),
+            "run" => Some(Self::Run),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Positional => "positional",
+            Self::Run => "run",
+        }
+    }
+}
+
 /// Under-layer index the cache_aware policy keeps per model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1250,6 +1288,7 @@ impl Default for RouterConfig {
             worker_overload_token_usage: None,
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
+            kv_index: KvIndexKind::default(),
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
