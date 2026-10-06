@@ -2124,7 +2124,12 @@ impl RunIndex {
                     .arena
                     .table_find(window.children, remaining[0].content_hash.0)
                 {
-                    Some((child, generation)) => Plan::Descend(child, generation),
+                    Some((child, generation)) => {
+                        // The child's header is the next line the walk reads: ask for it while
+                        // the version is confirmed.
+                        prefetch_hint::prefetch_read(std::ptr::from_ref(self.slab.run(child)));
+                        Plan::Descend(child, generation)
+                    }
                     // A run with a child table takes a new branch without its lock; a leaf (the
                     // worker's own to extend, or a shared one without a table yet) is locked.
                     None if window.children != NONE => Plan::Insert,
@@ -2575,6 +2580,13 @@ impl RunIndex {
         }
         lap(self.counter_slot(4), grouping);
         let applying = tick();
+        // The runs' headers are the lines the locked work reads first: ask for all of them now
+        // so their misses overlap instead of serialising one run after another.
+        for removal in &work {
+            if removal.run != GONE {
+                prefetch_hint::prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
+            }
+        }
         let mut freed = Vec::new();
         while let Some(removal) = work.pop() {
             self.remove_from_run(worker, removal, &mut work, &mut freed);
