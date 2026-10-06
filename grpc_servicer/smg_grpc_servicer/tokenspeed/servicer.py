@@ -670,7 +670,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             return False
         try:
             return bool(await self._bounded_probe("_pause_probe", query))
-        except TimeoutError:
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             logger.warning(
                 "is_scheduler_paused did not answer within %ss; reporting not paused",
                 PAUSE_PROBE_TIMEOUT,
@@ -719,7 +720,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             load_outputs = await asyncio.wait_for(
                 self.async_llm.get_load(), timeout=HEALTH_CHECK_TIMEOUT
             )
-        except TimeoutError:
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
                 f"tokenspeed scheduler did not respond to GetLoad within {HEALTH_CHECK_TIMEOUT}s",
@@ -852,7 +854,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         comm_timeout = max(30.0, request.timeout_s + 10.0)
         try:
             result = await asyncio.wait_for(self.async_llm.flush_cache(), timeout=comm_timeout)
-        except TimeoutError:
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
                 f"Flush cache timed out after {comm_timeout}s",
@@ -896,7 +899,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 ),
                 timeout=PROFILE_TIMEOUT,
             )
-        except TimeoutError:
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
                 f"Start profiling timed out after {PROFILE_TIMEOUT}s",
@@ -918,7 +922,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         logger.debug("Receive stop profile request")
         try:
             await asyncio.wait_for(self.async_llm.stop_profile(), timeout=PROFILE_TIMEOUT)
-        except TimeoutError:
+        # asyncio.TimeoutError is a separate exception on Python 3.10.
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
                 f"Stop profiling timed out after {PROFILE_TIMEOUT}s",
