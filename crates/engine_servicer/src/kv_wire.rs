@@ -53,7 +53,10 @@ use smg_grpc_client::common_proto::{
 };
 use tracing::{debug, warn};
 
-use crate::engine_hash::{self, Digest32, EngineHash, VllmExtraKey};
+use crate::{
+    engine_hash::{self, Digest32, EngineHash, VllmExtraKey},
+    kv_state::COPIES_CAP,
+};
 
 /// `int.from_bytes(bytes, "big")` kept to 64 bits: the whole value for the
 /// publisher's eight-byte sequence frame, the low 64 bits of a longer hash.
@@ -655,11 +658,18 @@ impl Namespace {
     }
 }
 
-/// What this stream remembers about a stored engine hash.
+/// What this stream remembers about a stored engine hash, kept until the
+/// last of its physical copies is removed: the engines keep up to two
+/// copies of a block and remove them one at a time, and the gateway counts
+/// them the same way, so a child stored after one copy went still has its
+/// parent here.
 #[derive(Clone, Debug, Default)]
 struct BlockRecord {
     /// The namespace it was stored under, for children that omit theirs.
     namespace: Option<Namespace>,
+    /// Physical copies stored and not yet removed, capped as the gateway
+    /// caps them.
+    copies: u32,
     /// Its recomputed full digest when the hash check ran: what a child
     /// chains on.
     digest: Option<Digest32>,
@@ -1063,12 +1073,24 @@ impl Normalizer {
         let stored_namespace = (!namespace.is_empty()).then(|| namespace.clone());
         let mut all_seen = true;
         for hash in &stored.block_hashes {
-            let record = BlockRecord {
-                namespace: stored_namespace.clone(),
-                digest: None,
-            };
-            if blocks_state.insert(hash.0, record).is_none() {
-                all_seen = false;
+            match blocks_state.get_mut(&hash.0) {
+                // A second physical copy: the record stays, its digest with
+                // it, with one more copy counted.
+                Some(record) => {
+                    record.copies = record.copies.saturating_add(1).min(COPIES_CAP);
+                    record.namespace.clone_from(&stored_namespace);
+                }
+                None => {
+                    all_seen = false;
+                    blocks_state.insert(
+                        hash.0,
+                        BlockRecord {
+                            namespace: stored_namespace.clone(),
+                            copies: 1,
+                            digest: None,
+                        },
+                    );
+                }
             }
         }
         if all_seen {
@@ -1176,8 +1198,14 @@ impl Normalizer {
                 }
             }
             if let Some(blocks_state) = state.tiers.get_mut(&(tier as i32)) {
+                // One physical copy goes; the record goes with the last.
                 for hash in &block_hashes {
-                    blocks_state.remove(hash);
+                    if let Some(record) = blocks_state.get_mut(hash) {
+                        record.copies = record.copies.saturating_sub(1);
+                        if record.copies == 0 {
+                            blocks_state.remove(hash);
+                        }
+                    }
                 }
             }
         }
@@ -2190,5 +2218,53 @@ mod tests {
             ),
             (2, 2, 1)
         );
+    }
+
+    /// The engine keeps up to two physical copies of a block and removes
+    /// them one at a time; the check's parent memory counts the copies the
+    /// way the gateway does, so a child stored after the first copy went
+    /// still chains on its parent's digest, and only after the last copy is
+    /// the parent gone and the child unverifiable. Both removals are
+    /// forwarded either way.
+    #[test]
+    fn the_hash_checks_parent_memory_counts_physical_copies() {
+        let root = engine_hash::sglang_chain(&[1, 2, 3, 4], 4, None)[0].1;
+        let child_b = engine_hash::sglang_chain(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None)[1].1;
+        let child_c = engine_hash::sglang_chain(&[1, 2, 3, 4, 13, 14, 15, 16], 4, None)[1].1;
+        let mut normalizer = Normalizer::with_hash_check(EngineHash::Sglang);
+        let mut event_id = 0;
+        normalize(
+            &mut normalizer,
+            one(vec![
+                store(&[root], None, &[1, 2, 3, 4]),
+                store(&[root], None, &[1, 2, 3, 4]), // the second physical copy
+                remove(&[root]),                     // one copy goes
+                store(&[child_b], Some(root), &[5, 6, 7, 8]),
+            ]),
+            1,
+            &mut event_id,
+        );
+        let counts = normalizer.counts();
+        assert_eq!(
+            (
+                counts.hash_checked,
+                counts.hash_mismatch,
+                counts.hash_unverifiable,
+                counts.duplicate_stores
+            ),
+            (3, 0, 0, 1)
+        );
+        normalize(
+            &mut normalizer,
+            one(vec![
+                remove(&[root]), // the last copy
+                store(&[child_c], Some(root), &[13, 14, 15, 16]),
+            ]),
+            2,
+            &mut event_id,
+        );
+        let counts = normalizer.counts();
+        assert_eq!((counts.hash_checked, counts.hash_unverifiable), (3, 1));
+        assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (4, 2));
     }
 }
