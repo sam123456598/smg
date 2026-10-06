@@ -1,6 +1,6 @@
 # Loop head e69487f8 on the GB300 fleet: vLLM load fields live, labelled replays, relay-history drills, and a blind index
 
-Host state first: devgpu044 rebooted at about 13:45 (uptime 14 min when this round started), so every engine, gateway
+Host state first: the GB300 host rebooted at about 13:45 (uptime 14 min when this round started), so every engine, gateway
 and build of the previous rounds was gone; podman stays unused. Everything below runs from the host venvs on cores
 72-143 (engines, builds) and 64-71 (gateway, load clients), by the recipe in `gpu-harness.md` section 7. Results under
 `~/smg-perf/gpu/results/{getloads,replay-8b-fleet-series-e69487f8*,replay-8b-branch-diag-e69487f8,gap-drill}`.

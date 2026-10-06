@@ -1,4 +1,4 @@
-# Gateway HTTP path adds latency and buffers streamed tokens (observed 2026-10-05, devgpu044)
+# Gateway HTTP path adds latency and buffers streamed tokens (observed 2026-10-05, the GB300 host)
 
 Setup: 8 x vLLM 0.31 Qwen3-0.6B workers behind the Rust servicer (`vllm serve --grpc --servicer-impl rust`),
 gateway `smg 1.11.0` (branch leap/gpu-harness @ 53b9ad54) with `--worker-urls grpc://...`, host load 140-500

@@ -1,7 +1,7 @@
-# GPU harness: real engines on devgpu044 (GB300)
+# GPU harness: real engines on the GB300 host
 
 Companion to the KV-router leap contract (`kv-router-leap.md`, 3.T4/T9 and 4.5). Everything here ran on
-devgpu044 (arm64 Grace, 4x NVIDIA GB300 284 GB, driver 580.126.20, podman 5.8.5 rootless, no
+the GB300 host (arm64 Grace, 4x NVIDIA GB300 284 GB, driver 580.126.20, podman 5.8.5 rootless, no
 nvidia-container-toolkit, no root). Scripts, fixtures and results live under `~/smg-perf/gpu/`; the
 captured streams are checked in under `crates/engine_servicer/tests/fixtures/captured/`.
 

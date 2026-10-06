@@ -1,4 +1,4 @@
-# Qwen3-8B baseline (2026-10-05, devgpu044)
+# Qwen3-8B baseline (2026-10-05, the GB300 host)
 
 Fleet: 4 x `vllm serve Qwen/Qwen3-8B --grpc --servicer-impl rust` run from the host venv (`scripts/run-vllm-grpc-host.sh`, vLLM 0.31.0, one per GB300, `--gpu-memory-utilization 0.4` (0.3 on GPU 3), `--max-model-len 8192`), gateway `smg 1.11.0` (branch leap/gpu-harness) at `--log-level warn` on cores 64-71, clients on 64-71 (`scripts/bench_prefix.py`). Workload: prefix repetition, 16 prefixes x 32 prompts, 1024 prefix + 128 suffix tokens, 64 output tokens with ignore_eos, Poisson 16 req/s, concurrency 64, 512 requests (128 at 4 req/s).
 

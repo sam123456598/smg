@@ -1,6 +1,6 @@
 # Captured KV-event streams from real engines
 
-Raw ZMQ KV-event batches recorded on devgpu044 (arm64 Grace, NVIDIA GB300, driver 580.126.20)
+Raw ZMQ KV-event batches recorded on the GB300 host (arm64 Grace, NVIDIA GB300, driver 580.126.20)
 on 2026-10-05 with the scripts in `~/smg-perf/gpu/scripts` (see `crates/kv_index/docs/gpu-harness.md`).
 Model: `Qwen/Qwen3-0.6B`, one engine per capture, data-parallel size 1 unless the section says otherwise.
 

@@ -1,6 +1,6 @@
 # Hash-check drill (guardrail 7: a worker hashing differently is detected, routing keeps working)
 
-2026-10-05, devgpu044. Four Qwen3-0.6B workers from the host venv through the loop-head Rust servicer
+2026-10-05, the GB300 host. Four Qwen3-0.6B workers from the host venv through the loop-head Rust servicer
 (`smg` wheel built from f4dc134b, `scripts/hash-drill.sh`, `SMG_KV_EVENT_HASH_CHECK=vllm-sha256-cbor` on all
 four), gateway = the loop-head `smg` binary, policy cache_aware, `--log-level warn`, cores 64-71.
 Workers 0-2 run with vLLM's default `NONE_HASH` seed (`PYTHONHASHSEED` unset); worker 3 runs with
