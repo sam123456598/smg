@@ -398,9 +398,12 @@ pub struct EngineParams {
     /// SGLang-style scheduling: a pass that contains prefill runs prefill only.
     pub prefill_first: bool,
     /// vLLM's `scheduler_reserve_full_isl`: a waiting request is admitted only
-    /// when KV room exists for its whole prompt beyond its cached blocks, and
-    /// admission stops at the first request that does not fit. Off, only the
-    /// pass's chunk is reserved (the older, over-admitting behaviour).
+    /// when the free and evictable blocks could hold its whole prompt beyond
+    /// its cached blocks, and admission stops at the first request that does
+    /// not fit; only the pass's chunk is allocated at admission, the next
+    /// chunks allocate as they run (the gate is read, not reserved, as in
+    /// vLLM's `full_sequence_must_fit`). Off, the gate is skipped (the older,
+    /// over-admitting behaviour).
     pub reserve_full_isl: bool,
     /// Output tokens to generate when a request does not specify `max_new_tokens`.
     pub max_new_default: u32,
@@ -1186,8 +1189,7 @@ impl BlockPool {
     /// as needed. Reserves nothing and returns false when even that is not
     /// enough.
     fn reserve(&mut self, n: u64, capacity: u64, evicted: &mut Vec<u64>) -> bool {
-        let idle = self.free_lru.len() as u64;
-        if capacity.saturating_sub(self.allocated) + idle < n {
+        if !self.fits(n, capacity) {
             return false;
         }
         while capacity.saturating_sub(self.allocated) < n {
@@ -1198,6 +1200,13 @@ impl BlockPool {
         }
         self.allocated += n;
         true
+    }
+
+    /// Whether `n` more blocks could be reserved now: never-used capacity
+    /// plus the idle cached blocks an eviction may take (what vLLM's
+    /// free-block count holds).
+    fn fits(&self, n: u64, capacity: u64) -> bool {
+        capacity.saturating_sub(self.allocated) + self.free_lru.len() as u64 >= n
     }
 
     /// Reserve without a capacity check (a prompt larger than all of KV on
@@ -1539,21 +1548,23 @@ impl SchedulerState {
             let chunk = remaining.min(budget);
             let completes = chunk == remaining;
             let add = chunk + u32::from(completes);
-            // Room for this pass's chunk, or for the whole prompt (plus the
-            // first output token's slot) under full-ISL reservation.
-            let covered = if p.reserve_full_isl {
-                cached + remaining + 1
-            } else {
-                cached + add
-            };
-            let need = blocks_for(covered, bs) - cached_blocks as u64;
+            // This pass's chunk is what gets allocated. Under full-ISL
+            // admission the whole prompt (plus the first output token's slot)
+            // must also fit in the free and evictable blocks right now: vLLM's
+            // `full_sequence_must_fit` is a gate read at admission, not a
+            // reservation, so an admitted prompt holds no more than it has
+            // computed and the next chunks allocate (evict, preempt) as they run.
+            let need = blocks_for(cached + add, bs) - cached_blocks as u64;
+            let need_full = blocks_for(cached + remaining + 1, bs) - cached_blocks as u64;
             // Reference the cached prefix before making room, so the eviction
             // cannot take the very blocks this request is about to reuse.
             for k in &front.keys[..cached_blocks] {
                 self.pool.hit(*k);
             }
             let mut freed = Vec::new();
-            if !self.pool.reserve(need, p.capacity_blocks(), &mut freed) {
+            let room = (!p.reserve_full_isl || self.pool.fits(need_full, p.capacity_blocks()))
+                && self.pool.reserve(need, p.capacity_blocks(), &mut freed);
+            if !room {
                 if self.running.is_empty() {
                     self.pool.force_reserve(need);
                 } else {
@@ -1629,9 +1640,6 @@ impl SchedulerState {
             });
             let idx = self.running.len() - 1;
             self.running[idx].held = self.running[idx].seq_keys[..cached_blocks].to_vec();
-            // Everything reserved beyond this pass's chunk is spare for the next chunks.
-            self.running[idx].reserved_spare =
-                need.saturating_sub(blocks_for(cached + add, bs) - cached_blocks as u64);
             evicted.extend(freed.iter().copied());
             self.push_removed(&mut kv, freed, p);
             let mut completed = self.apply_prefill(idx, chunk, p);
@@ -2845,9 +2853,11 @@ mod tests {
     }
 
     #[test]
-    fn full_isl_reservation_is_spent_by_the_prefill_chunks_and_returned_on_release() {
-        // A 2500-token prompt against a 1000-token pass budget: three chunks
-        // draw on the reservation made at admission; nothing is reserved twice.
+    fn full_isl_admission_gates_on_the_whole_prompt_but_allocates_per_chunk() {
+        // A 2500-token prompt against a 1000-token pass budget: the gate reads
+        // the whole prompt, the first pass allocates its chunk only, the next
+        // chunks allocate as they run, and nothing is held beyond what is
+        // computed (plus the first token's slot once the prefill completes).
         let p = EngineParams {
             max_batched_tokens: 1000,
             block_size: 16,
@@ -2857,23 +2867,20 @@ mod tests {
         let mut st = SchedulerState::new();
         let (r, mut rx) = req("long", vec![7; 2500], 3);
         st.enqueue(r, &p);
-        let after_first = {
-            st.step(&p);
-            st.pool.allocated
-        };
+        st.step(&p);
         assert_eq!(
-            after_first,
-            blocks_for(2501, 16),
-            "the whole prompt and the first token's slot are reserved up front"
+            st.pool.allocated,
+            blocks_for(1000, 16),
+            "the first pass allocates its chunk, not the whole prompt"
         );
+        assert_eq!(st.running[0].reserved_spare, 0, "nothing is reserved ahead");
         let (_, passes) = run_to_first_token(&mut st, &p, &mut rx);
         assert_eq!(passes, 2, "two more passes finish the prefill");
         assert_eq!(
             st.pool.allocated,
             blocks_for(2501, 16),
-            "chunks consumed the reservation, nothing more"
+            "after the prefill the prompt and the first token's slot are held"
         );
-        assert_eq!(st.running[0].reserved_spare, 0, "no spare left over");
         for _ in 0..10 {
             st.step(&p);
         }
