@@ -105,6 +105,13 @@ const MAX_WORDS: usize = 16;
 /// Partial holders a lookup can buffer per run: every worker at most.
 const MAX_PARTIAL: usize = MAX_WORDS * 64;
 
+thread_local! {
+    /// The lookup's buffer for one run's partial-holder entries, per thread: filled and read
+    /// within one walk, never cleared, so a lookup does not zero 8 KB of stack first.
+    static PARTIAL_BUFFER: std::cell::RefCell<[u64; MAX_PARTIAL]> =
+        const { std::cell::RefCell::new([0; MAX_PARTIAL]) };
+}
+
 /// Where one of a worker's blocks lives: the run and the offset of the block within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockRef {
@@ -2819,102 +2826,107 @@ impl RunIndex {
         let (mut run_id, mut expected) = entry;
         let words = self.words;
         let mut alive = [0u64; MAX_WORDS];
-        let mut partial = [0u64; MAX_PARTIAL];
-        let mut position = 0usize;
-        let mut walked = 0usize;
-        loop {
-            let run = self.slab.run(run_id);
-            let (window, version) = run.snapshot();
-            if (version >> 32) as u32 != expected {
-                break;
-            }
-            let len = window.len as usize;
-            let available = len.min(content_hashes.len() - position);
-            let hashes = self.arena.words(window.block + window.base, available);
-            let matched = content_hashes[position..position + available]
-                .iter()
-                .zip(hashes)
-                .take_while(|(content, slot)| hash_of(content) == slot.load(Ordering::Relaxed))
-                .count();
-            // Partial holders before the coverage words: a worker moving from a prefix to the
-            // whole run gains its bit before it loses its entry, so this order never misses it.
-            let mut partials = 0usize;
-            if window.partials != NONE {
-                let (_, used) = self.arena.partials_shape(window.partials);
-                for slot in self.arena.words(window.partials + 2, used) {
-                    let entry = slot.load(Ordering::Relaxed);
-                    if entry != 0 && entry != TOMB && partials < MAX_PARTIAL {
-                        partial[partials] = entry;
-                        partials += 1;
+        // The partial-holder entries of the run in hand live in a per-thread buffer: a walk
+        // writes the prefix it then reads, so nothing is zeroed per lookup (the 8 KB this
+        // buffer would cost on the stack was a sixth of a lookup). `report` must not look up.
+        PARTIAL_BUFFER.with(|buffer| {
+            let mut partial = buffer.borrow_mut();
+            let mut position = 0usize;
+            let mut walked = 0usize;
+            loop {
+                let run = self.slab.run(run_id);
+                let (window, version) = run.snapshot();
+                if (version >> 32) as u32 != expected {
+                    break;
+                }
+                let len = window.len as usize;
+                let available = len.min(content_hashes.len() - position);
+                let hashes = self.arena.words(window.block + window.base, available);
+                let matched = content_hashes[position..position + available]
+                    .iter()
+                    .zip(hashes)
+                    .take_while(|(content, slot)| hash_of(content) == slot.load(Ordering::Relaxed))
+                    .count();
+                // Partial holders before the coverage words: a worker moving from a prefix to the
+                // whole run gains its bit before it loses its entry, so this order never misses it.
+                let mut partials = 0usize;
+                if window.partials != NONE {
+                    let (_, used) = self.arena.partials_shape(window.partials);
+                    for slot in self.arena.words(window.partials + 2, used) {
+                        let entry = slot.load(Ordering::Relaxed);
+                        if entry != 0 && entry != TOMB && partials < MAX_PARTIAL {
+                            partial[partials] = entry;
+                            partials += 1;
+                        }
                     }
                 }
-            }
-            let coverage = self.slab.coverage(run_id);
-            let mut held = [0u64; MAX_WORDS];
-            for (word, slot) in held[..words].iter_mut().zip(coverage) {
-                *word = slot.load(Ordering::Relaxed);
-            }
-            let next = if matched == len && position + matched < content_hashes.len() {
-                self.arena.table_find(
-                    window.children,
-                    hash_of(&content_hashes[position + matched]),
-                )
-            } else {
-                None
-            };
-            if !run.confirm(version) {
-                continue;
-            }
-            walked += 1;
-            if matched == 0 {
-                break;
-            }
-            if position == 0 {
-                alive = held;
+                let coverage = self.slab.coverage(run_id);
+                let mut held = [0u64; MAX_WORDS];
+                for (word, slot) in held[..words].iter_mut().zip(coverage) {
+                    *word = slot.load(Ordering::Relaxed);
+                }
+                let next = if matched == len && position + matched < content_hashes.len() {
+                    self.arena.table_find(
+                        window.children,
+                        hash_of(&content_hashes[position + matched]),
+                    )
+                } else {
+                    None
+                };
+                if !run.confirm(version) {
+                    continue;
+                }
+                walked += 1;
+                if matched == 0 {
+                    break;
+                }
+                if position == 0 {
+                    alive = held;
+                    for &entry in &partial[..partials] {
+                        let worker = entry as u32;
+                        alive[(worker / 64) as usize] |= 1u64 << (worker % 64);
+                    }
+                    if early_exit {
+                        emit(&alive[..words], 1, &mut report);
+                        return walked;
+                    }
+                }
+                // A partial holder still alive ends here with the part of the run it holds.
                 for &entry in &partial[..partials] {
                     let worker = entry as u32;
-                    alive[(worker / 64) as usize] |= 1u64 << (worker % 64);
-                }
-                if early_exit {
-                    emit(&alive[..words], 1, &mut report);
-                    return walked;
-                }
-            }
-            // A partial holder still alive ends here with the part of the run it holds.
-            for &entry in &partial[..partials] {
-                let worker = entry as u32;
-                let (index, bit) = ((worker / 64) as usize, 1u64 << (worker % 64));
-                if alive[index] & bit != 0 && held[index] & bit == 0 {
-                    let cutoff = (entry >> 32) as usize;
-                    report(worker, (position + cutoff.min(matched)) as u32);
-                    alive[index] &= !bit;
-                }
-            }
-            if position > 0 {
-                for (index, word) in alive[..words].iter_mut().enumerate() {
-                    let dropped = *word & !held[index];
-                    if dropped != 0 {
-                        emit_word(index, dropped, position as u32, &mut report);
+                    let (index, bit) = ((worker / 64) as usize, 1u64 << (worker % 64));
+                    if alive[index] & bit != 0 && held[index] & bit == 0 {
+                        let cutoff = (entry >> 32) as usize;
+                        report(worker, (position + cutoff.min(matched)) as u32);
+                        alive[index] &= !bit;
                     }
                 }
-            }
-            for (index, word) in alive[..words].iter_mut().enumerate() {
-                *word &= held[index];
-            }
-            if alive[..words].iter().all(|word| *word == 0) {
-                return walked;
-            }
-            position += matched;
-            match next {
-                Some((child, generation)) => {
-                    run_id = child;
-                    expected = generation;
+                if position > 0 {
+                    for (index, word) in alive[..words].iter_mut().enumerate() {
+                        let dropped = *word & !held[index];
+                        if dropped != 0 {
+                            emit_word(index, dropped, position as u32, &mut report);
+                        }
+                    }
                 }
-                None => break,
+                for (index, word) in alive[..words].iter_mut().enumerate() {
+                    *word &= held[index];
+                }
+                if alive[..words].iter().all(|word| *word == 0) {
+                    return walked;
+                }
+                position += matched;
+                match next {
+                    Some((child, generation)) => {
+                        run_id = child;
+                        expected = generation;
+                    }
+                    None => break,
+                }
             }
-        }
-        emit(&alive[..words], position as u32, &mut report);
-        walked
+            emit(&alive[..words], position as u32, &mut report);
+            walked
+        })
     }
 
     /// Every block every worker holds, as `(worker, position, content hash, prefix hash)`;

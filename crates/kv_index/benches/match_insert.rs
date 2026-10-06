@@ -24,8 +24,8 @@ use std::{
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use kv_index::{
     compute_content_hash, compute_request_content_hashes, request_prefix_hashes, ContentHash,
-    PositionalIndexer, RunBlockMap, RunIndex, SequenceHash, StoredBlock, TokenTree, Tree,
-    WorkerBlockMap,
+    PositionalIndexer, RunBlockMap, RunIndex, SequenceHash, ShardedRunIndex, StoredBlock,
+    TokenTree, Tree, WorkerBlockMap,
 };
 
 const TENANTS: usize = 64;
@@ -394,11 +394,46 @@ fn bench_run_index_store(c: &mut Criterion) {
     group.finish();
 }
 
+/// The lookup of the run index: a request of 88 blocks that twenty workers hold whole (the
+/// Mooncake shape, one run walked), and the same request against two shards holding it on both.
+fn bench_run_index_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run_index_lookup");
+    group.throughput(Throughput::Elements(1));
+    let (index, blocks) = shared_run(20);
+    let request: Vec<ContentHash> = blocks.iter().map(|block| block.content_hash).collect();
+    group.bench_function("88_blocks/20_holders/1_shard", |b| {
+        b.iter(|| {
+            let mut scored = 0usize;
+            index.score_into(&request, |content| content.0, false, |_, _| scored += 1);
+            scored
+        });
+    });
+    let sharded = ShardedRunIndex::new(2, 64);
+    for w in 0..20 {
+        let worker = sharded
+            .intern_worker_in(w % 2, &tenant(w))
+            .expect("worker id");
+        let mut map = RunBlockMap::default();
+        sharded
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("store");
+    }
+    group.bench_function("88_blocks/20_holders/2_shards", |b| {
+        b.iter(|| {
+            let mut scored = 0usize;
+            sharded.score_into(&request, |content| content.0, false, |_, _| scored += 1);
+            scored
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_token_tree,
     bench_string_tree,
     bench_event_path,
-    bench_run_index_store
+    bench_run_index_store,
+    bench_run_index_lookup
 );
 criterion_main!(benches);
