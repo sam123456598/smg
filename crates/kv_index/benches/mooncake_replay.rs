@@ -451,6 +451,9 @@ struct Run {
     /// index when the list spans exactly `shards` nodes, else contiguous groups of the list.
     shard_of_cpu: FxHashMap<usize, usize>,
     event_lanes: usize,
+    /// Under `--count-shard-heads`: lookups by how many shards held the request's first block
+    /// (index = that count); a shared counter the query lanes write, so a diagnostic only.
+    heads_held: Option<Vec<AtomicUsize>>,
 }
 
 impl Run {
@@ -517,6 +520,12 @@ impl ReplayBackend for Run {
             total.arena_chunk_bytes,
             total.slab_bytes
         ));
+        if let Some(counts) = &self.heads_held {
+            let counts: Vec<usize> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+            out.push_str(&format!(
+                "\n  lookups by shards holding the first block (0, 1, 2, ..): {counts:?}"
+            ));
+        }
         Some(out)
     }
 
@@ -560,6 +569,10 @@ impl ReplayBackend for Run {
     }
 
     fn lookup(&self, hashes: &[ContentHash]) -> usize {
+        if let (Some(counts), Some(first)) = (&self.heads_held, hashes.first()) {
+            let held = self.inner.shards_holding_head(first.0);
+            counts[held.min(counts.len() - 1)].fetch_add(1, Ordering::Relaxed);
+        }
         let mut scored = 0usize;
         self.inner
             .score_into(hashes, |content| content.0, false, |_, _| scored += 1);
@@ -1257,6 +1270,10 @@ struct Args {
     /// each pinned lane prefer its own NUMA node for what it allocates (set_mempolicy).
     #[arg(long, value_enum, default_value = "inherit")]
     lane_memory: LaneMemory,
+    /// Diagnostic: count lookups by how many shards hold the request's first block (a shared
+    /// counter on the lookup path; not for timing rows).
+    #[arg(long)]
+    count_shard_heads: bool,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
     /// reference window when they differ.
     #[arg(long, conflicts_with = "offered_block_ops_per_sec")]
@@ -1365,6 +1382,11 @@ fn main() -> anyhow::Result<()> {
                     inner: ShardedRunIndex::new(args.shards.max(1), args.max_workers),
                     shard_of_cpu,
                     event_lanes: args.event_lanes,
+                    heads_held: args.count_shard_heads.then(|| {
+                        (0..=args.shards.max(1))
+                            .map(|_| AtomicUsize::new(0))
+                            .collect()
+                    }),
                 }),
             )
         }

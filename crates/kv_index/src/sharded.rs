@@ -229,13 +229,37 @@ impl ShardedRunIndex {
         if let [only] = &*self.shards {
             return only.score_into(content_hashes, &hash_of, early_exit, report);
         }
+        let Some(first) = content_hashes.first() else {
+            return 0;
+        };
+        let first = hash_of(first);
         let mut walked = 0;
         for (shard, index) in self.shards.iter().enumerate() {
-            walked += index.score_into(content_hashes, &hash_of, early_exit, |worker, score| {
-                report(Self::global(shard, worker), score);
-            });
+            // A shard whose root has no run starting with the request's first block holds
+            // nothing of it: one probe of its root table and the shard is passed over.
+            let Some(entry) = index.head_entry(first) else {
+                continue;
+            };
+            walked += index.score_from(
+                entry,
+                content_hashes,
+                &hash_of,
+                early_exit,
+                |worker, score| {
+                    report(Self::global(shard, worker), score);
+                },
+            );
         }
         walked
+    }
+
+    /// How many shards hold a chain starting with `first` (a diagnostic for the lookup's shard
+    /// filter: a shard without the head costs one root probe, a shard with it a walk).
+    pub fn shards_holding_head(&self, first: u64) -> usize {
+        self.shards
+            .iter()
+            .filter(|index| index.head_entry(first).is_some())
+            .count()
     }
 
     /// Shape and memory counters summed over the shards.

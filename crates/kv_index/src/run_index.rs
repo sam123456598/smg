@@ -2781,23 +2781,42 @@ impl RunIndex {
         content_hashes: &[T],
         hash_of: impl Fn(&T) -> u64,
         early_exit: bool,
-        mut report: impl FnMut(u32, u32),
+        report: impl FnMut(u32, u32),
     ) -> usize {
         let Some(first) = content_hashes.first() else {
             return 0;
         };
-        let first = hash_of(first);
+        match self.head_entry(hash_of(first)) {
+            Some(entry) => self.score_from(entry, content_hashes, hash_of, early_exit, report),
+            None => 0,
+        }
+    }
+
+    /// The run under the root that starts with the content hash `first`, with its generation:
+    /// whether any worker holds a chain starting there, read under the root's version. This is
+    /// the lookup's first step, and what lets a sharded lookup pass over a shard that cannot
+    /// hold the request at all.
+    pub(crate) fn head_entry(&self, first: u64) -> Option<(u32, u32)> {
         let root = self.slab.run(ROOT);
-        let (mut run_id, mut expected) = loop {
+        loop {
             let (window, version) = root.snapshot();
             let found = self.arena.table_find(window.children, first);
             if root.confirm(version) {
-                match found {
-                    Some(entry) => break entry,
-                    None => return 0,
-                }
+                return found;
             }
-        };
+        }
+    }
+
+    /// The lookup from the run under the root that [`head_entry`](Self::head_entry) found.
+    pub(crate) fn score_from<T>(
+        &self,
+        entry: (u32, u32),
+        content_hashes: &[T],
+        hash_of: impl Fn(&T) -> u64,
+        early_exit: bool,
+        mut report: impl FnMut(u32, u32),
+    ) -> usize {
+        let (mut run_id, mut expected) = entry;
         let words = self.words;
         let mut alive = [0u64; MAX_WORDS];
         let mut partial = [0u64; MAX_PARTIAL];
