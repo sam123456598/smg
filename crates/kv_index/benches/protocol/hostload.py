@@ -77,8 +77,68 @@ def _describe(pid: str) -> tuple[str, str, bool]:
     return comm, cmdline[:200], cmdline == ""
 
 
+def _proc_ticks(pid: str) -> tuple[int, int] | None:
+    """(utime + stime in ticks, last CPU) of a whole process, or None if it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    rest = raw[raw.rfind(b")") + 2 :].split()
+    if len(rest) < 37:
+        return None
+    return int(rest[11]) + int(rest[12]), int(rest[36])
+
+
+def _proc_snapshot() -> dict[str, tuple[int, int]]:
+    out: dict[str, tuple[int, int]] = {}
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            ticks = _proc_ticks(pid)
+            if ticks is not None:
+                out[pid] = ticks
+    return out
+
+
+def _all_cpus() -> set[int]:
+    try:
+        return set(range(os.cpu_count() or 0))
+    except Exception:
+        return set()
+
+
 def sample(cores: set[int], seconds: float, ignore_pids: set[int]) -> list[dict]:
     """Processes that used CPU on `cores` during the sampling interval, busiest first."""
+    if cores >= _all_cpus() and cores:
+        # Every core is sampled, so whole-process CPU time is exact and the walk reads one stat
+        # per process instead of one per thread (a host with tens of thousands of threads makes
+        # the per-thread walk take seconds per sample).
+        started = time.monotonic()
+        first = _proc_snapshot()
+        time.sleep(seconds)
+        resumed = time.monotonic()
+        second = _proc_snapshot()
+        elapsed = max(resumed - started, 1e-3)
+        rows = []
+        for pid, (ticks, cpu) in second.items():
+            if int(pid) in ignore_pids or pid not in first:
+                continue
+            delta = ticks - first[pid][0]
+            if delta <= 0:
+                continue
+            comm, cmdline, kernel = _describe(pid)
+            rows.append(
+                {
+                    "pid": int(pid),
+                    "comm": comm,
+                    "cmdline": cmdline,
+                    "cpu_pct": delta / CLK_TCK / elapsed * 100.0,
+                    "kernel_thread": kernel,
+                    "cpus": sorted({c for c in (cpu, first[pid][1]) if c in cores}),
+                }
+            )
+        rows.sort(key=lambda row: -row["cpu_pct"])
+        return rows
     started = time.monotonic()
     first = _snapshot()
     time.sleep(seconds)
@@ -92,12 +152,16 @@ def sample(cores: set[int], seconds: float, ignore_pids: set[int]) -> list[dict]
         if int(pid) in ignore_pids or pid not in first:
             continue
         delta = 0
+        busy_cpus: set[int] = set()
         for tid, (ticks, cpu) in threads.items():
             before = first[pid].get(tid)
             if before is None:
                 continue
             if cpu in cores or before[1] in cores:
-                delta += ticks - before[0]
+                used = ticks - before[0]
+                delta += used
+                if used > 0:
+                    busy_cpus.update(c for c in (cpu, before[1]) if c in cores)
         if delta <= 0:
             continue
         comm, cmdline, kernel = _describe(pid)
@@ -108,6 +172,9 @@ def sample(cores: set[int], seconds: float, ignore_pids: set[int]) -> list[dict]
                 "cmdline": cmdline,
                 "cpu_pct": delta / CLK_TCK / elapsed * 100.0,
                 "kernel_thread": kernel,
+                # The sampled cores this process's busy threads were last seen on (which lanes or
+                # issuers it sat on), so a flagged trial names the cores, not only the process.
+                "cpus": sorted(busy_cpus),
             }
         )
     rows.sort(key=lambda row: -row["cpu_pct"])
