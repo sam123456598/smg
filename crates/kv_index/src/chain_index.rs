@@ -2690,10 +2690,17 @@ impl ChainIndex {
         }
         let held = self.held_by(run_id, worker);
         if held < offset {
-            // The parent entry pointed past what this worker holds (it cannot, unless the engine
-            // re-stored under a stale parent). Cut here and join the suffix instead.
+            // The parent entry pointed past what this worker holds: the engine re-stored under
+            // a stale parent, or named one position by two engine hashes (the same content under
+            // the same parent) and removed the one the index filed the position under. Cut here
+            // and join the suffix; when nobody holds anything past the cut and no child hangs
+            // there, the split leaves nothing to join (`GONE`) and the run simply ends at the
+            // cut: the blocks go after it, like any store past a run's end.
             self.count_split(LockKind::Shared);
             let suffix = self.split_locked(run_id, meta, offset);
+            if suffix == GONE {
+                return InRun::Continue(remaining);
+            }
             return InRun::MoveTo(suffix, self.slab.run(suffix).generation());
         }
         let base = run.base.load(Ordering::Relaxed) + offset as u32;
@@ -4082,6 +4089,69 @@ mod tests {
         reference.apply_removed(b, &[blocks[1].seq_hash]);
         reference.apply_removed(b, &[blocks[4].seq_hash]);
         assert_eq!(index.debug_blocks(), reference.blocks());
+    }
+
+    /// An engine that names one position by two engine hashes (the same content under the same
+    /// parent: a twin) has the second filed onto the first by content, and the lane map carries
+    /// both names for one held position. Removing the first name takes the position with it;
+    /// a store under the second then points past what the worker holds, which cuts the run at
+    /// the parent and joins what lies beyond. When nothing lies beyond (nobody else holds the
+    /// tail, no child hangs there) the cut used to hand back `GONE` as a run to join and the
+    /// slab lookup panicked; now the run ends at the cut and the blocks go after it.
+    #[test]
+    fn a_store_under_a_twin_whose_first_name_was_removed_does_not_panic() {
+        let index = ChainIndex::with_max_workers(8);
+        let w = index.intern_worker("w").expect("id");
+        let mut map = ChainBlockMap::default();
+        let chain: Vec<ContentHash> = (0..8).map(|p| content(29, p)).collect();
+        let blocks = blocks_of(&chain);
+        index
+            .apply_stored(w, &blocks, None, &mut map)
+            .expect("chain");
+        // Twins of positions 4..8: the same content under the same parent, other engine hashes.
+        let twins: Vec<StoredBlock> = blocks[4..]
+            .iter()
+            .enumerate()
+            .map(|(i, b)| StoredBlock {
+                seq_hash: SequenceHash(b.seq_hash.0 ^ (0x5151 << (i + 8))),
+                content_hash: b.content_hash,
+            })
+            .collect();
+        index
+            .apply_stored(w, &twins, Some(blocks[3].seq_hash), &mut map)
+            .expect("twins");
+        assert_eq!(index.stats().engine_conflicts, 4);
+        assert_eq!(index.worker_block_count(w), 8);
+        assert_eq!(map.len(), 12);
+        // The first names of positions 4..8 go: the positions go with them.
+        let first_names: Vec<SequenceHash> = blocks[4..].iter().map(|b| b.seq_hash).collect();
+        index.apply_removed(w, &first_names, &mut map);
+        assert_eq!(index.worker_block_count(w), 4);
+        assert_eq!(scores(&index, &chain), vec![(w, 4)]);
+        // A store under the twin at position 5: the parent entry points past the holding.
+        let tail = blocks_of(&[
+            chain[0],
+            chain[1],
+            chain[2],
+            chain[3],
+            chain[4],
+            chain[5],
+            content(30, 6),
+        ]);
+        let stored = index.apply_stored(w, &tail[6..], Some(twins[1].seq_hash), &mut map);
+        assert!(stored.is_ok(), "{stored:?}");
+        assert_eq!(index.worker_block_count(w), 5);
+        // Positions 0..4 and the new block at 6 are held; positions 4 and 5 are not (the
+        // documented twin gap: one engine hash per held position).
+        assert_eq!(scores(&index, &chain[..4]), vec![(w, 4)]);
+        let query: Vec<ContentHash> = tail.iter().map(|b| b.content_hash).collect();
+        assert_eq!(scores(&index, &query), vec![(w, 4)]);
+        assert!(index
+            .debug_blocks()
+            .iter()
+            .any(|b| b.0 == w && b.1 == 6 && b.2 == content(30, 6)));
+        // Everything the worker holds is still reachable and consistent.
+        assert_eq!(index.debug_blocks().len(), 5);
     }
     /// `is_empty` follows the blocks: false from the first store, true again once every block
     /// is removed, cleared or taken with its worker.
