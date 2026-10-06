@@ -86,7 +86,10 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("test client: {e}"))?;
         let worker_url = self
             .first_worker_url()
             .ok_or_else(|| "No workers available".to_string())?;
@@ -115,7 +118,10 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("test client: {e}"))?;
         let worker_url = self
             .first_worker_url()
             .ok_or_else(|| "No workers available".to_string())?;
@@ -408,7 +414,11 @@ async fn build_test_app_context(
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
 
-    let client = reqwest::Client::new();
+    // See `test_app::create_test_app_context`: no environment proxy in a test's path.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     // Initialize rate limiter
     let rate_limiter = match config.max_concurrent_requests {
