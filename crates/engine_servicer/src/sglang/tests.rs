@@ -29,7 +29,7 @@ use tonic_health::pb::{
 };
 
 use super::*;
-use crate::ServicerError;
+use crate::{testing::Bounded, ServicerError};
 
 fn model_info() -> SglangModelInfo {
     SglangModelInfo {
@@ -350,22 +350,22 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
     )
     .await;
 
-    let first = stream.message().await.unwrap().unwrap();
+    let first = stream.message().bounded().await.unwrap().unwrap();
     assert_eq!(first.request_id, "r1");
     let first = chunk(first);
     assert_eq!(first.token_ids, vec![10]);
     assert_eq!(first.prompt_tokens, 3);
     assert_eq!(
-        chunk(stream.message().await.unwrap().unwrap()).token_ids,
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
         vec![11]
     );
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "length");
     assert_eq!(done.output_ids, vec![10, 11]);
     assert_eq!(done.prompt_tokens, 3);
     assert_eq!(done.completion_tokens, 2);
     assert_eq!(done.index, 0);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -386,10 +386,10 @@ async fn non_streaming_generate_delivers_only_the_complete() {
         &batch("r2", vec![11, 12], 3, Some("stop"), None),
     )
     .await;
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(done.output_ids, vec![10, 11, 12]);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -412,7 +412,7 @@ async fn string_stops_reach_the_scheduler_and_its_match_comes_back() {
     let mut done = batch("r3", vec![10, 11], 2, Some("stop"), None);
     done.finished_matched = vec![Some(MatchedStop::Text("###".to_string()))];
     send(&mut h.engine_out, &done).await;
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(
         done.matched_stop,
@@ -437,7 +437,7 @@ async fn abort_rpc_ends_the_stream_and_reaches_the_scheduler() {
     recv_add(&mut h.engine_in).await;
     send(&mut h.engine_out, &batch("r4", vec![10], 1, None, None)).await;
     assert_eq!(
-        chunk(stream.message().await.unwrap().unwrap()).token_ids,
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
         vec![10]
     );
 
@@ -451,10 +451,10 @@ async fn abort_rpc_ends_the_stream_and_reaches_the_scheduler() {
         .unwrap()
         .into_inner();
     assert!(response.success);
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "abort");
     assert_eq!(done.output_ids, vec![10]);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r4".to_string()]);
 
     let unknown = h
@@ -528,8 +528,8 @@ async fn n2_fans_out_under_the_parent_id() {
     };
     send(&mut h.engine_out, &both).await;
     let mut completes = [
-        complete(stream.message().await.unwrap().unwrap()),
-        complete(stream.message().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
     ];
     completes.sort_by_key(|done| done.index);
     assert_eq!(
@@ -540,7 +540,7 @@ async fn n2_fans_out_under_the_parent_id() {
         (completes[1].index, &completes[1].output_ids),
         (1, &vec![11])
     );
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -562,11 +562,11 @@ async fn logprobs_and_ranked_candidates_pass_through() {
     step.output_top_logprobs_val = vec![vec![vec![-0.5, -1.5]]];
     step.output_top_logprobs_idx = vec![vec![vec![10, 12]]];
     send(&mut h.engine_out, &step).await;
-    let first = chunk(stream.message().await.unwrap().unwrap());
+    let first = chunk(stream.message().bounded().await.unwrap().unwrap());
     let logprobs = first.output_logprobs.expect("chunk logprobs");
     assert_eq!(logprobs.token_logprobs, vec![-0.5]);
     assert_eq!(logprobs.top_logprobs[0].token_ids, vec![10, 12]);
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     let logprobs = done.output_logprobs.expect("complete logprobs");
     assert_eq!(logprobs.token_ids, vec![10]);
     assert_eq!(logprobs.top_logprobs.len(), 1);
@@ -589,7 +589,7 @@ async fn a_scheduler_refusal_is_the_callers_error() {
     refusal.finished_messages = vec![Some("n=2 is not served on this wire".to_string())];
     refusal.finished_status = vec![Some(400)];
     send(&mut h.engine_out, &refusal).await;
-    let error = stream.message().await.expect_err("a status");
+    let error = stream.message().bounded().await.expect_err("a status");
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(error.message().contains("n=2 is not served"), "{error}");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
@@ -678,7 +678,7 @@ async fn info_rpcs_report_launcher_facts_and_handshake_figures() {
         &batch("r8", vec![10], 1, None, Some((1, 2, 50, 1000))),
     )
     .await;
-    chunk(stream.message().await.unwrap().unwrap());
+    chunk(stream.message().bounded().await.unwrap().unwrap());
     let busy = h
         .client
         .get_loads(sg::GetLoadsRequest {
@@ -908,7 +908,7 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
         ..batch("p1", vec![10], 1, None, None)
     };
     send(&mut h.engine_out, &first).await;
-    let chunk1 = chunk(stream.message().await.unwrap().unwrap());
+    let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(chunk1.reasoning_tokens, 1);
     let input = chunk1
         .input_logprobs
@@ -923,19 +923,19 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
         ..batch("p1", vec![11], 2, Some("stop"), None)
     };
     send(&mut h.engine_out, &last).await;
-    let chunk2 = chunk(stream.message().await.unwrap().unwrap());
+    let chunk2 = chunk(stream.message().bounded().await.unwrap().unwrap());
     assert!(
         chunk2.input_logprobs.is_none(),
         "prompt logprobs go out once"
     );
     assert_eq!(chunk2.reasoning_tokens, 2);
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.reasoning_tokens, 2);
     assert_eq!(
         done.input_logprobs.map(|input| input.token_ids),
         Some(vec![1, 2, 3])
     );
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -996,7 +996,7 @@ async fn subscribe_kv_events_relays_a_configured_publisher() {
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
     let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(event) = monitor.next().await {
+        while let Some(event) = monitor.next().bounded().await {
             if matches!(event, SocketEvent::Disconnected(_)) {
                 return true;
             }

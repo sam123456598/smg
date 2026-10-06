@@ -43,7 +43,7 @@ use tonic_health::pb::{
 use zip::{CompressionMethod, ZipArchive};
 
 use super::*;
-use crate::{kv_events, tokenizer_bundle, ServicerError};
+use crate::{kv_events, testing::Bounded, tokenizer_bundle, ServicerError};
 
 fn model_info() -> VllmModelInfo {
     VllmModelInfo {
@@ -413,7 +413,7 @@ async fn streams_chunks_then_a_cumulative_complete() {
         .await
         .unwrap();
     assert_eq!(
-        chunk_tokens(stream.message().await.unwrap().unwrap()),
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![10]
     );
 
@@ -444,14 +444,14 @@ async fn streams_chunks_then_a_cumulative_complete() {
         .await
         .unwrap();
     assert_eq!(
-        chunk_tokens(stream.message().await.unwrap().unwrap()),
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![11]
     );
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.output_ids, vec![10, 11]);
     assert_eq!(done.finish_reason, "length");
     assert_eq!(done.completion_tokens, 2);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
 }
 
 /// A non-streaming request gets the terminal `Complete` only, as from the
@@ -479,10 +479,10 @@ async fn non_streaming_yields_only_the_complete() {
         ))
         .await
         .unwrap();
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.output_ids, vec![10, 11]);
     assert_eq!(done.finish_reason, "stop");
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
 }
 
 /// EngineCore cannot match string stops: the servicer strips them from the
@@ -521,14 +521,14 @@ async fn string_stops_are_matched_by_the_servicer() {
         .unwrap();
 
     assert_eq!(
-        chunk_tokens(stream.message().await.unwrap().unwrap()),
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![1]
     );
     assert_eq!(
-        chunk_tokens(stream.message().await.unwrap().unwrap()),
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![2]
     );
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(done.output_ids, vec![1, 2]);
     assert_eq!(
@@ -537,7 +537,7 @@ async fn string_stops_are_matched_by_the_servicer() {
             "Hello world".to_string()
         ))
     );
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     // The engine is still generating from its point of view: it gets the
     // abort for the choice the servicer ended.
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r3".to_string()]);
@@ -580,15 +580,15 @@ async fn an_engine_finish_on_the_matching_tick_keeps_the_engine_complete() {
 
         if streaming {
             assert_eq!(
-                chunk_tokens(stream.message().await.unwrap().unwrap()),
+                chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
                 vec![1]
             );
             assert_eq!(
-                chunk_tokens(stream.message().await.unwrap().unwrap()),
+                chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
                 vec![2]
             );
         }
-        let done = complete(stream.message().await.unwrap().unwrap());
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
         assert_eq!(done.output_ids, vec![1, 2], "streaming={streaming}");
         assert_eq!(done.finish_reason, "stop");
         assert_eq!(done.completion_tokens, 2);
@@ -596,7 +596,7 @@ async fn an_engine_finish_on_the_matching_tick_keeps_the_engine_complete() {
             done.matched_stop,
             Some(vllm::generate_complete::MatchedStop::MatchedTokenId(2))
         );
-        assert!(stream.message().await.unwrap().is_none());
+        assert!(stream.message().bounded().await.unwrap().is_none());
     }
 }
 
@@ -633,7 +633,7 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         .await
         .unwrap();
     assert_eq!(
-        chunk_tokens(stream.message().await.unwrap().unwrap()),
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![10]
     );
 
@@ -645,10 +645,10 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         .expect("abort");
     // Ends as on the Python servicer: a terminal `abort` Complete with the
     // output so far, then the stream closes; the engine side is aborted.
-    let aborted = complete(stream.message().await.unwrap().unwrap());
+    let aborted = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(aborted.finish_reason, "abort");
     assert_eq!(aborted.output_ids, vec![10]);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r4".to_string()]);
     // An unknown id is a no-op, not an error (idempotent cleanup).
     h.client
@@ -695,7 +695,7 @@ async fn kv_transfer_params_pass_through_both_ways() {
         }));
     }
     h.engine_out.send_outputs(&outputs).await.unwrap();
-    let finished = complete(stream.message().await.unwrap().unwrap());
+    let finished = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(finished.finish_reason, "length");
     let returned: serde_json::Value = serde_json::from_str(
         finished
@@ -709,7 +709,7 @@ async fn kv_transfer_params_pass_through_both_ways() {
     let legacy = finished.kv_transfer_params.expect("legacy mirror");
     assert_eq!(legacy.remote_host, "10.0.0.1");
     assert_eq!(legacy.remote_port, 5600);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -896,11 +896,11 @@ async fn string_stops_wait_for_min_tokens() {
     }
     for expected in [1, 2, 1, 2] {
         assert_eq!(
-            chunk_tokens(stream.message().await.unwrap().unwrap()),
+            chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
             vec![expected]
         );
     }
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(done.output_ids, vec![1, 2, 1, 2]);
     assert_eq!(
@@ -909,7 +909,7 @@ async fn string_stops_wait_for_min_tokens() {
             "Hello world".to_string()
         ))
     );
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mt1".to_string()]);
 }
 
@@ -937,11 +937,11 @@ async fn string_stops_may_span_the_min_tokens_boundary() {
     }
     for _ in 0..3 {
         assert_eq!(
-            chunk_tokens(stream.message().await.unwrap().unwrap()),
+            chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
             vec![2]
         );
     }
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(done.output_ids, vec![2, 2, 2]);
     assert_eq!(
@@ -950,7 +950,7 @@ async fn string_stops_may_span_the_min_tokens_boundary() {
             "world world".to_string()
         ))
     );
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mt2".to_string()]);
 }
 
@@ -981,7 +981,7 @@ async fn spec_decode_counts_reach_the_complete() {
         });
     }
     h.engine_out.send_outputs(&outputs).await.unwrap();
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.output_ids, vec![5, 6]);
     assert_eq!(done.spec_accepted_tokens, 5);
     assert_eq!(done.spec_draft_tokens, 9);
@@ -1486,7 +1486,7 @@ async fn get_tokenizer_streams_a_bundle_the_router_loader_accepts() {
         .expect("get_tokenizer")
         .into_inner();
     let mut chunks = Vec::new();
-    while let Some(chunk) = stream.message().await.unwrap() {
+    while let Some(chunk) = stream.message().bounded().await.unwrap() {
         chunks.push(chunk);
     }
     let (last, full) = chunks.split_last().expect("at least one chunk");
@@ -1684,7 +1684,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
     let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(event) = monitor.next().await {
+        while let Some(event) = monitor.next().bounded().await {
             if matches!(event, SocketEvent::Disconnected(_)) {
                 return true;
             }
@@ -2508,8 +2508,8 @@ async fn a_pd_prefill_leg_returns_the_media_identity() {
         ))
         .await
         .unwrap();
-    let _chunk = stream.message().await.unwrap().unwrap();
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let _chunk = stream.message().bounded().await.unwrap().unwrap();
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.media_identity, Some(identity));
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

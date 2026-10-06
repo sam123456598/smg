@@ -33,7 +33,7 @@ use tonic_health::pb::{
 };
 
 use super::*;
-use crate::{kv_events, ServicerError};
+use crate::{kv_events, testing::Bounded, ServicerError};
 
 fn model_info() -> TokenSpeedModelInfo {
     TokenSpeedModelInfo {
@@ -401,18 +401,18 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
     )
     .await;
 
-    let first = stream.message().await.unwrap().unwrap();
+    let first = stream.message().bounded().await.unwrap().unwrap();
     assert_eq!(first.request_id, "r1");
     assert_eq!(chunk_tokens(first), vec![10]);
-    let second = stream.message().await.unwrap().unwrap();
+    let second = stream.message().bounded().await.unwrap().unwrap();
     assert_eq!(chunk_tokens(second), vec![11]);
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "length");
     assert_eq!(done.output_ids, vec![10, 11]);
     assert_eq!(done.prompt_tokens, 3);
     assert_eq!(done.completion_tokens, 2);
     assert_eq!(done.index, 0);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -433,10 +433,10 @@ async fn non_streaming_generate_delivers_only_the_complete() {
         &batch("r2", vec![11, 12], 3, Some("stop"), None),
     )
     .await;
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(done.output_ids, vec![10, 11, 12]);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -466,14 +466,14 @@ async fn string_stops_are_matched_by_the_servicer() {
     send(&mut h.engine_out, &batch("r3", vec![2], 2, None, None)).await;
 
     assert_eq!(
-        chunk_tokens(stream.message().await.unwrap().unwrap()),
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![1]
     );
     assert_eq!(
-        chunk_tokens(stream.message().await.unwrap().unwrap()),
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![2]
     );
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(done.output_ids, vec![1, 2]);
     assert_eq!(
@@ -482,7 +482,7 @@ async fn string_stops_are_matched_by_the_servicer() {
             "Hello world".to_string()
         ))
     );
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r3".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -508,10 +508,10 @@ async fn a_single_token_stop_reaches_the_scheduler_as_a_stop_id() {
         &batch("r3b", vec![2], 2, Some("stop"), None),
     )
     .await;
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(done.output_ids, vec![7, 2]);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -543,7 +543,7 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
     recv_add(&mut h.engine_in).await;
     send(&mut h.engine_out, &batch("r4", vec![10], 1, None, None)).await;
     assert_eq!(
-        chunk_tokens(stream.message().await.unwrap().unwrap()),
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![10]
     );
 
@@ -559,10 +559,10 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
     assert!(response.success);
     // Ends as on the Python servicer: a terminal `abort` Complete with the
     // output so far, then the stream closes; the scheduler side is aborted.
-    let aborted = complete(stream.message().await.unwrap().unwrap());
+    let aborted = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(aborted.finish_reason, "abort");
     assert_eq!(aborted.output_ids, vec![10]);
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r4".to_string()]);
     // An unknown id is a no-op, not an error (idempotent cleanup).
     h.client
@@ -625,7 +625,7 @@ async fn choices_fan_out_under_the_parent_id() {
     .await;
     let mut seen = Vec::new();
     for _ in 0..4 {
-        let response = stream.message().await.unwrap().unwrap();
+        let response = stream.message().bounded().await.unwrap().unwrap();
         assert_eq!(response.request_id, "r6");
         match response.response.unwrap() {
             ts::generate_response::Response::Chunk(chunk) => {
@@ -646,7 +646,7 @@ async fn choices_fan_out_under_the_parent_id() {
             (1, vec![21], true),
         ]
     );
-    assert!(stream.message().await.unwrap().is_none());
+    assert!(stream.message().bounded().await.unwrap().is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -669,7 +669,15 @@ async fn logprobs_pass_through_and_the_unsupported_kinds_are_refused() {
     step.output_token_logprobs_val = vec![vec![-0.5]];
     step.output_token_logprobs_idx = vec![vec![10]];
     send(&mut h.engine_out, &step).await;
-    let chunk = match stream.message().await.unwrap().unwrap().response.unwrap() {
+    let chunk = match stream
+        .message()
+        .bounded()
+        .await
+        .unwrap()
+        .unwrap()
+        .response
+        .unwrap()
+    {
         ts::generate_response::Response::Chunk(chunk) => chunk,
         other @ ts::generate_response::Response::Complete(_) => {
             panic!("expected a chunk, got {other:?}")
@@ -678,7 +686,7 @@ async fn logprobs_pass_through_and_the_unsupported_kinds_are_refused() {
     let logprobs = chunk.output_logprobs.expect("chunk logprobs");
     assert_eq!(logprobs.token_ids, vec![10]);
     assert!((logprobs.token_logprobs[0] + 0.5).abs() < 1e-6);
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.output_logprobs.unwrap().token_ids, vec![10]);
 
     let mut request = generate_request("lp2", true, Vec::new());
@@ -804,7 +812,7 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         &batch("ld", vec![11], 2, Some("length"), Some((2, 1, 10, 100))),
     )
     .await;
-    let done = complete(stream.message().await.unwrap().unwrap());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(done.output_ids, vec![10, 11]);
     let idle = h
         .client

@@ -31,6 +31,8 @@ mod requests;
 mod server;
 pub mod sglang;
 mod stop_match;
+#[cfg(test)]
+mod testing;
 mod tokenizer_bundle;
 pub mod tokenspeed;
 pub mod vllm;
