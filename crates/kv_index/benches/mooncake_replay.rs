@@ -1145,6 +1145,13 @@ struct Args {
     /// the set; a diagnostic for scheduler effects, not Dynamo's method.
     #[arg(long)]
     pin_event_lanes: bool,
+    /// Give each worker's events to the issuer whose lane range holds the worker's lane (issuer k
+    /// feeds lanes [k * lanes / issuers, (k + 1) * lanes / issuers)) instead of Dynamo's contiguous
+    /// worker-id ranges; with `--pin-event-lanes` and the issuer CPUs listed in lane order every
+    /// issuer then sits on the socket of the lanes it feeds. A two-socket diagnostic, not Dynamo's
+    /// method.
+    #[arg(long)]
+    issuer_by_lane: bool,
     /// Charge what Dynamo's harness charges every backend: each event arrives as an owned payload
     /// in Dynamo's block layout (40 bytes per block, allocated before the trial) that the lane
     /// converts into this crate's blocks and frees after the apply, and each lookup copies its
@@ -1302,7 +1309,11 @@ fn run<B: ReplayBackend>(
                 .entry((op.worker, op.dp_rank()))
                 .or_insert((next % args.event_lanes) as u16);
             event_lane_expected[lane as usize] += 1;
-            let shard = event_issuer_for(op.worker, corpus.logical_workers, issuer_threads);
+            let shard = if args.issuer_by_lane {
+                (lane as usize) * issuer_threads / args.event_lanes
+            } else {
+                event_issuer_for(op.worker, corpus.logical_workers, issuer_threads)
+            };
             // Under --mirror-dynamo-costs the payload is built here, before the trial, as Dynamo's
             // preparation builds the owned events its issuers move to the lanes.
             let payload = match op.kind {
@@ -1740,6 +1751,7 @@ fn run<B: ReplayBackend>(
         "rejected_events": failed_events,
         "issuer_cpu_ns": issuer_cpu_ns,
         "pin_event_lanes": args.pin_event_lanes,
+        "issuer_by_lane": args.issuer_by_lane,
         "event_lane_cpu_ms": event_lane_cpu_ms,
         "event_lane_events": event_lane_events,
         "event_lane_last_finished_ms": event_lane_last_finished_ms,
