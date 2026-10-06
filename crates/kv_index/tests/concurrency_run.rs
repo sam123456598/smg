@@ -266,10 +266,11 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
     let reader_lookups = AtomicU64::new(0);
 
     thread::scope(|scope| {
+        let mut lane_threads = Vec::with_capacity(lanes);
         for lane in 0..lanes {
             let (index, pool, clock, logs) = (&index, &pool, &clock, &logs);
             let seed = rng.next();
-            scope.spawn(move || {
+            lane_threads.push(scope.spawn(move || {
                 let worker = index
                     .intern_worker(&format!("lane-{lane}-0"))
                     .expect("worker slot");
@@ -289,7 +290,7 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
                     state.step();
                 }
                 logs.lock().unwrap().extend(state.log);
-            });
+            }));
         }
         for reader in 0..4usize {
             let (index, pool, stop, reader_lookups) = (&index, &pool, &stop, &reader_lookups);
@@ -318,12 +319,12 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
                 }
             });
         }
-        // Lanes are finite; readers stop once the lanes have logged.
-        loop {
-            thread::sleep(std::time::Duration::from_millis(20));
-            if logs.lock().unwrap().len() >= lanes * steps {
-                break;
-            }
+        // Lanes are finite; the readers stop once every lane has returned. The log length is
+        // not a completion signal: a removal that finds nothing held logs nothing and the
+        // two-turn store logs twice, so a run whose count ended short of `lanes * steps` waited
+        // here forever with the readers spinning.
+        for lane in lane_threads {
+            lane.join().expect("a lane panicked");
         }
         stop.store(true, Ordering::Relaxed);
     });
