@@ -97,6 +97,8 @@ pub struct TokenSpeedServicerConfig {
     pub ipc_base_url: String,
     /// `tcp://host:port` the headless scheduler dials for the handshake (its
     /// `--data-parallel-address`/`--data-parallel-rpc-port`).
+    /// An `ipc://<path>` endpoint is accepted too: one per test, so parallel
+    /// tests never share a probed TCP port.
     pub handshake_address: String,
     /// Engines that will dial in (the attention data-parallel size).
     pub engine_count: usize,
@@ -201,8 +203,12 @@ impl TokenSpeedServicerServer {
         if !config.ipc_base_url.starts_with("ipc://") {
             return Err(invalid("ipc_base_url must be ipc://<path>"));
         }
-        if !config.handshake_address.starts_with("tcp://") {
-            return Err(invalid("handshake_address must be tcp://host:port"));
+        if !config.handshake_address.starts_with("tcp://")
+            && !config.handshake_address.starts_with("ipc://")
+        {
+            return Err(invalid(
+                "handshake_address must be tcp://host:port or ipc://<path>",
+            ));
         }
         if config.engine_count == 0 {
             return Err(invalid("engine_count must be positive"));

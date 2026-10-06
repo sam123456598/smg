@@ -11,7 +11,10 @@ use std::{
 use bytes::Bytes;
 use engine_zmq_client::{
     codec::{decode_msgpack, encode_msgpack},
-    mock_engine::{connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput},
+    mock_engine::{
+        connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput,
+        MOCK_DEADLINE,
+    },
     protocol::tokenspeed::{
         output::BatchTokenIDOutSlim,
         request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
@@ -19,7 +22,6 @@ use engine_zmq_client::{
     EngineId,
 };
 use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
-use portpicker::pick_unused_port;
 use prost_types::value::Kind;
 use smg_grpc_client::{
     common_proto as common,
@@ -73,11 +75,33 @@ fn config(
     }
 }
 
-fn handshake_address() -> String {
-    format!(
-        "tcp://127.0.0.1:{}",
-        pick_unused_port().expect("a free handshake port")
-    )
+/// The handshake endpoint of one test: an IPC socket under its own
+/// directory. A probed TCP port is not reserved, so two tests running in
+/// parallel could pick the same one and a mock engine would handshake with
+/// the other test's servicer and wait forever for its INIT.
+fn handshake_address(dir: &std::path::Path) -> String {
+    format!("ipc://{}", dir.join("handshake").display())
+}
+
+/// The handshake endpoint is free again: ZMQ unlinks the ipc socket file once
+/// the bound socket is dropped, so a fresh listener can take the path.
+async fn assert_handshake_released(handshake: &str) {
+    use std::os::unix::net::UnixListener;
+    let path = handshake.trim_start_matches("ipc://");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::metadata(path).is_ok() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    UnixListener::bind(path).expect("handshake endpoint released");
+}
+
+/// The port a socket bound to `tcp://127.0.0.1:0` was given.
+fn bound_port(endpoint: &str) -> u16 {
+    endpoint
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .expect("a bound tcp endpoint ends with its port")
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -88,6 +112,17 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("condition not met within 10s");
+}
+
+/// A channel to the servicer whose every request fails after [`MOCK_DEADLINE`]
+/// instead of waiting on a servicer that never answers.
+async fn grpc_channel(address: impl std::fmt::Display) -> Channel {
+    Channel::from_shared(format!("http://{address}"))
+        .expect("grpc address")
+        .timeout(MOCK_DEADLINE)
+        .connect()
+        .await
+        .expect("grpc client")
 }
 
 /// A bound servicer, a handshaken mock scheduler, and a gRPC client.
@@ -101,7 +136,7 @@ struct Harness {
 
 async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer>>) -> Harness {
     let dir = tempfile::tempdir().unwrap();
-    let handshake = handshake_address();
+    let handshake = handshake_address(dir.path());
     let config = config(dir.path(), &handshake, model);
     let server = match tokenizer {
         Some(tokenizer) => TokenSpeedServicerServer::start_with_tokenizer(config, tokenizer),
@@ -116,9 +151,7 @@ async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer
     .await
     .expect("mock scheduler handshake");
     wait_until(|| server.engine_ready()).await;
-    let client = TokenSpeedSchedulerClient::connect(format!("http://{}", server.address()))
-        .await
-        .expect("grpc client");
+    let client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
     let (engine_in, engine_out) = engine.split();
     Harness {
         server,
@@ -234,7 +267,7 @@ fn config_is_validated_before_binding() {
         (
             "handshake",
             TokenSpeedServicerConfig {
-                handshake_address: "ipc://x".into(),
+                handshake_address: "udp://x".into(),
                 ..good.clone()
             },
         ),
@@ -273,7 +306,7 @@ fn config_is_validated_before_binding() {
 #[tokio::test]
 async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     let dir = tempfile::tempdir().unwrap();
-    let handshake = handshake_address();
+    let handshake = handshake_address(dir.path());
     let server = TokenSpeedServicerServer::start(config(dir.path(), &handshake, model_info()))
         .expect("servicer starts");
     let address = format!("http://{}", server.address());
@@ -833,12 +866,14 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
 
     use crate::kv_events::golden;
 
-    let port = pick_unused_port().expect("a free publisher port");
     let mut publisher = PubSocket::new();
-    publisher
-        .bind(&format!("tcp://127.0.0.1:{port}"))
-        .await
-        .expect("publisher binds");
+    let port = bound_port(
+        &publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("publisher binds")
+            .to_string(),
+    );
     let mut model = model_info();
     model.kv_events_endpoint = format!("tcp://*:{port}");
     model.kv_events_topic = "kv".to_string();
@@ -909,18 +944,22 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
 
     use crate::kv_events::golden;
 
-    let pub_port = pick_unused_port().expect("a free publisher port");
-    let replay_port = pick_unused_port().expect("a free replay port");
     let mut publisher = PubSocket::new();
-    publisher
-        .bind(&format!("tcp://127.0.0.1:{pub_port}"))
-        .await
-        .expect("publisher binds");
+    let pub_port = bound_port(
+        &publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("publisher binds")
+            .to_string(),
+    );
     let mut router = RouterSocket::new();
-    router
-        .bind(&format!("tcp://127.0.0.1:{replay_port}"))
-        .await
-        .expect("replay socket binds");
+    let replay_port = bound_port(
+        &router
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("replay socket binds")
+            .to_string(),
+    );
     let mut model = model_info();
     model.kv_events_endpoint = format!("tcp://*:{pub_port}");
     model.kv_events_replay_endpoint = format!("tcp://*:{replay_port}");
@@ -1010,11 +1049,11 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
 
 /// A scheduler that never dials in fails the link at the configured bound (not
 /// a fixed one: a cold kernel cache makes a real start exceed ten minutes), the
-/// server stays up to report it, and `stop` releases the handshake port.
+/// server stays up to report it, and `stop` releases the handshake endpoint.
 #[tokio::test]
 async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     let dir = tempfile::tempdir().unwrap();
-    let handshake = handshake_address();
+    let handshake = handshake_address(dir.path());
     let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
         engine_startup_timeout: Duration::from_millis(300),
         ..config(dir.path(), &handshake, model_info())
@@ -1036,6 +1075,5 @@ async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     );
 
     server.stop(Duration::from_secs(5)).unwrap();
-    let port = handshake.rsplit(':').next().unwrap();
-    std::net::TcpListener::bind(format!("127.0.0.1:{port}")).expect("handshake port released");
+    assert_handshake_released(&handshake).await;
 }
