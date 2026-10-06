@@ -38,10 +38,13 @@ current date, reasoning level and channels, then the developer turn) is shared b
    copy counting (a store when the first copy appears, a removal when the last goes, which is how the gateway's monitor
    counts copies per tier) all 148,157 stores are accepted and 296,314 lookups (every chain head) score identically in
    both indexers.
-2. **Production misses 24-32 blocks.** On the copy-counted two-group feed the production index ends with 8,261 blocks
-   against the reference's 8,293 (32 missing, at positions 4 and 5, 0 phantom); on the window-group-only feed 424 against
-   448 (24 missing); on the full-attention-only feed 8,745 against 8,745. The sampled lookups did not change score. This
-   is the run-index lane's item, with the feed files kept beside the capture.
+2. **Engine-hash twins from head-aligned decoding (closed).** The first decoding of this capture sliced the window
+   group's `token_ids` from the head (item 3 explains why that is wrong), so its feeds carried stores of an engine hash
+   under a content hash that was not the block's; on those feeds the production index ended 32 blocks short of the
+   reference on the copy-counted two-group feed and 24 short on the window-group-only feed, exact on the full-attention
+   feed. The index lane re-read the capture with the window events decoded tail-aligned (hashes = the last
+   `len(block_hashes)` blocks of `token_ids`) and all three feeds are exact: 8,738 / 8,738, 441 / 441 and 8,745 / 8,745,
+   content conflicts down from 6,267 to 131, no shortfall. Nothing is open on the index side from this corpus.
 3. **Window-group events are tail-aligned.** A window-group `BlockStored` carries the token ids of the whole span the
    request computed but lists only the hashes of the blocks inside the window: in 2,179 of 2,200 events the listed hashes
    belong to the last `len(block_hashes) x 16` tokens of `token_ids`, not the first. Read head-aligned, 5,629 of the
@@ -63,7 +66,7 @@ current date, reasoning level and channels, then the developer turn) is shared b
    a four-block overlap for every later request; fed copy-counted events they hold the chains. Where the second copy
    is collapsed on the live path (the relay's live-block store, the normalizer, or the monitor's copy accounting) is
    what the re-run on the group-aware wheel, with its drop reasons and hash counters in the relay-closed line, has to
-   say; the oracle's position-4 and -5 discrepancy (item 2) sits at the same fork and is the run-index lane's item.
+   say; the position-4 and -5 shortfall first seen in the oracle (item 2) was the head-aligned decoding, not the index.
 4. **Relay paths on this stream.** Late join: the relay started with the first `cache_aware` subscription after 385
    batches, applied 361 live batches and never learned what was stored before (relay-closed line `relayed: 747,
    served_snapshots: 1, publisher_gaps: 0, live_blocks=8201` against 8,745 hashes live in the engine). That is the
@@ -107,9 +110,21 @@ lookup and the stored blocks hash the same ids, which is what the 228-of-228 ove
 Attribution (A/B): the 85f9d28c servicer wheel under the same 823792b5 gateway brings the cap back in full: phase 2
 `event_hit` 61 (all at 4 blocks) / `event_miss` 199, router credit 0.003 of the prompt against engine reuse 0.518; phase 3
 30 / 235, credit 0.001 against 0.503; `agree` 0 of 525; the trace prompt's second send alone matched 228 blocks (a fresh
-chain, no eviction involved). The four-block cap was therefore on the servicer side of 85f9d28c (what the relay forwarded
-or how the normalizer chained stores after a copy's removal), not in the gateway's index, and 823792b5 removes it. The
-servicer lane names the mechanism from its side; this run closes the question for the harness.
+chain, no eviction involved). The four-block cap was therefore on the servicer side of 85f9d28c, not in the gateway's index, and
+823792b5 removes it. The mechanism, named by the servicer lane and consistent with every number above: the 85f9d28c relay
+subscribed to the engine's publisher only at the first `SubscribeKvEvents`, and vLLM publishes a `BlockStored` only when
+a block is first stored (a cache hit re-stores nothing). The phase-2 gateway therefore received a live stream that began
+at batch 385 (relayed 747 = 1,132 - 385, live_blocks 8,201 against 8,745 in the engine) and never learned the blocks the
+engine already held; the warm prefixes of the replayed prompts hit in the engine without a single new event, while the
+only warm blocks the relay did see were the ones the engine stored again after batch 385, the shared preamble among them
+(its second copy at seq 385: the four blocks every hit stopped at). Phase 3's snapshot was a snapshot of that same partial
+relay state, so the cap stayed; a fresh prompt's chain is stored during the phase, which is why the trace prompt matched
+228 of 228 on the old wheel too. The 823792b5 wheel starts the relay when the servicer starts serving and primes it from
+the publisher's replay (a926881d), so its state covers the engine's whole life and the snapshot it serves a late gateway
+is complete. The group policy and the second copies moved nothing: both wheels dropped the same 8,077 window events and
+forwarded the second copies. For the harness this is the same lesson as the history window: a gateway started on a warm
+engine is only as complete as the relay's own record of that engine, and `hash_unverifiable` stays the one counter that
+still reads the single-copy cascade (the checker's parent memory; a copy-counted record is proposed).
 
 ## Next
 
