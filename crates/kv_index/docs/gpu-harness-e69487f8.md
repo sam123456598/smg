@@ -8,7 +8,7 @@ and build of the previous rounds was gone; podman stays unused. Everything below
 ## 1. Build and install
 
 `/tmp/wt-leap-gpu-harness-head` was already detached at e69487f8 (clean, on `origin/perf/kv-router-leap`) with `smg` and
-`replay` built into `~/.cargo/target-leap-gpu-harness-head/release/` (a `cargo build --release -p smg -p replay` was a
+`replay` built into `~/.cargo/target-leap-gpu-harness-head/release/` (a `cargo build --release -p smg -p mock-worker --bins` was a
 no-op, 0.6 s), so no second worktree was made. The binding wheel was built from that tree
 (`scripts/build-head6.sh`: maturin `--release --features vendored-openssl --compatibility linux`, 6 m 25 s) into
 `~/smg-perf/gpu/wheels-head5/smg-1.11.0-cp38-abi3-linux_aarch64.whl` and installed with `smg-grpc-proto`

@@ -1,6 +1,6 @@
 # T9: the mock engine against the GB300 fleet (2026-10-05)
 
-Goal T9 of the leap contract asks the simulation (the `mock-worker` realistic engine driven by `crates/replay`)
+Goal T9 of the leap contract asks the simulation (the `mock-worker` realistic engine driven by its `replay` binary)
 and the hardware runs to agree on direction and within 15% on magnitude for the T4/T5 metrics. This is the
 first complete comparison: same input (Mooncake rows 0-1999), same replayer, same gateway family, both fleet
 settings the hardware was measured in, three runs per policy on the mock against the hardware tables.
@@ -8,7 +8,7 @@ settings the hardware was measured in, three runs per policy on the mock against
 ## Method
 
 - Input: `~/dynamo/lib/kv-router/traces/mooncake_trace.jsonl` rows 0-1999 at `--speedup 3` (trace span 342 s,
-  about 117 s per run), `crates/replay` with 480 words per block and 512 max output tokens, streaming chat
+  about 117 s per run), the `replay` binary of `crates/mock_worker` with 480 words per block and 512 max output tokens, streaming chat
   completions with `include_usage`; 50 rows exceed the 40,960-token context and are rejected by the gateway in
   every run on both sides (1,950 served / 50 errors everywhere). SLO: 500 ms TTFT and 50 ms mean ITL per request.
 - Gateway: loop head 35e06a3e plus the allocator-defaults commit (2684a14d on `perf/kv-router-leap`), inference-

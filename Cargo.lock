@@ -4390,12 +4390,16 @@ dependencies = [
 name = "mock-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "clap",
  "engine-servicer",
  "engine-zmq-client",
  "futures",
+ "reqwest 0.13.4",
  "rmp-serde",
  "rmpv",
+ "serde",
  "serde_json",
  "smg-grpc-client",
  "tempfile",
@@ -6536,19 +6540,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "replay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "futures",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "tokio",
-]
 
 [[package]]
 name = "reqwest"

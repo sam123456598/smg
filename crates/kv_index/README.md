@@ -225,6 +225,6 @@ budget, a block-level KV pool with reference counts, LRU and LIFO preemption, ad
 the whole prompt fits, tail-first frees, KV events per pass on the gRPC stream and on the engines'
 own ZMQ wires (`--kv-events-zmq-base-port`, `--kv-events-wire vllm|sglang`), an admin API with
 fault hooks (drop, delay, publisher restart, pause) and engine truth, and timing from a
-calibration file. `crates/replay` replays a Mooncake-style trace through the gateway and scores
+calibration file. The `replay` binary of `crates/mock_worker` replays a Mooncake-style trace through the gateway and scores
 every decision against the fleet's arrival-time oracle and the engines' own cached-token counts.
 Both crates' READMEs describe their flags.
