@@ -16,7 +16,10 @@
 //! (default 10,000) for `T6_SECS` seconds (default 12, the first 2 discarded)
 //! on whatever core the process is pinned to, reporting p50/p99/p999 over the
 //! decisions with the lookup's and the hashing's own distributions beside
-//! them. `T6_WORKERS` (128) and `T6_BLOCKS_PER_WORKER` (8192) size the fleet.
+//! them. `T6_WORKERS` (128) and `T6_BLOCKS_PER_WORKER` (8192) size the fleet;
+//! `T6_INDEX=positional|run` runs one backend alone, which is how the index's
+//! RSS delta is measured (the second backend in a process reuses the first's
+//! freed pages and reads zero).
 //!
 //! Run with (one pinned core, outside the measurement set):
 //!   taskset -c 100 cargo bench -p smg --bench kv_index_decision
@@ -511,7 +514,16 @@ fn main() {
          lookup p50 | lookup p99 | lookup share | hash p50 | hash p99 | req tokens p50 | p99 |"
     );
     eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    // `T6_INDEX=positional|run` runs one backend in its own process: the second
+    // backend in one process reuses the pages the first freed, so its RSS
+    // delta reads zero.
+    let only = std::env::var("T6_INDEX")
+        .ok()
+        .and_then(|value| KvIndexKind::parse(&value));
     for kind in [KvIndexKind::Positional, KvIndexKind::Run] {
+        if only.is_some_and(|only| only != kind) {
+            continue;
+        }
         let setup = setup(kind, workers, blocks_per_worker);
         let mut r = 0usize;
         criterion.bench_function(&format!("decision/{kind:?}"), |b| {
