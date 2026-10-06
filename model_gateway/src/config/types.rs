@@ -118,6 +118,14 @@ pub struct RouterConfig {
     pub worker_warmup_share: f32,
     #[serde(default = "default_worker_warmup_blocks")]
     pub worker_warmup_blocks: usize,
+    /// A worker whose index holds less than this share of the fleet's level
+    /// (the median over healthy workers), or nothing, is thin and receives
+    /// the warm-up slice until it has grown by `worker_warmup_blocks`,
+    /// whatever emptied it (a resync after a publisher restart, an
+    /// out-of-range or data-loss resubscription, an engine that came back
+    /// empty). 0 keeps the age rule alone.
+    #[serde(default = "default_worker_warmup_thin_ratio")]
+    pub worker_warmup_thin_ratio: f32,
     /// How long a disaggregated (PD) dispatch waits for a slot in the decode
     /// engine's running window before shedding. Must stay well under the
     /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
@@ -472,6 +480,10 @@ fn default_worker_warmup_share() -> f32 {
 
 fn default_worker_warmup_blocks() -> usize {
     1024
+}
+
+fn default_worker_warmup_thin_ratio() -> f32 {
+    0.5
 }
 
 fn default_pd_admission_wait_secs() -> u64 {
@@ -1317,6 +1329,7 @@ impl Default for RouterConfig {
             worker_warmup_secs: default_worker_warmup_secs(),
             worker_warmup_share: default_worker_warmup_share(),
             worker_warmup_blocks: default_worker_warmup_blocks(),
+            worker_warmup_thin_ratio: default_worker_warmup_thin_ratio(),
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
             worker_overload_protection: default_worker_overload_protection(),

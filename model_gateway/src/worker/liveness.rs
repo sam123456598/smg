@@ -66,25 +66,51 @@ static THRESHOLDS: OnceLock<(Duration, Duration)> = OnceLock::new();
 static WARMUP: OnceLock<Warmup> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// The warm-up slice: for `secs` after a worker becomes routable, until its
-/// index has grown by `blocks` blocks, one cache miss in `1 / share` is
-/// routed to it (the least-loaded warming worker) so it builds a cache
-/// instead of idling behind the fleet's affinity. `share == 0` disables.
+/// The warm-up slice: one cache miss in `1 / share` is routed to a warming
+/// worker (the least-loaded one) so it builds a cache instead of idling behind
+/// the fleet's affinity. A worker is warming while its index has gained fewer
+/// than `blocks` blocks since it last became thin, and it is thin for `secs`
+/// after it became routable or, whatever the fleet's age, while its index
+/// holds less than `thin_ratio` of the fleet's level (the median over healthy
+/// workers) or nothing at all: a resync after a publisher restart, an
+/// `OUT_OF_RANGE` or `DATA_LOSS`, or an engine that came back empty leaves a
+/// worker whose every prompt has an overlap elsewhere, so no miss would ever
+/// reach it otherwise. `share == 0` disables; `thin_ratio == 0` keeps the age
+/// rule alone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Warmup {
     pub secs: Duration,
     pub share: f32,
     pub blocks: usize,
+    pub thin_ratio: f32,
 }
 
 impl Warmup {
-    /// Whether a worker admitted `age` ago whose index has gained
-    /// `indexed_blocks` blocks since (`None` when the index has never seen it)
-    /// is still warming up.
-    pub(crate) fn applies(&self, age: Duration, indexed_blocks: Option<usize>) -> bool {
+    /// Whether a worker admitted `age` ago, holding `indexed` blocks against a
+    /// fleet level of `fleet_level`, whose index has gained `growth` blocks
+    /// since it last became thin (`None` when the index has never seen it),
+    /// is warming up.
+    pub(crate) fn applies(
+        &self,
+        age: Duration,
+        growth: Option<usize>,
+        indexed: usize,
+        fleet_level: usize,
+    ) -> bool {
         self.share > 0.0
-            && age < self.secs
-            && indexed_blocks.is_none_or(|blocks| blocks < self.blocks)
+            && growth.is_none_or(|blocks| blocks < self.blocks)
+            && (age < self.secs || self.is_thin(indexed, fleet_level))
+    }
+
+    /// Whether an index of `indexed` blocks is thin against the fleet's
+    /// `fleet_level`: empty, or below `thin_ratio` of the level, once the
+    /// fleet holds a cache worth catching up to (a level of at least the
+    /// warm-up `blocks`). A fleet below that (young, or tiny) makes nobody
+    /// thin; the age rule decides there.
+    pub(crate) fn is_thin(&self, indexed: usize, fleet_level: usize) -> bool {
+        self.thin_ratio > 0.0
+            && fleet_level >= self.blocks
+            && (indexed == 0 || (indexed as f64) < fleet_level as f64 * f64::from(self.thin_ratio))
     }
 
     /// Every how many misses one goes to a warming worker.
@@ -100,6 +126,7 @@ const DEFAULT_WARMUP: Warmup = Warmup {
     secs: Duration::from_secs(60),
     share: 0.25,
     blocks: 1024,
+    thin_ratio: 0.5,
 };
 
 /// Set the warm-up slice from the gateway configuration; the first call wins.
@@ -513,17 +540,14 @@ mod tests {
     #[test]
     fn warm_up_ends_with_time_or_blocks_and_slices_by_share() {
         let warmup = DEFAULT_WARMUP;
+        let s = Duration::from_secs;
+        // A young fleet: every index empty, nobody thin by comparison, the
+        // age rule decides.
+        assert!(warmup.applies(s(10), None, 0, 0), "never indexed");
+        assert!(warmup.applies(s(10), Some(100), 100, 100));
+        assert!(!warmup.applies(s(61), Some(100), 100, 100), "too old");
         assert!(
-            warmup.applies(Duration::from_secs(10), None),
-            "never indexed"
-        );
-        assert!(warmup.applies(Duration::from_secs(10), Some(100)));
-        assert!(
-            !warmup.applies(Duration::from_secs(61), Some(100)),
-            "too old"
-        );
-        assert!(
-            !warmup.applies(Duration::from_secs(10), Some(2048)),
+            !warmup.applies(s(10), Some(2048), 2048, 2048),
             "warm already"
         );
         assert_eq!(warmup.period(), 4);
@@ -531,8 +555,52 @@ mod tests {
             share: 0.0,
             ..warmup
         };
-        assert!(!off.applies(Duration::ZERO, None));
+        assert!(!off.applies(Duration::ZERO, None, 0, 0));
         assert_eq!(off.period(), u64::MAX);
+    }
+
+    #[test]
+    fn a_worker_emptied_by_a_resync_is_thin_until_it_regrows() {
+        // The soaks' case: hours after admission a publisher restart cleared
+        // the worker's index (32,739 -> 180 blocks) while the fleet held
+        // ~30,000 per worker; every prompt had an overlap elsewhere, so no
+        // miss ever reached it and it idled for good.
+        let warmup = DEFAULT_WARMUP;
+        let old = Duration::from_secs(3_600);
+        assert!(warmup.is_thin(180, 30_000));
+        assert!(
+            warmup.applies(old, Some(180), 180, 30_000),
+            "emptied: thin, 180 blocks regrown"
+        );
+        assert!(warmup.applies(old, Some(0), 0, 30_000), "empty outright");
+        assert!(
+            !warmup.applies(old, Some(1_100), 1_100, 30_000),
+            "regrown by the warm-up blocks: back to affinity, thin or not"
+        );
+        assert!(
+            !warmup.applies(old, Some(0), 20_000, 30_000),
+            "two thirds of the fleet's level is not thin at a half"
+        );
+        assert!(
+            !warmup.applies(old, None, 0, 0),
+            "an empty fleet has no level: the age rule alone, and this worker is old"
+        );
+        assert!(
+            !warmup.applies(old, Some(0), 0, 100),
+            "a fleet holding less than the warm-up blocks is not worth catching up to"
+        );
+        assert!(
+            warmup.applies(old, Some(0), 0, 1_024),
+            "at the warm-up blocks it is"
+        );
+        let age_only = Warmup {
+            thin_ratio: 0.0,
+            ..warmup
+        };
+        assert!(
+            !age_only.applies(old, Some(0), 0, 30_000),
+            "thin_ratio 0 keeps the age rule alone"
+        );
     }
 
     #[test]

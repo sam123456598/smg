@@ -638,9 +638,18 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.25, help_heading = "Routing Policy")]
     worker_warmup_share: f32,
 
-    /// A worker whose index holds this many blocks is warm.
+    /// A worker whose index has grown by this many blocks since it became
+    /// thin is warm.
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     worker_warmup_blocks: usize,
+
+    /// A worker whose index holds less than this share of the fleet's median
+    /// (or nothing) is thin and receives the warm-up slice until it has grown
+    /// by --worker-warmup-blocks, whatever emptied it (a resync after a
+    /// publisher restart, an out-of-range or data-loss resubscription, an
+    /// engine that came back empty). 0 keeps the age rule alone.
+    #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
+    worker_warmup_thin_ratio: f32,
 
     /// Only poll worker loads when a load-aware routing policy,
     /// --engine-metrics, or worker overload protection needs the data. By
@@ -2021,6 +2030,7 @@ impl CliArgs {
                 self.worker_warmup_secs,
                 self.worker_warmup_share,
                 self.worker_warmup_blocks,
+                self.worker_warmup_thin_ratio,
             )
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)

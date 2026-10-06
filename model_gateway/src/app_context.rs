@@ -699,6 +699,7 @@ impl AppContextBuilder {
             secs: Duration::from_secs(config.worker_warmup_secs),
             share: config.worker_warmup_share,
             blocks: config.worker_warmup_blocks,
+            thin_ratio: config.worker_warmup_thin_ratio,
         });
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.

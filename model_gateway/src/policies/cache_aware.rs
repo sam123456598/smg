@@ -1198,9 +1198,14 @@ struct PoolTable {
     id_at: Vec<Option<u32>>,
     /// Index id -> position.
     position_of: HashMap<u32, u32>,
-    /// Positions of the workers inside the warm-up window at the build
-    /// (admitted within it, index still thin); empty when every worker was
-    /// (a young fleet slices nothing).
+    /// The fleet's index level at the build: the upper median of the
+    /// workers' index sizes, what a thin worker is thin against.
+    fleet_level: usize,
+    /// Positions of the warm-up slice's candidates at the build: the workers
+    /// thinner than the fleet (an index emptied by a resync, or never fed)
+    /// whatever their age, else the workers inside the warm-up window
+    /// (admitted within it, index still growing) unless every worker was (a
+    /// young fleet slices nothing).
     warming: Vec<u32>,
 }
 
@@ -1220,7 +1225,7 @@ impl PoolTable {
         let mut worker_at = Vec::with_capacity(workers.len());
         let mut id_at = Vec::with_capacity(workers.len());
         let mut position_of = HashMap::with_capacity(workers.len());
-        let mut warming = Vec::new();
+        let mut sized: Vec<Option<(usize, usize)>> = Vec::with_capacity(workers.len());
         for (position, worker) in workers.iter().enumerate() {
             worker_at.push(Self::worker_address(worker));
             let id = indexer.worker_id(worker.url());
@@ -1228,25 +1233,56 @@ impl PoolTable {
             if let Some(id) = id {
                 position_of.insert(id, position as u32);
             }
-            if warmup.share > 0.0 {
-                let age = worker.admitted_age();
-                if age < warmup.secs {
-                    let grown = id.map(|id| worker.warmup_growth(indexer.worker_block_count(id)));
-                    if warmup.applies(age, grown) {
-                        warming.push(position as u32);
-                    }
+            // Index size and growth since the worker last became thin (or was
+            // admitted); the growth baseline restarts when the count drops.
+            sized.push(id.map(|id| {
+                let indexed = indexer.worker_block_count(id);
+                (indexed, worker.warmup_growth(indexed))
+            }));
+        }
+        // The fleet's level: the upper median of the sizes, so one emptied
+        // worker does not drag it down.
+        let mut sizes: Vec<usize> = sized
+            .iter()
+            .map(|sized| sized.map_or(0, |(indexed, _)| indexed))
+            .collect();
+        sizes.sort_unstable();
+        let fleet_level = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
+        let mut thin = Vec::new();
+        let mut young = Vec::new();
+        if warmup.share > 0.0 {
+            for (position, (worker, sized)) in workers.iter().zip(&sized).enumerate() {
+                let (indexed, grown) = match sized {
+                    Some((indexed, grown)) => (*indexed, Some(*grown)),
+                    None => (0, None),
+                };
+                if !warmup.applies(worker.admitted_age(), grown, indexed, fleet_level) {
+                    continue;
+                }
+                if warmup.is_thin(indexed, fleet_level) {
+                    thin.push(position as u32);
+                } else {
+                    young.push(position as u32);
                 }
             }
         }
-        if warming.len() == workers.len() {
-            warming.clear();
-        }
+        // A thin worker is a candidate whatever the fleet's age; workers
+        // warming only because they are young are candidates only when the
+        // fleet is not all young.
+        let warming = if !thin.is_empty() {
+            thin
+        } else if young.len() < workers.len() {
+            young
+        } else {
+            Vec::new()
+        };
         Self {
             slice: Self::slice_key(workers),
             built_ms: now_ms,
             worker_at,
             id_at,
             position_of,
+            fleet_level,
             warming,
         }
     }
@@ -1755,14 +1791,19 @@ impl CacheAwarePolicy {
     }
 
     /// The warm-up slice: one cache miss in `1 / share` goes to the
-    /// least-loaded worker that became routable within the warm-up window and
-    /// whose index is still thin, so a returned or new worker builds a cache
-    /// instead of idling behind the fleet's affinity (on the GB300 fleet a
-    /// restarted worker went a minute without a request). The candidates are
-    /// the pool table's: the workers inside the window at its build, so a
-    /// settled fleet pays nothing here, and with every worker warming (a
-    /// young fleet) it lists none, a miss getting a load-balanced pick anyway.
-    /// The pick is credited through the expected-wait selector like any other.
+    /// least-loaded warming worker, so a returned, new or emptied worker
+    /// builds a cache instead of idling behind the fleet's affinity (on the
+    /// GB300 fleet a restarted worker went a minute without a request; in the
+    /// soaks a worker whose index a publisher-restart resync had emptied never
+    /// saw a request again, every prompt holding an overlap elsewhere). The
+    /// candidates are the pool table's, chosen at its build (refreshed every
+    /// second): workers thinner than the fleet (see
+    /// [`liveness::Warmup::is_thin`]) whatever the fleet's age, else the
+    /// workers inside the warm-up window unless every worker is (a young
+    /// fleet slices nothing, a miss getting a load-balanced pick anyway); a
+    /// settled fleet pays nothing here. Each candidate is checked live before
+    /// the pick, and the pick is credited through the expected-wait selector
+    /// like any other.
     fn warmup_slice(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1787,13 +1828,14 @@ impl CacheAwarePolicy {
             if !state.eligible() {
                 continue;
             }
-            let age = worker.admitted_age();
-            if age >= warmup.secs {
-                continue;
-            }
-            let grown =
-                table.id_at[idx].map(|id| worker.warmup_growth(indexer.worker_block_count(id)));
-            if !warmup.applies(age, grown) {
+            let indexed = table.id_at[idx].map(|id| indexer.worker_block_count(id));
+            let grown = indexed.map(|indexed| worker.warmup_growth(indexed));
+            if !warmup.applies(
+                worker.admitted_age(),
+                grown,
+                indexed.unwrap_or(0),
+                table.fleet_level,
+            ) {
                 continue;
             }
             if pick.is_none_or(|(_, load)| state.load < load) {
@@ -2207,16 +2249,17 @@ impl CacheAwarePolicy {
         };
         // A miss for the warm-up slice is no overlap or a thin one: chat requests
         // share their template's head with every holder, which is affinity in
-        // name only. Thin is a few blocks outright (the head of a short
-        // request) or at most the tree-mode `cache_threshold` share of a
-        // long one.
+        // name only. Thin is at most the tree-mode `cache_threshold` share of
+        // the request, or a few blocks outright when they are under half of
+        // it (the head of a short request; a short request cached whole is a
+        // hit and stays with its holder).
         let best_overlap = candidates
             .iter()
             .map(|candidate| candidate.raw_score)
             .fold(0.0_f64, f64::max);
-        let thin_overlap = best_overlap <= WARMUP_MISS_BLOCKS
-            || best_overlap / request.request_blocks as f64
-                <= f64::from(self.config.cache_threshold);
+        let request_blocks = request.request_blocks as f64;
+        let thin_overlap = best_overlap / request_blocks <= f64::from(self.config.cache_threshold)
+            || (best_overlap <= WARMUP_MISS_BLOCKS && best_overlap * 2.0 < request_blocks);
         if thin_overlap {
             if let Some(idx) = self.warmup_slice(workers, &table, indexer, info) {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
@@ -5327,6 +5370,45 @@ mod tests {
             Some(0)
         );
         assert_only_final_worker_credited(&policy, &workers, 0, 8);
+    }
+
+    #[test]
+    fn a_worker_with_an_emptied_index_gets_the_warm_up_slice_whatever_its_age() {
+        // The soaks' case in miniature: w1 holds a fleet-sized cache (1,100
+        // blocks), w2's index was cleared by a resync (nothing indexed), and
+        // every request shares a head with w1, so affinity alone would never
+        // send w2 a request again. The slice does, on the thin overlap: w2 is
+        // thin against the fleet's level whatever its age.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &[0, 0]);
+        let held: Vec<u32> = (1..=4_400).collect();
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&held], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+        // w1's first block (the shared head) followed by eleven novel blocks.
+        let mut request: Vec<u32> = (1..=4).collect();
+        request.extend(90_000..90_044);
+        let picks: Vec<usize> = (0..8)
+            .map(|_| {
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: Some(&request),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            picks.contains(&1),
+            "the emptied worker got its slice of the thin-overlap requests: {picks:?}"
+        );
+        assert!(picks.contains(&0), "the holder kept the rest: {picks:?}");
     }
 
     #[test]

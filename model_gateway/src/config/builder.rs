@@ -276,10 +276,11 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn worker_warmup(mut self, secs: u64, share: f32, blocks: usize) -> Self {
+    pub fn worker_warmup(mut self, secs: u64, share: f32, blocks: usize, thin_ratio: f32) -> Self {
         self.config.worker_warmup_secs = secs;
         self.config.worker_warmup_share = share;
         self.config.worker_warmup_blocks = blocks;
+        self.config.worker_warmup_thin_ratio = thin_ratio;
         self
     }
 
