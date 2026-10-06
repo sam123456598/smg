@@ -152,3 +152,44 @@ the next mock lever, one change with a restricted-pool re-run of both policies.
 - Scripts: `~/smg-perf/replay/{run.sh,fit-compare-t9.sh,fit-table.py,t9-ratios.py}`; calibration
   `~/smg-perf/replay/fit-gb300-v2.json` (sources `qwen3-8b-gb300-vllm0.31.json`, `prefill-batch-sweep.json`,
   `scheduler-settings.json` under `~/smg-perf/gpu/results/calibration/`).
+
+## Re-run of the restricted pool with tail-first free order (2026-10-05 20:35-21:09)
+
+The eviction-order change (`BlockPool::unref_request`: a finished request's blocks enter the idle LRU tail
+first, as vLLM's `free()` does) was re-measured in the same setting with the integrated mock binary of the
+batch-3 tree (`~/smg-perf/bin/leap-int/mock-worker`, sha256 0c244a29...), the T9 series' own gateway and
+replayer, six locked runs (`t9tailk-<policy>-r{1,2,3}`).
+
+| metric | cache_aware mock | hardware | ratio | round_robin mock | hardware | ratio | direction (ca-rr) mock / hw |
+|---|---|---|---|---|---|---|---|
+| req/s | 12.25 | 14.80 | 0.83 (!) | 15.55 | 16.60 | 0.94 | - / - |
+| goodput req/s | 7.01 | 7.04 | 1.00 | 6.85 | 11.88 | 0.58 (!) | + / - (differs) |
+| within SLO % | 57.0 | 47.8 | 1.19 (!) | 44.1 | 71.5 | 0.62 (!) | + / - (differs) |
+| strict SLO % | 38.3 | 33.0 | 1.16 (!) | 13.7 | 33.0 | 0.42 (!) | + / 0 (differs) |
+| prefix reuse | 0.38 | 0.37 | 1.03 | 0.31 | 0.36 | 0.86 | + / + |
+| TTFT mean ms | 7187.5 | 4065.0 | 1.77 (!) | 1716.9 | 641.0 | 2.68 (!) | + / + |
+| TTFT p50 | 268.8 | 821.0 | 0.33 (!) | 510.7 | 245.0 | 2.08 (!) | - / + (differs) |
+| TTFT p90 | 25926.9 | 13217.0 | 1.96 (!) | 5000.9 | 1838.0 | 2.72 (!) | + / + |
+| TTFT p99 | 40470.9 | 24479.0 | 1.65 (!) | 7527.1 | 4787.0 | 1.57 (!) | + / + |
+| ITL mean ms | 20.2 | 26.1 | 0.77 (!) | 31.0 | 26.9 | 1.15 (!) | - / - |
+| ITL p90 | 26.8 | 66.1 | 0.41 (!) | 52.0 | 68.5 | 0.76 (!) | - / - |
+| ITL p99 | 117.8 | 198.1 | 0.59 (!) | 185.4 | 223.0 | 0.83 (!) | - / - |
+| e2e p50 ms | 574.6 | 3599.0 | 0.16 (!) | 3949.5 | 1258.0 | 3.14 (!) | - / + (differs) |
+| e2e p99 | 49500.8 | 30061.0 | 1.65 (!) | 18585.1 | 10317.0 | 1.80 (!) | + / + |
+
+Within 15%: 4 of 28 (11 of 28 within 25%); direction agreement 9 of 14. Means before (head-first) and after
+(tail-first): round robin reuse 0.305 → 0.313, goodput 6.54 → 6.85, TTFT p50 601 → 511 ms, p90 5,604 → 5,001;
+cache_aware reuse 0.373 → 0.376, goodput 7.32 → 7.01, TTFT mean 4,351 → 7,188 (one run with a 60 s tail; the
+mock's cache_aware at this pool swings run to run). The change is correct and kept, but it is not the lever:
+reuse moved by 0.008 against a gap of 0.05, and the goodput ratio stays at 0.58.
+
+Where the round-robin time goes (`requests.csv`, `queued_ms` = the mock's admission wait): the queue is 93% of
+TTFT at the median in every 12k run, queued p50 223-431 ms and p90 4.7-5.3 s against TTFT p50 461-602 and p90
+4.9-5.3 s; every one of the 1,950 requests waited; uncached prompt tokens average 5,200-5,300 (p90 15,400) on
+about 192,000 tokens of pool. At the full pool the same share is 0.71 with queued p50 124 ms, and there the
+mock matches the fleet. So the mock's reserve-full-input admission (a waiting prompt is admitted only when the
+pool has idle or free room for all of it beyond its cached blocks, head-of-line) serialises admission far more
+than the engine does at this pool: the fleet's round robin keeps TTFT p50 at 245 ms with 192k-token pools.
+Next lever: the admission rule itself, read from vLLM's scheduler on the fleet host (how many blocks a waiting
+request must be able to allocate to enter the running batch, chunk versus full length, lookahead, and when it
+preempts), then one change and a 12k re-run; the preemption counts are no longer the issue (17-28 per run).
