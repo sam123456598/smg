@@ -15,9 +15,11 @@ name: Bellwether Fixtures
 # the pull request that does it runs against the new commit.
 #
 # bellwether is private, so the checkout needs the BELLWETHER_READ_TOKEN secret
-# (read access to that repository's contents). A pull request from a fork
-# cannot read it: the job says so and passes without running the tests, and the
-# push to main after the merge runs them.
+# (read access to that repository's contents). A pull request from a fork, or
+# one Dependabot opened, is not given the repository's secrets: the job says so
+# and passes without running the tests, and the push to main after the merge
+# runs them. Any other run without the token fails, so a secret that is
+# missing or has expired cannot pass for tests that ran.
 on:
   push:
     branches: [ main ]
@@ -33,6 +35,7 @@ on:
       - .github/versions/bellwether.ref
       - .github/workflows/bellwether-fixtures.yml
       - .github/actions/setup-rust/**
+      - scripts/ci_install_rust.sh
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened]
@@ -48,6 +51,7 @@ on:
       - .github/versions/bellwether.ref
       - .github/workflows/bellwether-fixtures.yml
       - .github/actions/setup-rust/**
+      - scripts/ci_install_rust.sh
   workflow_dispatch:
 
 permissions:
@@ -71,7 +75,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # The tests below run this pull request's code, so the workflow token is
+      # not left in the checkout's git configuration.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # A secret cannot be read in an `if:`, so this step turns "is the token
       # there" into an output the later steps test.
@@ -79,6 +87,10 @@ jobs:
         id: pin
         env:
           BELLWETHER_READ_TOKEN: ${{ secrets.BELLWETHER_READ_TOKEN }}
+          GIVEN_NO_SECRETS: >-
+            ${{ github.event_name == 'pull_request'
+                && (github.event.pull_request.head.repo.full_name != github.repository
+                    || github.event.pull_request.user.login == 'dependabot[bot]') }}
         run: |
           ref="$(tr -d '[:space:]' < .github/versions/bellwether.ref)"
           if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
@@ -88,9 +100,12 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           if [ -n "$BELLWETHER_READ_TOKEN" ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "$GIVEN_NO_SECRETS" = "true" ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::BELLWETHER_READ_TOKEN is not available to this run, so the bellwether tests did not run."
+            echo "::notice::A pull request from a fork or from Dependabot is not given BELLWETHER_READ_TOKEN, so the bellwether tests did not run here. The push to main runs them."
+          else
+            echo "::error::BELLWETHER_READ_TOKEN is not set, so the bellwether tests cannot run. Add it as a repository secret with read access to smg-project/bellwether's contents."
+            exit 1
           fi
 
       - name: Check out bellwether
@@ -112,9 +127,11 @@ jobs:
           cache-key: bellwether-fixtures
 
       # The tests fetch each model's tokenizer files from Hugging Face once, at
-      # the revision its manifest pins, into these directories. The files
-      # depend on the manifests alone, so the key is their hash: moving the
-      # pin to a commit with the same models stores nothing new.
+      # the revision its manifest pins, into these directories. Which files
+      # are there depends on the manifests and on the list each test asks for,
+      # so the key is the hash of both: moving the pin to a commit with the
+      # same models stores nothing new, and a test that asks for one more file
+      # gets a new entry that starts from the old one.
       - name: Cache tokenizer files
         if: steps.pin.outputs.available == 'true'
         uses: actions/cache@v6
@@ -122,7 +139,7 @@ jobs:
           path: |
             crates/tokenizer/.tokenizer_cache/bellwether
             model_gateway/.tokenizer_cache/bellwether
-          key: bellwether-tokenizers-${{ hashFiles('.bellwether/fixtures/*/manifest.toml') }}
+          key: bellwether-tokenizers-${{ hashFiles('.bellwether/fixtures/*/manifest.toml', 'model_gateway/tests/bellwether_*.rs', 'crates/tokenizer/tests/bellwether_*.rs') }}
           restore-keys: |
             bellwether-tokenizers-
 
