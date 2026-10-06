@@ -21,8 +21,8 @@ grpc-server = []
 jemalloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]
 jemalloc-profiling = ["tikv-jemallocator/profiling"]
 # Measured, bench-only selection policies for the replay harness
-# (cache-aware-balanced and the comparison baseline): not part of the
-# product and never selectable without this feature.
+# (cache-aware-balanced): not part of the product and never selectable
+# without this feature.
 bench-policies = []
 opencv-video = ["llm-multimodal/opencv-video"]
 mm-rdma = ["smg-mm-rdma/nixl"]

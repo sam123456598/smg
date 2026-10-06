@@ -2,12 +2,12 @@
 //!
 //! Parameters are YAML (JSON is YAML) text; unknown parameters are rejected, so a typo cannot
 //! silently fall back to a default. The product ships one selection policy, the cache-aware
-//! default; the `bench-policies` feature adds the measured, bench-only `cache-aware-balanced`
-//! and the replay harness's comparison baseline. Without the feature those names are rejected
-//! with a message that says so, rather than read as typos.
+//! default; the `bench-policies` feature adds the measured, bench-only `cache-aware-balanced`.
+//! Without the feature that name is rejected with a message that says so, rather than read as
+//! a typo.
 
 #[cfg(feature = "bench-policies")]
-use super::{balanced, reference_cost};
+use super::balanced;
 use super::{default, policy::WorkerSelectionPolicy};
 
 /// The policy used when none is configured: the pre-policy cache-aware decision.
@@ -16,16 +16,12 @@ pub const DEFAULT_POLICY: &str = default::POLICY_NAME;
 #[cfg(not(feature = "bench-policies"))]
 pub const POLICY_NAMES: &[&str] = &[default::POLICY_NAME];
 #[cfg(feature = "bench-policies")]
-pub const POLICY_NAMES: &[&str] = &[
-    default::POLICY_NAME,
-    balanced::POLICY_NAME,
-    reference_cost::POLICY_NAME,
-];
+pub const POLICY_NAMES: &[&str] = &[default::POLICY_NAME, balanced::POLICY_NAME];
 
 /// The names the `bench-policies` feature adds, known to a build without it
 /// so that asking for one names the feature instead of a typo.
 #[cfg(not(feature = "bench-policies"))]
-const BENCH_ONLY_POLICY_NAMES: &[&str] = &["cache-aware-balanced", "reference-cost"];
+const BENCH_ONLY_POLICY_NAMES: &[&str] = &["cache-aware-balanced"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -88,15 +84,6 @@ pub fn build(
             })?;
             Ok(balanced::policy(p))
         }
-        #[cfg(feature = "bench-policies")]
-        reference_cost::POLICY_NAME => {
-            let p: reference_cost::ReferenceCostParams = parse(name, params)?;
-            p.validate().map_err(|message| CatalogError::Parameters {
-                name: name.to_string(),
-                message,
-            })?;
-            Ok(reference_cost::policy(p))
-        }
         #[cfg(not(feature = "bench-policies"))]
         other if BENCH_ONLY_POLICY_NAMES.contains(&other) => {
             Err(CatalogError::BenchOnly(other.to_string()))
@@ -132,14 +119,16 @@ mod tests {
     #[cfg(not(feature = "bench-policies"))]
     #[test]
     fn the_bench_only_policies_are_refused_by_name_without_the_feature() {
-        for name in ["cache-aware-balanced", "reference-cost"] {
-            let err = build(name, None, 0.0).expect_err("bench-only");
-            assert!(matches!(err, CatalogError::BenchOnly(_)), "{name}: {err}");
-            assert!(
-                err.to_string().contains("bench-policies"),
-                "the message names the feature: {err}"
-            );
-        }
+        let err = build("cache-aware-balanced", None, 0.0).expect_err("bench-only");
+        assert!(matches!(err, CatalogError::BenchOnly(_)), "{err}");
+        assert!(
+            err.to_string().contains("bench-policies"),
+            "the message names the feature: {err}"
+        );
+        assert!(matches!(
+            build("reference-cost", None, 0.0),
+            Err(CatalogError::Unknown(_))
+        ));
     }
 
     #[cfg(feature = "bench-policies")]
@@ -165,20 +154,6 @@ mod tests {
                 Some("{affinity_cap_blocks: 32}"),
                 0.0
             ),
-            Err(CatalogError::Parameters { .. })
-        ));
-    }
-
-    #[cfg(feature = "bench-policies")]
-    #[test]
-    fn the_bench_baseline_takes_json_parameters_and_checks_them() {
-        assert!(build("reference-cost", Some(r#"{"router_temperature":0.5}"#), 0.0).is_ok());
-        assert!(matches!(
-            build("reference-cost", Some("{overlap_score_credit: -1}"), 0.0),
-            Err(CatalogError::Parameters { .. })
-        ));
-        assert!(matches!(
-            build("reference-cost", Some("{alphaa: 2.5}"), 0.0),
             Err(CatalogError::Parameters { .. })
         ));
     }

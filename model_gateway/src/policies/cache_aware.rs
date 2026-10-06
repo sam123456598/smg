@@ -2090,8 +2090,8 @@ impl CacheAwarePolicy {
                 None if booked > 0 => Some(booked),
                 None => None,
             };
-            // The reference cost prices decode by the blocks its active sequences hold.
-            // The router has no per-request block ledger yet, so every
+            // Decode work is priced by the blocks a worker's active sequences
+            // hold. The router has no per-request block ledger yet, so every
             // request in flight on the worker is taken to hold this request's
             // blocks, plus any output blocks the accounting layer credited.
             // The backend's KV usage is not that signal: it counts reusable

@@ -245,8 +245,8 @@ fn run(scenario: Scenario, chooser: Chooser<'_>, seed: u64) -> Outcome {
     }
 }
 
-/// Policies under test: the product's default, plus the bench-only balanced policy and the
-/// replay harness's comparison baseline when they are compiled in.
+/// Policies under test: the product's default, plus the bench-only balanced policy when it is
+/// compiled in.
 fn policies() -> Vec<(&'static str, WorkerSelectionPolicy)> {
     let list = vec![(
         "cache-aware-default",
@@ -258,10 +258,6 @@ fn policies() -> Vec<(&'static str, WorkerSelectionPolicy)> {
         list.push((
             "cache-aware-balanced",
             build("cache-aware-balanced", None, 0.0).unwrap(),
-        ));
-        list.push((
-            "reference-cost",
-            build("reference-cost", None, 0.0).unwrap(),
         ));
         list
     };

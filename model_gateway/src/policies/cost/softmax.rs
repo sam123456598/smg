@@ -41,8 +41,8 @@ pub fn sample_by_score_temperature(scores: &[f64], temperature: f32) -> Option<u
     Some(scores.len() - 1)
 }
 
-/// Softmax selection over *costs* (lower is better) normalised to their range, as the reference
-/// cost's picker does: `p_i ∝ exp(-(c_i - c_min) / (range · T))`. Equal costs draw uniformly.
+/// Softmax selection over *costs* (lower is better) normalised to their range:
+/// `p_i ∝ exp(-(c_i - c_min) / (range · T))`. Equal costs draw uniformly.
 pub fn sample_by_cost_temperature(costs: &[f64], temperature: f64) -> Option<usize> {
     let first = *costs.first()?;
     let (min, max) = costs

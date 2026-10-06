@@ -16,9 +16,6 @@
 //!   trails the default on goodput while flattening the fleet; the scoreboard carries its rows.
 //! - [`accounting::OptimisticAccounting`] closes the window between a dispatch and the engine's
 //!   first event, when enabled.
-//! - With the `bench-policies` feature the catalog also builds the replay harness's comparison
-//!   baseline (`reference-cost`, the published prefill-load cost formula); it is not part of the
-//!   product and cannot be selected without the feature.
 //!
 //! Design notes from the routers surveyed while building this layer, kept here because they are
 //! what `cache-aware-balanced` is built from:
@@ -43,8 +40,6 @@ pub mod softmax;
 #[cfg(feature = "bench-policies")]
 mod balanced;
 mod default;
-#[cfg(feature = "bench-policies")]
-mod reference_cost;
 
 #[cfg(test)]
 mod sim_tests;

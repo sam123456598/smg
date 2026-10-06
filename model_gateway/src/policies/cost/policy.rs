@@ -76,7 +76,7 @@ pub struct Needs {
 }
 
 impl Needs {
-    /// What every published cost function wants: the whole fleet with its load reports.
+    /// What a policy that ranks the whole fleet wants: every eligible worker with its load report.
     pub const FLEET_WITH_LOADS: Self = Self {
         prefix_hashes: false,
         all_workers: true,
