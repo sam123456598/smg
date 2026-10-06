@@ -1,0 +1,138 @@
+name: Bellwether Fixtures
+
+# bellwether (smg-project/bellwether) records, for each model at a pinned
+# Hugging Face revision, what the checkpoint's own template and tokenizer give:
+# the prompt token ids of a request, and the text of an output token by token.
+# The tests named bellwether_* read those fixtures and skip without them: the
+# gateway's chat request path, Symphony's parsers, and the tokenizer crate's
+# encode and incremental decode. This workflow runs them on every change to
+# the code they judge (the protocol crate, the tokenizer crate, the gRPC
+# router, Symphony) and to the dependencies, so a difference shows on the pull
+# request that makes it.
+#
+# The fixtures come from the bellwether commit in
+# .github/versions/bellwether.ref. To move to newer fixtures, change that hash:
+# the pull request that does it runs against the new commit.
+#
+# bellwether is private, so the checkout needs the BELLWETHER_READ_TOKEN secret
+# (read access to that repository's contents). A pull request from a fork
+# cannot read it: the job says so and passes without running the tests, and the
+# push to main after the merge runs them.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - crates/protocols/**
+      - crates/tokenizer/**
+      - crates/symphony/**
+      - model_gateway/src/routers/grpc/**
+      - model_gateway/tests/bellwether_*.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/versions/bellwether.ref
+      - .github/workflows/bellwether-fixtures.yml
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+    paths:
+      - crates/protocols/**
+      - crates/tokenizer/**
+      - crates/symphony/**
+      - model_gateway/src/routers/grpc/**
+      - model_gateway/tests/bellwether_*.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/versions/bellwether.ref
+      - .github/workflows/bellwether-fixtures.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One group per pull request and one per branch: a newer push cancels the
+# superseded run. Keep the pull request form in sync with
+# cancel-pr-workflows.yml.
+concurrency:
+  group: bellwether-fixtures-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  fixture-tests:
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # A secret cannot be read in an `if:`, so this step turns "is the token
+      # there" into an output the later steps test.
+      - name: Read the pinned bellwether commit
+        id: pin
+        env:
+          BELLWETHER_READ_TOKEN: ${{ secrets.BELLWETHER_READ_TOKEN }}
+        run: |
+          ref="$(tr -d '[:space:]' < .github/versions/bellwether.ref)"
+          if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error file=.github/versions/bellwether.ref::expected one 40-character commit hash"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          if [ -n "$BELLWETHER_READ_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::BELLWETHER_READ_TOKEN is not available to this run, so the bellwether tests did not run."
+          fi
+
+      - name: Check out bellwether
+        if: steps.pin.outputs.available == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: smg-project/bellwether
+          ref: ${{ steps.pin.outputs.ref }}
+          token: ${{ secrets.BELLWETHER_READ_TOKEN }}
+          path: .bellwether
+          persist-credentials: false
+
+      # This job builds three test targets and nothing else, so it keeps its
+      # own cache entry instead of racing the full builds for theirs.
+      - name: Setup Rust
+        if: steps.pin.outputs.available == 'true'
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: bellwether-fixtures
+
+      # The tests fetch each model's tokenizer files from Hugging Face once, at
+      # the revision its manifest pins, into these directories.
+      - name: Cache tokenizer files
+        if: steps.pin.outputs.available == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            crates/tokenizer/.tokenizer_cache/bellwether
+            model_gateway/.tokenizer_cache/bellwether
+          key: bellwether-tokenizers-${{ steps.pin.outputs.ref }}
+          restore-keys: |
+            bellwether-tokenizers-
+
+      # One invocation, so the test targets build with the same features (the
+      # tokenizer files are downloaded over the TLS backend the gateway
+      # enables), and the pattern takes in every test file named bellwether_*
+      # in these crates.
+      - name: Run the tests that read bellwether
+        if: steps.pin.outputs.available == 'true'
+        timeout-minutes: 45
+        env:
+          BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test -p llm-tokenizer -p smg -p smg-symphony --test 'bellwether_*' -- --nocapture
+
+      - name: Show sccache stats
+        if: always() && steps.pin.outputs.available == 'true'
+        run: sccache --show-stats
