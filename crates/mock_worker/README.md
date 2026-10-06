@@ -45,8 +45,7 @@ Each worker is one port. Register them against an IGW gateway with
 
 `--engine realistic` backs each worker with a continuous-batching simulator
 ([`src/engine.rs`](src/engine.rs)) built the way vLLM schedules, so routing
-experiments against it transfer to engines (and compare with Dynamo's offline
-replay, which models the same loop):
+experiments against it transfer to engines:
 
 - **pass loop** — every pass has a token budget (`--max-batched-tokens`, 8192)
   and a sequence cap (`--max-running`, 256). Running requests go first, each
@@ -123,7 +122,7 @@ over KV utilisation); capacity is `kv_capacity_tokens` or
 `kv_capacity_blocks` with `block_size`; `request_overhead_ms` shifts every
 event of a stream. Unknown keys are ignored, and `--block-size`,
 `--kv-tokens`/`--kv-blocks` and `--request-overhead-ms` given explicitly win
-over the file (the GB300 restricted-pool fleet is `--kv-blocks 12000
+over the file (a restricted pool is, for example, `--kv-blocks 12000
 --block-size 16`); the decode fit's utilisation is still read against the
 file's `kv_capacity_tokens`, so a smaller pool changes how much fits, not
 how long a decode step takes. The defaults stay AISimulate's uncalibrated

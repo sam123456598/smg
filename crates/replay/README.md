@@ -31,7 +31,7 @@ replay --trace mooncake_trace.jsonl --gateway http://127.0.0.1:31000 \
 With `--gateway-log <file>` (the gateway run at `--log-level debug`) the
 gateway's routing decisions are joined to the requests by request id (the
 `x-request-id` header, which is the response id without its uuid tail) and
-`t4.md` prints the GB300 harness's T4 table: `phase, idx, worker, branch,
+`t4.md` prints the T4 table (the hardware harness's columns): `phase, idx, worker, branch,
 prompt_tokens, engine cached_tokens, implied overlap, agree`. The implied
 overlap is the gateway's stated credit when its log carries one
 (`overlap_tokens=`, `overlap_blocks=` or the tree path's `matched_ratio=`);
@@ -47,22 +47,22 @@ hardware only with prefix caching off).
 
 ## Soak (guardrail 3)
 
-`~/smg-perf/replay/soak.sh --label L --hours 24` keeps one gateway and one mock
-fleet up for the whole run and replays the trace window by window (one
-measurement-lock acquisition per window, released between windows), while:
+A soak keeps one gateway and one mock fleet up for 24 hours and replays the
+trace window by window with this replayer (`--skip` advancing by `--limit`
+each window, `--admin` for the oracle join, a label per window), while:
 
-- `soak-faults.py` fires the mock's fault hooks on a schedule, cycling over
-  the workers: drop 20 batches, 1000 ms publishing delay for 60 s, publisher
-  restart, pause 30 s then resume, and a worker restart (cache reset plus
-  publisher restart, what the index sees when an engine restarts);
-- `soak-sampler.py` appends one row per minute to `samples.csv`: gateway RSS,
+- a fault scheduler drives the mock's admin fault hooks on a cycle, over the
+  workers in turn: drop 20 batches, a 1000 ms publishing delay for 60 s, a
+  publisher restart, pause 30 s then resume, and a worker restart (cache
+  reset plus publisher restart, what the index sees when an engine restarts);
+- a sampler appends one row per minute: gateway RSS and its allocator gauges,
   its cache-aware branch counters, match-ratio mean, engine cache-hit gauge
   and KV-subscription failures from `/metrics`, and from the mock's admin API
   the last minute's requests, hit/oracle, prefix reuse, per-worker balance,
   preemptions and KV batches.
 
-`soak-report.py DIR` prints RSS at hour 1 and at the end with the ratio the
-guardrail asks for (within 5%), hit/oracle, reuse and balance in the five
-minutes before and after each fault, the counters, and the per-window table.
-The run is restartable: `--resume` continues the window position and the fault
-cycle in a new segment (a restarted gateway is a new RSS baseline).
+The report reads the guardrail on the allocator's live bytes at idle (hour N
+against hour 1, within 5%), with RSS as the retention indicator, and prints
+hit/oracle, reuse and balance in the minutes before and after each fault, the
+counters, and the per-window table (rows served, TTFT, goodput, hit/oracle,
+reuse, balance, active workers). The scripts live outside the crate.

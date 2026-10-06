@@ -47,7 +47,7 @@ pub enum TimingModel {
     /// uncached tokens it processes, decode `max(1, a + b·u + c·u²)` ms with
     /// `u` the KV utilisation of the decoding requests (their context tokens
     /// over capacity). The defaults are AISimulate's uncalibrated baseline, so
-    /// results compare with Dynamo's offline replay.
+    /// results compare with other simulators built on the same polynomials.
     Polynomial { prefill: [f64; 3], decode: [f64; 3] },
     /// Prefill at a fixed token rate; decode `base + per_req × batch` ms.
     Linear {

@@ -756,7 +756,7 @@ fn t4_summary(ok: &[&ReqResult], decisions: usize) -> Value {
     })
 }
 
-/// The T4 table with the GB300 harness's columns: `implied overlap` is the
+/// The T4 table (the hardware harness's columns): `implied overlap` is the
 /// gateway's stated credit when its log carries one, `-` otherwise (then
 /// `agree` compares the branch's claim of an overlap with the engine).
 fn t4_table(results: &[ReqResult], rows: usize) -> String {
