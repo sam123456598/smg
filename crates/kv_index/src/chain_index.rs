@@ -2671,7 +2671,7 @@ impl ChainIndex {
             Some((child, generation)) => {
                 // The child's header is the next line the walk reads: ask for it while the
                 // version is confirmed.
-                prefetch_hint::prefetch_read(std::ptr::from_ref(self.slab.run(child)));
+                crate::prefetch::prefetch_read(std::ptr::from_ref(self.slab.run(child)));
                 Plan::Descend(child, generation)
             }
             None if window.children != NONE => Plan::InsertAt(offset),
@@ -2924,7 +2924,7 @@ impl ChainIndex {
         // so their misses overlap instead of serialising one run after another.
         for removal in &work {
             if removal.run != GONE {
-                prefetch_hint::prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
+                crate::prefetch::prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
             }
         }
         let mut freed = Vec::new();

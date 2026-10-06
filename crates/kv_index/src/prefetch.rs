@@ -5,12 +5,22 @@
 //! and may be ignored by the hardware. That is why [`prefetch_read`] is a safe function for any
 //! pointer, aligned or not, mapped or not, dangling or null. The function is a no-op on targets
 //! without a prefetch instruction.
+//!
+//! This is the crate's one unsafe line, behind a safe function; the workspace denies unsafe code
+//! and the exception is scoped to that function, not to a crate of its own.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 /// Hint that the cache line at `pointer` will be read soon (first-level cache, keep). Sound for
 /// any pointer: a prefetch instruction never faults and has no effect on program state.
 #[inline(always)]
+#[cfg_attr(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    expect(
+        unsafe_code,
+        reason = "a prefetch instruction is a hint: it never faults, reads nothing, writes nothing"
+    )
+)]
 pub fn prefetch_read<T>(pointer: *const T) {
     #[cfg(target_arch = "aarch64")]
     {

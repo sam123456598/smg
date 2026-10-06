@@ -230,8 +230,8 @@ impl ChainBlockMap {
     fn touch(&self, key: u64) {
         if !self.slots.is_empty() {
             let home = self.home(key);
-            prefetch_hint::prefetch_read(&self.tags[home]);
-            prefetch_hint::prefetch_read(&self.slots[home]);
+            crate::prefetch::prefetch_read(&self.tags[home]);
+            crate::prefetch::prefetch_read(&self.slots[home]);
         }
     }
 

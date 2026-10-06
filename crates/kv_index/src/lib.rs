@@ -20,6 +20,7 @@ mod event_tree;
 mod lane_map;
 pub mod lane_pool;
 mod path_hash;
+mod prefetch;
 pub mod reference;
 pub mod salt;
 pub mod sharded;

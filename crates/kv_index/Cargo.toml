@@ -21,7 +21,6 @@ crossbeam-utils = "0.8"
 dashmap = { workspace = true }
 once_cell = "1.21.4"
 parking_lot = { workspace = true }
-prefetch-hint = { path = "../prefetch_hint" }
 rustc-hash = "2.1.2"
 serde = { version = "1", features = ["derive"] }
 tracing = { workspace = true }
