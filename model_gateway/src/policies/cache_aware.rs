@@ -7265,6 +7265,7 @@ mod tests {
     /// The balanced policy through the host: the holder of the prompt's
     /// blocks wins while its expected wait is within the credit of the cold
     /// worker's, and loses the request once its queue is deeper than that.
+    #[cfg(feature = "bench-policies")]
     #[test]
     fn balanced_policy_trades_the_holders_affinity_against_its_queue() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
@@ -7483,6 +7484,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bench-policies")]
     #[test]
     fn an_all_workers_policy_ranks_the_holder_beside_the_sample() {
         let config = CacheAwareConfig {
@@ -7596,6 +7598,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bench-policies")]
     #[test]
     fn an_all_workers_policy_over_a_sampled_pool_keeps_the_deepest_holder() {
         let config = CacheAwareConfig {

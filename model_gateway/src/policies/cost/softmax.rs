@@ -5,8 +5,10 @@ use std::cmp::Ordering;
 
 use rand::RngExt;
 
+use super::inputs::CandidateInputs;
+#[cfg(feature = "bench-policies")]
 use super::{
-    inputs::{CandidateInputs, RequestInputs},
+    inputs::RequestInputs,
     policy::{Pick, WorkerPicker},
 };
 
@@ -109,12 +111,15 @@ pub enum TieBreak {
 }
 
 /// Lowest cost, with the configured tie-break at temperature zero and a cost-softmax draw above.
+/// The picker of the bench-only policies; the default policy has its own.
+#[cfg(feature = "bench-policies")]
 #[derive(Debug)]
 pub(super) struct LowestCostPicker {
     pub temperature: f64,
     pub tie_break: TieBreak,
 }
 
+#[cfg(feature = "bench-policies")]
 impl WorkerPicker for LowestCostPicker {
     fn pick(
         &self,

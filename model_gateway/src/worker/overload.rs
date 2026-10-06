@@ -101,29 +101,18 @@ impl OverloadThresholds {
     }
 
     /// Evaluate the veto for one load report. O(DP ranks), i.e. O(1) per report.
-    pub fn is_overloaded(&self, load: &WorkerLoadResponse) -> bool {
-        self.exceeded_by(
-            Some(load.total_waiting_reqs()),
-            Some(load.effective_token_usage()),
-        )
-    }
-
-    /// The veto on two readings, `None` meaning the signal is not known for
-    /// the worker and never vetoes. [`Self::is_overloaded`] applies it to one
-    /// load report; a selection policy applies it to the per-worker inputs
-    /// the router gathered, under its own thresholds.
     ///
     /// Both comparisons are `>=` so that the excluded ends of the validated
     /// ranges (`0` waiting requests, `0.0` token usage) are exactly the values
     /// that would mark every worker overloaded unconditionally.
-    pub fn exceeded_by(&self, waiting_requests: Option<i64>, token_usage: Option<f64>) -> bool {
-        if let (Some(threshold), Some(waiting)) = (self.waiting_requests, waiting_requests) {
-            if waiting >= threshold as i64 {
+    pub fn is_overloaded(&self, load: &WorkerLoadResponse) -> bool {
+        if let Some(threshold) = self.waiting_requests {
+            if load.total_waiting_reqs() >= threshold as i64 {
                 return true;
             }
         }
-        if let (Some(threshold), Some(usage)) = (self.token_usage, token_usage) {
-            if usage >= threshold {
+        if let Some(threshold) = self.token_usage {
+            if load.effective_token_usage() >= threshold {
                 return true;
             }
         }
@@ -175,19 +164,6 @@ mod tests {
         assert!(!thresholds.is_overloaded(&response(0, 0.89)));
         assert!(thresholds.is_overloaded(&response(0, 0.9)));
         assert!(thresholds.is_overloaded(&response(0, 0.95)));
-    }
-
-    #[test]
-    fn unknown_readings_never_veto() {
-        let thresholds = OverloadThresholds {
-            waiting_requests: Some(4),
-            token_usage: Some(0.8),
-        };
-        assert!(!thresholds.exceeded_by(None, None));
-        assert!(!thresholds.exceeded_by(None, Some(0.5)));
-        assert!(thresholds.exceeded_by(None, Some(0.8)));
-        assert!(thresholds.exceeded_by(Some(4), None));
-        assert!(!thresholds.exceeded_by(Some(3), None));
     }
 
     #[test]

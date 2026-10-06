@@ -926,7 +926,9 @@ pub enum PolicyConfig {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cache_boundaries: Vec<usize>,
         /// Worker selection policy run over the gathered per-worker inputs
-        /// (`cache-aware-default`). Unset is the cache-aware default.
+        /// (`cache-aware-default`; `cache-aware-balanced` only in a build
+        /// with the `bench-policies` feature). Unset is the cache-aware
+        /// default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selection_policy: Option<String>,
         /// YAML/JSON parameters for `selection_policy`.

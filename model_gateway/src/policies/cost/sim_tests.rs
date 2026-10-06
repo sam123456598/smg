@@ -245,22 +245,20 @@ fn run(scenario: Scenario, chooser: Chooser<'_>, seed: u64) -> Outcome {
     }
 }
 
-/// Policies under test. The product's own policies, plus the replay harness's comparison
-/// baseline when it is compiled in.
+/// Policies under test: the product's default, plus the bench-only balanced policy and the
+/// replay harness's comparison baseline when they are compiled in.
 fn policies() -> Vec<(&'static str, WorkerSelectionPolicy)> {
-    let list = vec![
-        (
-            "cache-aware-default",
-            build("cache-aware-default", None, 0.0).unwrap(),
-        ),
-        (
-            "cache-aware-balanced",
-            build("cache-aware-balanced", None, 0.0).unwrap(),
-        ),
-    ];
+    let list = vec![(
+        "cache-aware-default",
+        build("cache-aware-default", None, 0.0).unwrap(),
+    )];
     #[cfg(feature = "bench-policies")]
     let list = {
         let mut list = list;
+        list.push((
+            "cache-aware-balanced",
+            build("cache-aware-balanced", None, 0.0).unwrap(),
+        ));
         list.push((
             "reference-cost",
             build("reference-cost", None, 0.0).unwrap(),
@@ -302,12 +300,17 @@ fn every_policy_beats_random_when_prefixes_repeat() {
         "{}: random mean {:.2} p99 {:.2}; sticky mean {:.2} p99 {:.2}",
         REPEAT_HEAVY.name, random.mean_ttft, random.p99_ttft, sticky.mean_ttft, sticky.p99_ttft
     );
-    for (name, policy) in policies() {
-        let outcome = run(REPEAT_HEAVY, Chooser::Policy(&policy), 1);
+    let outcomes: Vec<(&str, Outcome)> = policies()
+        .iter()
+        .map(|(name, policy)| (*name, run(REPEAT_HEAVY, Chooser::Policy(policy), 1)))
+        .collect();
+    for (name, outcome) in &outcomes {
         eprintln!(
             "{}: {name} mean {:.2} p99 {:.2}",
             REPEAT_HEAVY.name, outcome.mean_ttft, outcome.p99_ttft
         );
+    }
+    for (name, outcome) in &outcomes {
         assert!(
             outcome.mean_ttft < 0.5 * random.mean_ttft,
             "{name}: mean TTFT {:.2} is not under half of random's {:.2}",
