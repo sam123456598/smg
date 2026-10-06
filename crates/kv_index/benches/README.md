@@ -340,7 +340,79 @@ ceiling on this layout (the generator, with the lanes doing nothing).
 
 ### 20-trial series
 
-(in progress: rendered by `protocol-tables.py` when the series complete)
+Same method as the first protocol run: 20 usable trials per series as fresh processes, each
+followed by a control trial of the same binary and configuration, one lock hold per series, the
+measurement cores sampled around every trial (record 5%, discard 50%), medians with bootstrap 95%
+intervals. Sustained points are the kept-up ends of the brackets above (the window that offers
+them in Dynamo's harness is given); overload is the 300 ms window for the competitor and the
+positional index in Dynamo's harness, 200 ms for the run index there, and twice the sustained rate
+in the SMG harness. Per lane core divides the achieved median by the 52 lane cores.
+
+Same-binary rows, Dynamo's harness (one binary, one generator, one lane scheduler):
+
+| System, harness | Load | Used / discarded | Kept up | Achieved median [95% CI] (M block ops/s) | Per lane core (M) | Lookup p50 [CI] (us) | Lookup p99 [CI] (us) | Subject minus control: achieved, p50, p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Dynamo CRTC, Dynamo harness | sustained bracket (666 ms window, 481M offered) | 20 / 9 | 17 of 20 | 479.3 [478.9, 479.5] | 9.22 (52 cores) | 3.5 [3.5, 3.5] | 14 [14, 14] | +0.1 [-0.3, +0.5], +0.0 [-0.1, +0.0], -0.3 [-0.5, -0.0] |
+| control (same binary) (Dynamo CRTC) | same | 25 / 4 | 21 of 25 | 479.2 [479.0, 479.3] | | 3.5 [3.5, 3.5] | 14 [14, 14] | |
+| Dynamo CRTC, Dynamo harness | overload (300 ms window, 1.07B offered) | 20 / 2 | 0 of 20 | 764.5 [734.8, 811.3] | 14.70 (52 cores) | 2.7 [2.7, 2.8] | 12 [12, 12] | -5.4 [-56.1, +41.4], +0.0 [-0.0, +0.1], +0.3 [-0.1, +0.6] |
+| control (same binary) (Dynamo CRTC) | same | 20 / 2 | 0 of 20 | 769.9 [756.4, 808.1] | | 2.7 [2.6, 2.7] | 12 [11, 12] | |
+| SMG PositionalIndexer, Dynamo harness | sustained bracket (2417 ms window, 132M offered) | 20 / 2 | 16 of 20 | 131.6 [131.4, 131.8] | 2.53 (52 cores) | 27.3 [25.5, 32.2] | 413 [343, 478] | +0.0 [-0.3, +0.3], -3.5 [-5.4, +4.0], -44.2 [-117.9, +49.7] |
+| control (same binary) (SMG PositionalIndexer) | same | 21 / 1 | 15 of 21 | 131.6 [131.4, 131.7] | | 30.8 [27.2, 31.6] | 457 [393, 482] | |
+| SMG PositionalIndexer, Dynamo harness | overload (300 ms window, 1.07B offered) | 20 / 0 | 0 of 20 | 144.7 [143.9, 145.1] | 2.78 (52 cores) | 23.4 [23.1, 23.6] | 565 [558, 571] | +0.4 [-0.8, +1.3], +0.1 [-0.4, +0.3], +3.0 [-6.1, +15.3] |
+| control (same binary) (SMG PositionalIndexer) | same | 20 / 0 | 0 of 20 | 144.3 [143.4, 145.3] | | 23.3 [23.3, 23.6] | 562 [550, 567] | |
+| SMG RunIndex, Dynamo harness | sustained bracket (488 ms window, 656M offered) | 20 / 4 | 17 of 20 | 654.6 [654.4, 654.6] | 12.59 (52 cores) | 1.3 [1.2, 1.3] | 4 [4, 4] | +0.1 [-0.2, +0.3], -0.0 [-0.1, +0.1], -0.0 [-0.2, +0.1] |
+| control (same binary) (SMG RunIndex) | same | 22 / 2 | 19 of 22 | 654.5 [654.3, 654.6] | | 1.3 [1.3, 1.3] | 4 [4, 4] | |
+| SMG RunIndex, Dynamo harness | overload (200 ms window, 1.60B offered) | 20 / 2 | 0 of 20 | 1171.0 [1140.1, 1227.9] | 22.52 (52 cores) | 1.2 [1.2, 1.2] | 4 [3, 4] | -7.1 [-66.8, +61.3], +0.0 [-0.0, +0.0], +0.0 [-0.2, +0.3] |
+| control (same binary) (SMG RunIndex) | same | 20 / 2 | 0 of 20 | 1178.1 [1155.8, 1220.5] | | 1.2 [1.2, 1.2] | 3 [3, 4] | |
+
+SMG harness rows (the cross-check):
+
+| System, harness | Load | Used / discarded | Kept up | Achieved median [95% CI] (M block ops/s) | Per lane core (M) | Lookup p50 [CI] (us) | Lookup p99 [CI] (us) | Subject minus control: achieved, p50, p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SMG PositionalIndexer, SMG harness | sustained bracket (2611 ms window, 123M offered) | 21 / 2 | 17 of 21 | 122.0 [121.8, 122.0] | 2.35 (52 cores) | 34.2 [32.9, 34.4] | 497 [478, 505] | +0.0 [-0.1, +0.8], +0.2 [-1.4, +0.7], +7.6 [-86.1, +19.6] |
+| control (same binary) (SMG PositionalIndexer) | same | 20 / 3 | 14 of 20 | 121.9 [121.1, 122.0] | | 34.0 [33.7, 35.0] | 490 [481, 571] | |
+| SMG PositionalIndexer, SMG harness | overload (1305 ms window, 245M offered) | 21 / 1 | 0 of 21 | 132.1 [130.9, 134.1] | 2.54 (52 cores) | 32.0 [31.2, 32.4] | 605 [601, 615] | -0.5 [-2.2, +2.4], +0.1 [-0.8, +1.5], +7.7 [-2.4, +18.9] |
+| control (same binary) (SMG PositionalIndexer) | same | 20 / 2 | 0 of 20 | 132.6 [131.2, 133.1] | | 31.9 [30.5, 32.1] | 597 [592, 605] | |
+| SMG RunIndex, SMG harness | sustained bracket (559 ms window, 572M offered) | 21 / 0 | 18 of 21 | 570.3 [570.0, 570.6] | 10.97 (52 cores) | 1.1 [1.1, 1.1] | 6 [6, 6] | -0.1 [-0.5, +0.4], -0.0 [-0.0, +0.0], +0.0 [-0.0, +0.1] |
+| control (same binary) (SMG RunIndex) | same | 20 / 1 | 20 of 20 | 570.3 [570.1, 570.5] | | 1.1 [1.1, 1.1] | 6 [6, 6] | |
+| SMG RunIndex, SMG harness | overload (279 ms window, 1.14B offered) | 21 / 0 | 2 of 21 | 1069.9 [980.0, 1114.6] | 20.58 (52 cores) | 1.0 [1.0, 1.1] | 8 [7, 8] | +41.7 [-71.4, +127.2], +0.0 [-0.1, +0.1], -1.0 [-2.0, +0.1] |
+| control (same binary) (SMG RunIndex) | same | 20 / 1 | 1 of 20 | 1028.3 [958.0, 1076.7] | | 1.0 [1.0, 1.1] | 9 [8, 9] | |
+| no indexer (harness ceiling), SMG harness | sustained bracket (191 ms window, 1.67B offered) | 20 / 2 | 18 of 20 | 1667.9 [1667.5, 1668.1] | 32.07 (52 cores) | 0.5 [0.5, 0.5] | 4 [4, 4] | -0.1 [-0.5, +2.6], +0.0 [+0.0, +0.0], +0.0 [-0.0, +0.0] |
+| control (same binary) (no indexer (harness ceiling)) | same | 21 / 1 | 19 of 21 | 1667.9 [1665.4, 1668.1] | | 0.5 [0.5, 0.5] | 4 [4, 4] | |
+
+The null backend's overload series (3.34B offered, twice its sustained rate) has no usable row:
+the generator was invalid in all 40 subject trials, which places the harness's own ceiling on this
+layout between 1.67B (kept up) and 3.34B, as the query-issuer grid above predicts (2.13B on
+schedule with four query issuers).
+
+Reading the rows. In one binary and on the same 52 cores the run index sustains 654.6M against
+the competitor's 479.3M (1.37x; 12.6 against 9.2M block ops/s per lane core) with lookups at p50
+1.3 us and p99 4 us against 3.5 us and 14 us; overloaded it achieves 1,171M at the 200 ms window
+(22.5M per core, p99 still 4 us) where the competitor achieves 764.5M at 300 ms (14.7M per core,
+p99 12 us). The positional design sustains 131.6M (2.5M per core) at p99 413 us and is the
+reference for what the run index replaced. The control pairs put the noise floor at or below one
+unit in the last digit for sustained throughput and lookup p50 and within 0.3 us for the run
+index's p99; the overload (capacity) rows carry the widest intervals (the competitor's 300 ms
+subject and control differ by 5.4M inside [-56, +41]; the run index's 200 ms pair by 7.1M inside
+[-67, +61]), so capacities are compared within one harness and layout only; the competitor's
+capacity on this layout (764.5M on 52 cores) is below its competitor-layout figure (857.4M on 59
+cores). The SMG harness reads 7% lower than Dynamo's for the same indexers at their sustained
+points (positional 122.0 against 131.6M, run index 570.3 against 654.6M) with the same latencies
+within 2 us at p99, and its run-index overload row shows the bracket is conservative: at 1.14B
+offered the index still achieved 1,069.9M [980, 1,115] (94% of offered, 2 of 21 trials kept up),
+so its ceiling in this harness lies near 1.1B and the 571.7M bracket, decided by one trial at
+96.9% of 611.3M, is being re-bracketed higher.
+
+Discarded trials were replaced and are listed per series in `summary.md`: across the twelve
+scaled series 0-13 of 40-58 attempts each were discarded for other users' jobs above half a core
+on the measurement cores (a configuration agent, a package proxy, kubectl, dnf, a sync daemon, git,
+a publish daemon) and one for an invalid generator; throughout, other workstreams measured on
+cores 67-71 and 77-135 and built and served engines on 72-143, outside the sampled cores (host
+load average 35-110), which the sustained rows are robust to and the capacity rows may not be.
+The first scaled series of the day (set aside, kept on disk under `-badmask`, not cited) ran with
+the lanes on cores 5-63 under issuers on 0-11, seven cores shared, because the wrapper applied its
+default lane mask before the layout selection; the replayer now refuses issuer CPUs inside the lane
+set and prints the layout at the top of every log.
 
 ## Plugging in a new index
 
