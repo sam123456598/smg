@@ -498,26 +498,32 @@ Dynamo's harness, competitor layout (lanes 5-63, event issuers 0-3, query issuer
 128 query lanes), run index at `9f9c7c04` and the competitor in the same binary build, 300 ms and
 200 ms windows, `numactl --cpunodebind=0 --membind=0` against `--interleave=all` (the published
 method), three fresh processes each, all interleaved inside one lock hold (19:30-19:35, host
-quiet). Per lane core divides the median by the 59 lane cores.
+quiet). Per lane core divides the median by the 59 lane cores. Kept up is the protocol's rule
+(generator valid and achieved at least 99% of offered); the harness's own `kept_up` flag, which
+lets replay plus drain run 10% past the window, is shown beside it because it says yes to two
+rows the rule says no to.
 
-| Window (offered) | Memory | System | Achieved per trial (M) | Median (M) | Per lane core (M) | Kept up | Lookup p50 / p99 (us) |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 300 ms (1,067M) | local | SMG `RunIndex` | 1,063.0, 1,064.2, 1,064.1 | 1,064.1 | 18.0 | 3 of 3 | 1.2 / 3 |
-| 300 ms (1,067M) | local | Dynamo CRTC | 991.1, 1,031.2, 1,026.8 | 1,026.8 | 17.4 | 3 of 3 | 2.6 / 9 |
-| 300 ms (1,067M) | interleaved | SMG `RunIndex` | 1,061.7, 1,059.1, 1,062.6 | 1,061.7 | 18.0 | 3 of 3 | 1.3 / 4 |
-| 300 ms (1,067M) | interleaved | Dynamo CRTC | 802.5, 860.6, 847.7 | 847.7 | 14.4 | 0 of 3 | 2.9 / 13 |
-| 200 ms (1,601M) | local | SMG `RunIndex` | 1,573.9, 1,552.5, 1,555.7 | 1,555.7 | 26.4 | 3 of 3 | 1.2 / 3 |
-| 200 ms (1,601M) | local | Dynamo CRTC | 1,129.5, 1,106.4, 1,149.4 | 1,129.5 | 19.1 | 0 of 3 | 2.1 / 8 |
-| 200 ms (1,601M) | interleaved | SMG `RunIndex` | 1,279.6, 1,301.6, 1,177.6 | 1,279.6 | 21.7 | 0 of 3 (generator valid in 1) | 1.2 / 4 |
-| 200 ms (1,601M) | interleaved | Dynamo CRTC | 933.2, 898.4, 972.1 | 933.2 | 15.8 | 0 of 3 (generator valid in 1) | 2.3 / 10 |
+| Window (offered) | Memory | System | Achieved per trial (M) | Median (M) | Per lane core (M) | Achieved / offered | Kept up (99% rule) | Harness flag | Lookup p50 / p99 (us) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 300 ms (1,067M) | local | SMG `RunIndex` | 1,063.0, 1,064.2, 1,064.1 | 1,064.1 | 18.0 | 99.6-99.7% | 3 of 3 | 3 of 3 | 1.2 / 3 |
+| 300 ms (1,067M) | local | Dynamo CRTC | 991.1, 1,031.2, 1,026.8 | 1,026.8 | 17.4 | 92.9-96.6% | 0 of 3 | 3 of 3 | 2.6 / 9 |
+| 300 ms (1,067M) | interleaved | SMG `RunIndex` | 1,061.7, 1,059.1, 1,062.6 | 1,061.7 | 18.0 | 99.3-99.6% | 3 of 3 | 3 of 3 | 1.3 / 4 |
+| 300 ms (1,067M) | interleaved | Dynamo CRTC | 802.5, 860.6, 847.7 | 847.7 | 14.4 | 75.2-80.7% | 0 of 3 | 0 of 3 | 2.9 / 13 |
+| 200 ms (1,601M) | local | SMG `RunIndex` | 1,573.9, 1,552.5, 1,555.7 | 1,555.7 | 26.4 | 97.0-98.3% | 0 of 3 | 3 of 3 | 1.2 / 3 |
+| 200 ms (1,601M) | local | Dynamo CRTC | 1,129.5, 1,106.4, 1,149.4 | 1,129.5 | 19.1 | 69.1-71.8% | 0 of 3 | 0 of 3 | 2.1 / 8 |
+| 200 ms (1,601M) | interleaved | SMG `RunIndex` | 1,279.6, 1,301.6, 1,177.6 | 1,279.6 | 21.7 | 73.6-81.3% | 0 of 3 (generator invalid in 2) | 0 of 3 | 1.2 / 4 |
+| 200 ms (1,601M) | interleaved | Dynamo CRTC | 933.2, 898.4, 972.1 | 933.2 | 15.8 | 56.1-60.7% | 0 of 3 (generator invalid in 2) | 0 of 3 | 2.3 / 10 |
 
-Local memory is worth 21% to the competitor at 300 ms (848M not kept up becomes 1,027M kept up,
-lookup p99 13 to 9 us) and nothing to the run index there, which keeps up either way at p99 3-4
-us; at 200 ms the run index keeps up 3 of 3 with local memory (1,556M, 26.4M per lane core, p99 3
-us) where the competitor achieves 1,130M, and under interleaving the generator itself is invalid
-in two trials of three for both systems at that window. The published rows keep `--interleave=all`
-because it is Dynamo's method; these rows say that on one socket the method costs the competitor
-about a fifth of its throughput and the run index its headroom above 1.06B.
+Local memory is worth 21% to the competitor at 300 ms (848M to 1,027M, lookup p99 13 to 9 us,
+still short of the 99% bar at 93-97%) and nothing to the run index there, which keeps up either
+way at p99 3-4 us (its 1,062-1,064M at 300 ms is the first kept-up point above 1.06B in Dynamo's
+harness, under both memory settings); at 200 ms the run index reaches 97-98% of 1.6B with local
+memory (1,556M, 26.4M per lane core, drain 2-6 ms) against 74-81% interleaved, the competitor
+69-72% against 56-61%, and under interleaving the generator itself is invalid in two trials of
+three for both systems at that window. The kept-up points under local memory are bracketed in the
+rows that follow. The published rows keep `--interleave=all` because it is Dynamo's method; a
+process bound to its socket is the deployment-realistic setting on one socket; both are reported
+and neither system was changed for either.
 
 ## Plugging in a new index
 
