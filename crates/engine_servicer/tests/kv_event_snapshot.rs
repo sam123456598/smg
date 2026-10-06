@@ -248,7 +248,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "sglang-hicache",
-        files: &["sglang-hicache/qwen3-0.6b-sglang0.5.21-hicache-capture.jsonl"],
+        files: &["sglang-hicache/qwen3-0.6b-sglang0.5.21-hicache-capture.jsonl.gz"],
         engine: EngineHash::Sglang,
     },
     Case {

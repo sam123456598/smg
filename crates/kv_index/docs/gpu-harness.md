@@ -71,7 +71,8 @@ venv/bin/python scripts/workload_kv.py --base http://127.0.0.1:8101 --model Qwen
 touch fixtures/vllm/.stop; venv/bin/python scripts/summarize_kv_events.py fixtures/vllm/capture.jsonl
 ```
 
-What the real streams contain (full census in the fixtures' `README.md` and `*-summary.json`):
+What the real streams contain (full census in the fixtures' `README.md`; the `*-summary.json` files are beside the
+originals under `~/smg-perf/gpu/fixtures/`):
 
 | | vLLM 0.31.0 | SGLang 0.5.21 |
 |---|---|---|
@@ -286,7 +287,7 @@ binding wheel from the same tree (`scripts/build-head.sh`, maturin `--compatibil
 
 10. Loop head e69487f8 (`gpu-harness-e69487f8.md`): the vLLM servicer's new load fields confirmed live on the 8B fleet
    (`num_waiting_uncached_tokens` up to 472 k under a 96 x 8,192-token burst, `gen_throughput`, `cache_hit_rate`,
-   `num_used_tokens`, `utilization`; fixture `captured/vllm-8b-getloads/`); the gateway reads them every
+   `num_used_tokens`, `utilization`; dumps under `~/smg-perf/gpu/results/getloads/`); the gateway reads them every
    `--load-monitor-interval` (10 s). Labelled replays: round robin unchanged (14.55 req/s, 87.1 %, 184/379/765 ms);
    `cache_aware` with the live fields forms the mock's hot worker (one fallback target at KV 1.00 with 17-38 waiting), and
    fresh gateways on warm engines went blind once the relay history window rolled (section 4). Clean series on fresh

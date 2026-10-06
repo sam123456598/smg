@@ -1,9 +1,0 @@
-864 distinct hashes; 4 distinct transition patterns
-   640 x  Store GPU -> Store CPU_PINNED -> Remove GPU
-   128 x  Store GPU -> Store CPU_PINNED
-    48 x  Store GPU -> Store CPU_PINNED -> Remove GPU -> Store GPU -> Store GPU -> Store CPU_PINNED
-    48 x  Store GPU -> Store CPU_PINNED -> Remove GPU -> Store GPU
-
-hashes whose first four transitions are Store GPU -> Store CPU_PINNED -> Remove GPU -> Store GPU: 96
-  hash 6340289242758876696: seq1:Store GPU, seq2:Store CPU_PINNED, seq19:Remove GPU, seq30:Store GPU, seq39:Store GPU, seq40:Store CPU_PINNED
-  hash -2536024184458518991: seq1:Store GPU, seq2:Store CPU_PINNED, seq19:Remove GPU, seq30:Store GPU, seq39:Store GPU, seq40:Store CPU_PINNED

@@ -1,1 +1,0 @@
-run-sglang-host.sh sgl-dp2 2,3 8201 5567 5577 --dp-size 2 --mem-fraction-static 0.15 --max-running-requests 16 --context-length 4096

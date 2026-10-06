@@ -1,1 +1,0 @@
-run-vllm.sh vllm-smoke 0 8101 5557 Qwen/Qwen3-0.6B --max-model-len 4096 --max-num-seqs 16 --kv-cache-memory-bytes 1073741824 --enforce-eager --gpu-memory-utilization 0.3

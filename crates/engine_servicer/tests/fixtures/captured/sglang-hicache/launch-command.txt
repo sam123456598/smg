@@ -1,1 +1,0 @@
-run-sglang-host.sh sgl-hicache 1 8202 5587 5597 --mem-fraction-static 0.1 --max-total-tokens 4096 --max-running-requests 8 --context-length 2048 --enable-hierarchical-cache --hicache-ratio 8 --hicache-write-policy write_through

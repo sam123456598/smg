@@ -32,8 +32,11 @@ device-wide free memory, so another process's allocations during its window are 
 ## 2. The new load fields on a live vLLM 0.31 worker (`scripts/getloads-check.sh`, `scripts/getloads-burst.sh`)
 
 One 8B worker (`8b-w0`) behind a fresh `cache_aware` gateway, `GetLoads` polled every 0.5 s together with the gateway's
-`smg_engine_*` gauges for it (`scripts/getloads_dump.py`; dumps and census in `results/getloads/e69487f8-w0*`, copies in
-`crates/engine_servicer/tests/fixtures/captured/vllm-8b-getloads/`).
+`smg_engine_*` gauges for it (`scripts/getloads_dump.py`; dumps and census in `~/smg-perf/gpu/results/getloads/e69487f8-w0`
+and `e69487f8-w0-burst`: one JSON object per 0.5 s poll with `epoch`, `worker`, the engine's `version`, `loads` as the
+`SchedulerLoad` message with defaults printed so every field is present, and `gateway` with the gateway's `smg_engine_*`
+gauges for the worker at that moment; the first run is `bench_prefix.py` through a `cache_aware` gateway, 16 prefixes x 20
+prompts, the second `getloads_under_load.py`).
 
 | load | `num_running_reqs` | `num_waiting_reqs` | `num_waiting_uncached_tokens` | `gen_throughput` tok/s | `cache_hit_rate` | `num_used_tokens` | `utilization` / `token_usage` | gateway gauges |
 |---|---|---|---|---|---|---|---|---|
@@ -45,6 +48,11 @@ vLLM has a waiting queue (which at 16 req/s of 1.2 k-token prompts it never has:
 batch), the throughput and hit rate move with the traffic, `utilization` equals `token_usage`. The gateway maps
 `gen_throughput` and `cache_hit_rate` into gauges and reads all of them at its load-poll cadence, which is
 `--load-monitor-interval` = 10 s by default: in the burst the gateway's view was ten seconds behind the servicer's.
+
+The servicer derives the three new fields from its own bookkeeping (`engine_servicer::load_tracker`): queued token-work
+from the forwarded requests the engine has not started, discounted by the recent hit rate; throughput from the tokens it
+streamed in the last two seconds; the hit rate from the last 64 first outputs. `max_total_num_tokens`, `num_used_tokens`,
+`token_usage` and the counts are the engine's own scheduler stats.
 
 ## 3. First labelled series at the full pool (`scripts/series-all.sh`, `labeled-series.sh`, `fleet_series_table.py`): contaminated from run 2 on
 

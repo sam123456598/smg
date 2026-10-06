@@ -1,1 +1,0 @@
-run-sglang.sh sglang-smoke 1 8201 5567 Qwen/Qwen3-0.6B --mem-fraction-static 0.3 --max-total-tokens 9216 --max-running-requests 16 --context-length 4096 --attention-backend triton
