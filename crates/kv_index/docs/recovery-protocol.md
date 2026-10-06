@@ -220,6 +220,31 @@ history-less numbers in parentheses):
 | 1.5 s publish delay | mean apply lag 1.41 to 1.51 s over 269 to 429 batches | mean apply lag 1.48 s over 525 batches; hit/oracle 90.9/93.3 -> 92.4/94.9 % (without history: 1.44 to 1.51 s) |
 | engine paused 8 s | `stalled=wedged` 3.0 to 3.2 s in, routable 0.0 to 0.4 s after resume | (direct only) |
 
+Relay state snapshot drills (2026-10-05 evening, gateway and relay from 85f9d28c, eight ZMQ mock
+ranks behind the Rust servicer with `SMG_KV_EVENT_HISTORY_BATCHES=100` so the window has rolled,
+engine truth from `GET /admin/cache/{worker}`; the index is compared to the engine within 1 % or
+32 blocks while the load runs, because the two sides are read tens of milliseconds apart while the
+engine stores, and exactly once the load is over):
+
+| Drill | Result |
+|---|---|
+| gateway restart under load (`drill-gateway-restart.sh`, `RELAY=1`) | serving again 0.6 s after the kill (`/health` 0.4 s, registrations 0.5 s); every worker resynced from a relay snapshot (`resyncs_total{snapshot}` 1 each, 5 to 6 chunks for the busy workers); `smg_kv_index_blocks` within 1 % of the engines' resident counts 1.9 s after the registrations (seven of eight exactly equal under load) and exactly equal for all eight once the load ended (4,857 to 5,079 blocks per worker); cached/oracle 0.974 over the next 10 s, the steady-state value; p99 0.62 to 0.61 s |
+| gap beyond the window (`drill-gap-beyond-window.sh`) | a second gateway keeps the fleet busy; the first gateway's link to the busiest worker's relay is blackholed for 15 s (unreachable veto 2.0 s in, back 0.0 s after the heal); on reconnect its cursor lay below the window: `OUT_OF_RANGE`, resubscription from zero, snapshot resync 17.3 s after the cut (the 15 s of blackhole plus the reconnect), index equal to the engine's resident set at once (1,468 = 1,468 under load, 2,266 = 2,266 after it); nothing settled as unrecovered, no degraded rank, no relay gap |
+
+Three things the drills showed. The snapshot is the relay's knowledge: when the engine's own replay
+cannot refill a gap (150 batches dropped on the wire against a 40-step replay buffer) the relay
+keeps a hole and its snapshot lacks what the hole held (3,982 blocks against the engine's 4,230);
+no subscriber can do better, a real engine's 10,000-step replay makes the case an artefact of the
+drill, and the index equals the engine wherever the relay saw every batch. The relay's ZMQ
+subscription joins after the publisher binds, and a PUB drops what it sends before a SUB has
+joined: in a fleet loaded the instant it registered, two near-idle workers' only batches were lost
+(the relays relayed nothing), their relays had no state, and the gateway came back with 0 against
+13 and 26 resident blocks; two seconds of settling before the load avoids it in the drill, and the
+relay should seed itself from the engine's replay socket at start, where those batches are. With
+one gateway a cut idles the engine, so the window never rolls past the cursor and the resume is
+served from history (exact); the window rolls only while the engine publishes for someone else,
+which is why the drill runs a second gateway, the shape of a multi-router deployment.
+
 ## Comparison with Dynamo (`lib/llm/src/kv_router/indexer/recovery/`)
 
 | Property | Dynamo | SMG after this branch |
@@ -352,3 +377,12 @@ failed round trip and exposes them as metrics.
   latter, one `snapshot` resync per worker on the gateway and no `event_miss` flood.
 - The SGLang servicer should request replays in chunks below libzmq's send high-water mark so a
   long replay is not truncated into a second gap.
+
+### 6. Router-to-router bootstrap (proposed, not started)
+
+A gateway endpoint (`GET /kv-index/dump`, per worker) that serves the index's blocks the way the
+relay's snapshot encodes them, with the cursor each rank's state stands at, so a second replica
+bootstraps from a peer in one transfer instead of asking every relay for a snapshot, then
+subscribes to the relays with the peer's cursors. The dump is exact to the peer's cursors and
+reuses the snapshot's chunking and watermark rules; the relay snapshot stays the source of truth
+when no peer is up.
