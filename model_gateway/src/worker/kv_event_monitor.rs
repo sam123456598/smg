@@ -2209,6 +2209,10 @@ mod tests {
                 gauge(&handle, "smg_kv_index_moved_hashes", "chain"),
                 Some(0.0)
             );
+            assert_eq!(
+                gauge(&handle, "smg_kv_index_engine_conflicts", "chain"),
+                Some(0.0)
+            );
             assert!(gauge(&handle, "smg_kv_index_arena_bytes", "chain").is_some_and(|b| b > 0.0));
             assert!(gauge(&handle, "smg_kv_index_slab_bytes", "chain").is_some_and(|b| b > 0.0));
             assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "pos"), None);

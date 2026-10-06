@@ -451,6 +451,11 @@ pub(crate) fn init_metrics() {
          (cumulative), by model"
     );
     describe_gauge!(
+        "smg_kv_index_engine_conflicts",
+        "Stored blocks whose engine hash differed from the one the chain index holds for \
+         the block, a fleet whose engines do not name content alike (cumulative), by model"
+    );
+    describe_gauge!(
         "smg_kv_index_blocks",
         "Blocks the positional index holds for a worker, as the index counts them; \
          set when a KV event batch is applied, when the worker's state is reset \
@@ -1802,7 +1807,8 @@ impl Metrics {
     }
 
     /// Publish the chain index's shape and memory for a model, from its own
-    /// counters: live runs and blocks, arena and slab bytes, moved hashes.
+    /// counters: live runs and blocks, arena and slab bytes, moved hashes and
+    /// engine conflicts.
     pub fn set_kv_index_chain_stats(model_id: &str, stats: &kv_index::ChainIndexStats) {
         let model = intern_string(model_id);
         gauge!("smg_kv_index_runs_live", "model" => model.clone()).set(stats.runs_live as f64);
@@ -1811,7 +1817,10 @@ impl Metrics {
         gauge!("smg_kv_index_arena_free_bytes", "model" => model.clone())
             .set(stats.arena_free_bytes as f64);
         gauge!("smg_kv_index_slab_bytes", "model" => model.clone()).set(stats.slab_bytes as f64);
-        gauge!("smg_kv_index_moved_hashes", "model" => model).set(stats.moved_hashes as f64);
+        gauge!("smg_kv_index_moved_hashes", "model" => model.clone())
+            .set(stats.moved_hashes as f64);
+        gauge!("smg_kv_index_engine_conflicts", "model" => model)
+            .set(stats.engine_conflicts as f64);
     }
 
     // ========================================================================
