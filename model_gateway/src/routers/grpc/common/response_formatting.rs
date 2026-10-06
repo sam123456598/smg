@@ -56,7 +56,8 @@ pub(crate) fn effective_weight_version<'a>(
     dispatch: Option<&'a str>,
 ) -> &'a str {
     reported
-        .or(dispatch.filter(|v| !v.is_empty()))
+        .or(dispatch)
+        .filter(|v| !v.is_empty())
         .unwrap_or("default")
 }
 
