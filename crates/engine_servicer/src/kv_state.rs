@@ -984,7 +984,7 @@ mod tests {
         reason = "the measured pass is this test's report; read it with --nocapture"
     )]
     fn a_snapshot_of_a_large_state_is_one_brief_pass() {
-        // A 676k-block pool (the GB300 8B workers) in chains of 64.
+        // A 676k-block pool (a large worker's) in chains of 64.
         let mut state = LiveState::new();
         let mut hash = 1i64;
         for seq in 0..(676_144 / 64) {

@@ -2989,7 +2989,7 @@ mod tests {
         latencies
     }
 
-    /// The GB300 workers' pool (676k blocks) behind a rolled window: the
+    /// A large worker's pool (676k blocks) behind a rolled window: the
     /// snapshot is cut atomically at the relay's cursor while live batches
     /// stream through to another subscriber, which sees no stall beyond the
     /// one pass under the lock; the snapshot subscriber, not read until the
