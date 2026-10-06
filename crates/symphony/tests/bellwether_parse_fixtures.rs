@@ -182,7 +182,8 @@ impl Said {
 fn qwen3_parse_fixtures_match_the_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
         eprintln!(
-            "skipping: {FIXTURES_ENV} is not set; point it at the fixtures/ directory of a bellwether checkout"
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
         );
         return;
     };
@@ -303,7 +304,8 @@ fn engine_finish(reference: &str) -> EngineFinish {
 fn qwen3_token_plans_count_every_token_where_its_first_byte_lands() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
         eprintln!(
-            "skipping: {FIXTURES_ENV} is not set; point it at the fixtures/ directory of a bellwether checkout"
+            "skipping: {FIXTURES_ENV} is not set; \
+             point it at the fixtures/ directory of a bellwether checkout"
         );
         return;
     };

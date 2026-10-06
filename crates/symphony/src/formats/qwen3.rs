@@ -856,7 +856,8 @@ mod tests {
                 ("</think>".into(), Some(1)),
                 (String::new(), Some(1)),
             ],
-            "the held halves count into the character they began; the trailing token is reported at the end"
+            "the held halves count into the character they began; \
+             the trailing token is reported at the end"
         );
         assert_eq!(
             events[events.len() - 2],
@@ -937,7 +938,8 @@ mod tests {
         assert_eq!(
             counted(&events),
             vec![("<think>".into(), Some(1)), ("x".into(), Some(2))],
-            "the cut token once, where its first byte landed; the byte-less token into the text after it"
+            "the cut token once, where its first byte landed; \
+             the byte-less token into the text after it"
         );
     }
 
