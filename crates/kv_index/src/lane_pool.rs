@@ -77,6 +77,13 @@ pub struct LanePoolConfig {
     /// Events a lane applies from one worker before releasing it, so a stolen backlog does not
     /// starve the lane's own ready workers.
     pub batch: usize,
+    /// Events a ready worker may have queued on a lane that is not serving before any lane may
+    /// take it: the case of a lane that is not running (preempted, or pinned to a core something
+    /// else holds), which today's rule never reaches because only a serving lane with more on its
+    /// list is stolen from. Zero, the default, keeps today's rule exactly. The bound is in events
+    /// queued, never in time, so a quiet pool never steals and a stalled lane's backlog is
+    /// taken once it is `steal_after` deep.
+    pub steal_after: usize,
 }
 
 /// The event handed back by [`LanePool::enqueue`] when the worker's queue is at its cap.
@@ -476,6 +483,33 @@ impl<W: Send, E: Send> LanePool<W, E> {
                 }
             }
         }
+        if self.config.steal_after == 0 {
+            return None;
+        }
+        // Nothing is stealable by the serving rule: look for a ready worker waiting on a lane that
+        // is not serving with `steal_after` events behind it, which is a lane that is not running.
+        // One try-lock per lane of the pool, only on an idle turn that found nothing above.
+        let count = self.lanes.len();
+        let start = (*seed % count as u64) as usize;
+        for step in 0..count {
+            let victim = (start + step) % count;
+            if victim == lane || self.lanes[victim].serving.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Ok(mut ready) = self.lanes[victim].ready.try_lock() else {
+                continue;
+            };
+            let Some(&worker) = ready.front() else {
+                continue;
+            };
+            if lock(&self.workers[worker as usize].queue).len() < self.config.steal_after {
+                continue;
+            }
+            ready.pop_front();
+            drop(ready);
+            self.lanes[lane].steals.fetch_add(1, Ordering::Relaxed);
+            return Some(worker);
+        }
         None
     }
 
@@ -566,6 +600,7 @@ mod tests {
             max_workers: WORKERS as usize,
             depth_cap: 64,
             batch: 8,
+            steal_after: 0,
         });
         let produced = AtomicBool::new(false);
         let claims: Vec<AtomicBool> = (0..WORKERS).map(|_| AtomicBool::new(false)).collect();
@@ -651,6 +686,7 @@ mod tests {
             max_workers: 2,
             depth_cap: 2,
             batch: 4,
+            steal_after: 0,
         });
         assert!(pool.enqueue(0, 1, "a").is_ok());
         assert!(pool.enqueue(0, 1, "b").is_ok());
@@ -678,6 +714,7 @@ mod tests {
             max_workers: 4,
             depth_cap: 16,
             batch: 2,
+            steal_after: 0,
         });
         for round in 0..3 {
             for worker in 0..4u32 {
@@ -749,5 +786,85 @@ mod tests {
             .clone()
             .unwrap_or_default();
         assert_eq!(worker_two, vec![2, 12, 22]);
+    }
+
+    /// A ready worker on a lane that is not running is taken by another lane once its queue is
+    /// `steal_after` deep, and never under the default: lane 0 is never run here, which is what a
+    /// preempted lane looks like to the pool.
+    #[test]
+    fn a_stalled_lane_is_drained_once_its_backlog_reaches_steal_after() {
+        for (steal_after, expect_applied, expect_steals) in [(0usize, 0u64, 0u64), (3, 4, 1)] {
+            let pool: LanePool<(), u32> = LanePool::new(LanePoolConfig {
+                lanes: 2,
+                max_workers: 1,
+                depth_cap: 16,
+                batch: 8,
+                steal_after,
+            });
+            for event in 0..4u32 {
+                pool.enqueue(0, 0, event).unwrap();
+            }
+            let mut applied = Vec::new();
+            let mut turns = 0u32;
+            pool.run_lane(
+                1,
+                &mut (
+                    |_claimed: Claimed<'_, ()>, event: u32| applied.push(event),
+                    || Control::Continue,
+                    || {
+                        turns += 1;
+                        if turns > 20 {
+                            return Control::Stop;
+                        }
+                        pool.park_lane(1, Duration::from_millis(1));
+                        Control::Continue
+                    },
+                ),
+            );
+            assert_eq!(
+                applied.len() as u64,
+                expect_applied,
+                "steal_after {steal_after}: lane 1 took the stalled lane's backlog"
+            );
+            if expect_applied > 0 {
+                assert_eq!(applied, vec![0, 1, 2, 3], "in order");
+            }
+            assert_eq!(pool.metrics().steals, expect_steals);
+            assert_eq!(pool.metrics().queued, 4 - expect_applied as usize);
+        }
+    }
+
+    /// Under `steal_after`, a backlog shallower than the setting stays with its lane: a lane that
+    /// is merely slow to its next turn is not robbed of its own work.
+    #[test]
+    fn a_shallow_backlog_stays_with_its_lane() {
+        let pool: LanePool<(), u32> = LanePool::new(LanePoolConfig {
+            lanes: 2,
+            max_workers: 1,
+            depth_cap: 16,
+            batch: 8,
+            steal_after: 3,
+        });
+        pool.enqueue(0, 0, 1).unwrap();
+        pool.enqueue(0, 0, 2).unwrap();
+        let mut turns = 0u32;
+        let mut applied = 0u64;
+        pool.run_lane(
+            1,
+            &mut (
+                |_claimed: Claimed<'_, ()>, _event: u32| applied += 1,
+                || Control::Continue,
+                || {
+                    turns += 1;
+                    if turns > 5 {
+                        return Control::Stop;
+                    }
+                    Control::Continue
+                },
+            ),
+        );
+        assert_eq!(applied, 0);
+        assert_eq!(pool.metrics().steals, 0);
+        assert_eq!(pool.depth(0), 2);
     }
 }
