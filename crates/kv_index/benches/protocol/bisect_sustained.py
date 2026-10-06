@@ -60,6 +60,7 @@ def run_trial(
     if args.lock_scope == "trial":
         lock.acquire(args.trial_minutes)
     before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
+    record["socket_freq_mhz_before"] = hostload.socket_freq_mhz()
     started = time.time()
     with open(out / f"point{point}-trial{trial}.log", "w") as log:
         child = subprocess.Popen(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
@@ -68,6 +69,7 @@ def run_trial(
     (out / "child.pid").write_text("")
     record["wall_s"] = time.time() - started
     after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
+    record["socket_freq_mhz_after"] = hostload.socket_freq_mhz()
     if args.lock_scope == "trial":
         lock.release()
     elif lock.over_cap():

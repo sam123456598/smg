@@ -114,6 +114,26 @@ def _thread_cpus(pid: str, cores: set[int]) -> set[int]:
     return out
 
 
+def socket_freq_mhz(nodes: tuple[range, ...] = (range(0, 72), range(72, 144))) -> dict[str, float]:
+    """Mean cpufreq average frequency per socket in MHz (`cpuinfo_avg_freq`, else
+    `scaling_cur_freq`), so a trial's record says whether one socket ran slower; empty when
+    the files are not readable."""
+    out: dict[str, float] = {}
+    for index, cpus in enumerate(nodes):
+        values = []
+        for cpu in cpus:
+            for name in ("cpuinfo_avg_freq", "scaling_cur_freq"):
+                try:
+                    with open(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/{name}") as handle:
+                        values.append(int(handle.read().strip()) / 1000.0)
+                    break
+                except (OSError, ValueError):
+                    continue
+        if values:
+            out[f"socket{index}"] = sum(values) / len(values)
+    return out
+
+
 def _all_cpus() -> set[int]:
     try:
         return set(range(os.cpu_count() or 0))
