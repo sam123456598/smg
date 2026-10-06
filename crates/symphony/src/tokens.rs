@@ -2,16 +2,19 @@
 //!
 //! The engine hands each delta with the spans of its tokens ([`TokenSpan`]). A format emits the
 //! output's bytes in order, each byte in exactly one event (the conservation property), so the
-//! [`Ledger`] needs no map from bytes to events: it keeps the absolute offsets at which tokens start
-//! and, as the format emits each run of text, counts the tokens that start inside it. A token is
-//! counted in the event that carries its first byte; a span continued from an earlier delta is not
-//! a new token. A span with no bytes is one of two things the ledger cannot tell apart when it
-//! arrives: a token whose bytes the decoder still holds, the character completed by a later token,
-//! or a hidden special token. Both are queued like any other token and counted into the run that
-//! carries the next byte, which for the held half is the character it began; whatever tokens remain
-//! queued when the output ends had no bytes to follow them, and [`Ledger::finish`] reports them once
-//! as `Dropped` with `ControlToken`, no text and their count. The sum over all events is then the
-//! number of tokens: token identity, the design's fifth property.
+//! [`Ledger`] needs no map from bytes to events: it keeps the absolute offsets at which tokens
+//! start and, as the format emits each run of text, counts the tokens that start inside it. A token
+//! is counted in the event that carries its first byte; a span continued from an earlier delta is
+//! not a new token. A span with no bytes is one of two things the ledger cannot tell apart when it
+//! arrives: a token whose bytes the decoder still holds (the character completed by a later token,
+//! or a possible stop string), or a hidden special token. Both are queued like any other token and
+//! counted into the run that carries the next byte, which for the held half is the character it
+//! began; whatever tokens remain queued when the output ends had no bytes to follow them, and
+//! [`Ledger::finish`] reports them once as `Dropped` with `ControlToken`, no text and their count.
+//! Most are special tokens; a text token whose held bytes were never released (a stop string the
+//! gateway stripped, or an output cut inside a character) is among them too, since nothing in the
+//! spans tells it apart. The sum over all events is then the number of tokens: token identity, the
+//! design's fifth property.
 //!
 //! Counting is all or nothing per stream: a delta without spans for non-empty text, or with spans
 //! that do not partition its text, turns the rest of the stream uncounted (`tokens: None`), since a
@@ -67,8 +70,9 @@ impl Ledger {
         }
     }
 
-    /// The output has ended: the tokens still queued had no bytes to follow them, so they are
-    /// control tokens, reported once with their count.
+    /// The output has ended: the tokens still queued had no bytes to follow them, and are reported
+    /// once as control tokens with their count. A text token whose held bytes were never released
+    /// is among them, as the module doc says.
     pub fn finish(&mut self, out: &mut Events) {
         if self.uncounted || self.starts.is_empty() {
             return;

@@ -19,8 +19,9 @@
 //!
 //! The design's "committed stays committed" is not a separate check: `Events` is append-only and
 //! conservation forbids saying a byte twice, so nothing a parser pushed can be taken back through
-//! the event list. The fifth property, token identity (every token counted in exactly one event,
-//! whatever the cuts), is checked with a synthetic tokenization of each output. A format joins the
+//! the event list. The fifth property, token identity (every token counted once, in the event that
+//! carries its first byte, whatever the cuts), is checked event by event with a synthetic
+//! tokenization of each output. A format joins the
 //! contract with one entry in [`FORMATS`], its constructor and its corpus.
 
 mod common;
@@ -420,25 +421,41 @@ fn tokens_of(event: &Event) -> Option<u32> {
 }
 
 #[test]
-fn every_token_is_counted_in_exactly_one_event_whatever_the_cuts() {
+fn every_token_is_counted_in_the_event_that_carries_its_first_byte_whatever_the_cuts() {
     for (format, text) in corpus() {
-        // The synthetic tokens plus the byte-less one at the end.
-        let expected = token_boundaries(text).len() as u32;
+        let boundaries = token_boundaries(text);
+        // Where each synthetic token starts, and the byte-less one at the end.
+        let mut starts: Vec<usize> = boundaries[..boundaries.len() - 1].to_vec();
+        starts.push(text.len());
         for cuts in chunkings(text) {
             let events = replay_counted(format, text, &cuts)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", format.name));
             let place = || format!("{}: {text:?} cut at {cuts:?}", format.name);
-            let counts: Vec<u32> = events
-                .iter()
-                .filter(|e| {
-                    !matches!(
-                        e,
-                        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. }
-                    )
-                })
-                .map(|e| tokens_of(e).unwrap_or_else(|| panic!("{}: uncounted {e:?}", place())))
-                .collect();
-            assert_eq!(counts.iter().sum::<u32>(), expected, "{}", place());
+            let mut at = 0;
+            for event in &events {
+                let Some(tokens) = tokens_of(event) else {
+                    continue;
+                };
+                let length = bytes_of(event).len();
+                let expected = match event {
+                    // The byte-less token at the end has no byte to follow it.
+                    Event::Dropped {
+                        why: DropReason::ControlToken,
+                        ..
+                    } if length == 0 => starts.iter().filter(|&&start| start >= text.len()).count(),
+                    _ => starts
+                        .iter()
+                        .filter(|&&start| start >= at && start < at + length)
+                        .count(),
+                };
+                assert_eq!(
+                    tokens as usize,
+                    expected,
+                    "{}: {event:?} at byte {at}",
+                    place()
+                );
+                at += length;
+            }
             let reasoning: u32 = events
                 .iter()
                 .filter_map(|e| match e {
