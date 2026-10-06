@@ -1320,6 +1320,30 @@ fn issue_queries(
     (thread_cpu_time_ns().saturating_sub(cpu_started), failure)
 }
 
+/// The owned payload of one event in Dynamo's block layout, as its lane receives it under
+/// `--mirror-dynamo-costs`.
+fn payload_for(corpus: &Corpus, op: &Op) -> Payload {
+    match op.kind {
+        OpKind::Stored { start, len, .. } => Payload::Stored(
+            corpus.blocks[start as usize..start as usize + len as usize]
+                .iter()
+                .map(|block| WireBlock {
+                    block_hash: block.seq_hash.0,
+                    tokens_hash: block.content_hash.0,
+                    mm_extra_info: None,
+                })
+                .collect(),
+        ),
+        OpKind::Removed { start, len, .. } => Payload::Removed(
+            corpus.removed[start as usize..start as usize + len as usize]
+                .iter()
+                .map(|hash| hash.0)
+                .collect(),
+        ),
+        _ => Payload::None,
+    }
+}
+
 /// One event in an issuer's dispatch: its operation, deadline group, lane and (when mirroring
 /// Dynamo's costs) the owned payload the lane receives.
 struct EventDispatch {
@@ -1416,6 +1440,20 @@ enum Queries {
     Off,
 }
 
+/// Which thread builds the owned event payloads of `--mirror-dynamo-costs`, and so which
+/// allocator arena and NUMA node they live on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum PayloadHome {
+    /// The main thread, before the trial, as Dynamo's preparation does: one arena for every
+    /// payload, which every lane frees into. On two sockets that one arena's lock and free lists
+    /// bounce between the sockets on every event, and the lanes' CPU per block doubles.
+    Main,
+    /// Each event issuer, in its pinned thread, for its own dispatch: payloads live on the
+    /// issuer's socket and the lanes free into the issuer's arena (under `--issuer-by-lane` the
+    /// same socket), so a two-socket row measures the index and not the allocator.
+    Issuer,
+}
+
 /// How a lookup is spread over the index's shards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Lookups {
@@ -1477,6 +1515,10 @@ struct Args {
     /// `per-shard` (one lane per shard on the shard's cores, merged by the last to finish).
     #[arg(long, value_enum, default_value = "all-shards")]
     lookups: Lookups,
+    /// Who builds the mirrored event payloads: the `main` thread before the trial (Dynamo's
+    /// method) or each `issuer` in its own pinned thread (payloads on the issuer's socket).
+    #[arg(long, value_enum, default_value = "main")]
+    payload_home: PayloadHome,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
     /// reference window when they differ.
     #[arg(long, conflicts_with = "offered_block_ops_per_sec")]
@@ -1680,7 +1722,7 @@ fn run<B: ReplayBackend>(
     }
     // The layout, first line of every run log, so the provenance shows it at a glance.
     println!(
-        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores), shards {}, lane memory {:?}, event lanes {}, queries {:?}, lookups {:?}",
+        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores), shards {}, lane memory {:?}, event lanes {}, queries {:?}, lookups {:?}, payload home {:?}",
         issuer_threads,
         issuer_cpus,
         query_issuers,
@@ -1694,6 +1736,7 @@ fn run<B: ReplayBackend>(
         if args.pin_event_lanes { "pinned one per core" } else { "floating" },
         args.queries,
         args.lookups,
+        args.payload_home,
     );
     if window_ns != corpus.reference_window_ns {
         let reference = corpus.reference_window_ns.max(1) as u128;
@@ -1755,25 +1798,12 @@ fn run<B: ReplayBackend>(
                 event_issuer_for(op.worker, corpus.logical_workers, issuer_threads)
             };
             // Under --mirror-dynamo-costs the payload is built here, before the trial, as Dynamo's
-            // preparation builds the owned events its issuers move to the lanes.
-            let payload = match op.kind {
-                OpKind::Stored { start, len, .. } if mirror => Payload::Stored(
-                    corpus.blocks[start as usize..start as usize + len as usize]
-                        .iter()
-                        .map(|block| WireBlock {
-                            block_hash: block.seq_hash.0,
-                            tokens_hash: block.content_hash.0,
-                            mm_extra_info: None,
-                        })
-                        .collect(),
-                ),
-                OpKind::Removed { start, len, .. } if mirror => Payload::Removed(
-                    corpus.removed[start as usize..start as usize + len as usize]
-                        .iter()
-                        .map(|hash| hash.0)
-                        .collect(),
-                ),
-                _ => Payload::None,
+            // preparation builds the owned events its issuers move to the lanes; or by the issuer
+            // itself under --payload-home issuer.
+            let payload = if mirror && args.payload_home == PayloadHome::Main {
+                payload_for(&corpus, op)
+            } else {
+                Payload::None
             };
             event_dispatch[shard].push(EventDispatch {
                 id: op.id,
@@ -1944,14 +1974,22 @@ fn run<B: ReplayBackend>(
                 (records, cpu_ns, failure)
             }));
         }
+        let issuer_payloads = mirror && args.payload_home == PayloadHome::Issuer;
         for (idx, dispatch) in event_dispatch.into_iter().enumerate() {
             let cpu = issuer_cpus.get(idx).copied();
             let senders = &senders;
             handles.push(scope.spawn(move || {
+                let mut dispatch = dispatch;
                 let pin = cpu.map_or(Ok(()), |cpu| pin_current_thread(&[cpu]));
                 let mut failure = pin.err().map(|_| "issuer_affinity");
                 if failure.is_some() {
                     shared_ref.peer_failed.store(true, Ordering::Release);
+                }
+                if issuer_payloads {
+                    // Built here, pinned: the payloads take this thread's arena and NUMA node.
+                    for entry in &mut dispatch {
+                        entry.payload = payload_for(corpus_ref, &corpus_ref.ops[entry.id as usize]);
+                    }
                 }
                 ready_ref.wait();
                 start_ref.wait();
@@ -2191,6 +2229,7 @@ fn run<B: ReplayBackend>(
             Lookups::AllShards => "all-shards",
             Lookups::PerShard => "per-shard",
         },
+        "payload_home": format!("{:?}", args.payload_home).to_lowercase(),
         "lookup_fanout": (fan > 1).then(|| json!({
             "fan": fan,
             "groups": lookup_groups,
