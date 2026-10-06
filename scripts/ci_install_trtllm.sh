@@ -21,6 +21,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 
 TRTLLM_VERSION="1.3.0rc29"
+# Mirrors the exact NCCL build 1.3.0rc29 requires (rc27 still took a range). A
+# wider range here would just be overwritten by the engine install below.
 NCCL_VERSION_CONSTRAINT="nvidia-nccl-cu13==2.30.7"
 
 # Activate venv if it exists
@@ -80,7 +82,7 @@ $RETRY 3 10 pip install --no-cache-dir "$NCCL_VERSION_CONSTRAINT"
 # the release appeared. 13.3.1 is the last version the lane ran on.
 #
 # The grpc-smg extra carries smg-grpc-proto, which the gRPC serving path needs.
-# It used to be an unconditional dependency; 1.3.0rc27 moved it behind an extra,
+# It used to be an unconditional dependency; 1.3.0rc25 moved it behind an extra,
 # so a plain install now starts and then dies at worker startup with
 # "gRPC serving with the SMG protocol requires the optional 'smg-grpc-proto'".
 echo "Installing tensorrt-llm[grpc-smg]==${TRTLLM_VERSION} from pypi.nvidia.com..."
