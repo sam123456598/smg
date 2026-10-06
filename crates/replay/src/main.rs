@@ -17,6 +17,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    io::Write,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -27,7 +28,10 @@ use clap::Parser;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::{watch, Semaphore},
+    task::JoinSet,
+};
 
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Replay a Mooncake trace through the gateway and score routing quality")]
@@ -830,6 +834,96 @@ async fn fetch_admin_records(client: &reqwest::Client, admin: &str) -> Result<Ve
     Ok(all)
 }
 
+/// One worker's line of the mock admin API's `GET /admin/fleet` snapshot.
+#[derive(Deserialize, Debug, Clone)]
+struct FleetWorker {
+    worker: String,
+    #[serde(default)]
+    num_running_reqs: u64,
+    #[serde(default)]
+    num_waiting_reqs: u64,
+    #[serde(default)]
+    num_waiting_uncached_tokens: u64,
+    #[serde(default)]
+    token_usage: f64,
+    #[serde(default)]
+    num_cached_blocks: u64,
+    #[serde(default)]
+    num_preemptions: u64,
+    #[serde(default)]
+    num_kv_batches: u64,
+}
+
+#[derive(Deserialize, Debug)]
+struct FleetSnapshot {
+    workers: Vec<FleetWorker>,
+}
+
+const FLEET_CSV_HEADER: &str =
+    "t_s,worker,running,waiting,waiting_uncached_tokens,token_usage,cached_blocks,preemptions,kv_batches";
+
+/// Samples the fleet's admin snapshot once a second into `path` (`fleet.csv`:
+/// one row per worker per tick, seconds since `start`) until `stop` turns
+/// true. The header is written before the first poll, so the file exists
+/// with a header even when the admin API never answers; a failed poll is
+/// skipped, not fatal. Returns the number of rows written.
+async fn sample_fleet(
+    client: reqwest::Client,
+    admin: String,
+    path: PathBuf,
+    start: Instant,
+    mut stop: watch::Receiver<bool>,
+) -> Result<usize> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut out = String::from(FLEET_CSV_HEADER);
+    out.push('\n');
+    fs::write(&path, &out)?;
+    let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+    let url = format!("{}/admin/fleet", admin.trim_end_matches('/'));
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut rows = 0usize;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+                continue;
+            }
+        }
+        let t_s = start.elapsed().as_secs_f64();
+        let snapshot = match client.get(&url).send().await {
+            Ok(resp) => resp.json::<FleetSnapshot>().await,
+            Err(e) => Err(e),
+        };
+        let Ok(snapshot) = snapshot else {
+            continue;
+        };
+        let mut chunk = String::new();
+        for w in &snapshot.workers {
+            chunk.push_str(&format!(
+                "{t_s:.1},{},{},{},{},{:.4},{},{},{}\n",
+                w.worker,
+                w.num_running_reqs,
+                w.num_waiting_reqs,
+                w.num_waiting_uncached_tokens,
+                w.token_usage,
+                w.num_cached_blocks,
+                w.num_preemptions,
+                w.num_kv_batches
+            ));
+            rows += 1;
+        }
+        file.write_all(chunk.as_bytes())?;
+    }
+    file.flush()?;
+    Ok(rows)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -858,6 +952,19 @@ async fn main() -> Result<()> {
     let inflight = Arc::new(Semaphore::new(args.max_inflight));
     let mut set: JoinSet<ReqResult> = JoinSet::new();
     let start = Instant::now();
+    // Per-second fleet series (admin snapshots) for the whole run, when the
+    // admin API is given; stopped once every request has finished.
+    let (stop_fleet, fleet_stop_rx) = watch::channel(false);
+    let mut fleet_set: JoinSet<Result<usize>> = JoinSet::new();
+    if let Some(admin) = &args.admin {
+        fleet_set.spawn(sample_fleet(
+            client.clone(),
+            admin.clone(),
+            args.out.join("fleet.csv"),
+            start,
+            fleet_stop_rx,
+        ));
+    }
     eprintln!(
         "replaying {} rows at {}x ({:.0} s of trace), {} words/block, max_output {}",
         rows.len(),
@@ -906,6 +1013,15 @@ async fn main() -> Result<()> {
     }
     let wall_s = start.elapsed().as_secs_f64();
     results.sort_by_key(|r| r.row);
+    if !fleet_set.is_empty() {
+        let _ = stop_fleet.send(true);
+        match fleet_set.join_next().await {
+            Some(Ok(Ok(rows))) => eprintln!("fleet series: {rows} rows in fleet.csv"),
+            Some(Ok(Err(e))) => eprintln!("fleet series not written: {e}"),
+            Some(Err(e)) => eprintln!("fleet series task failed: {e}"),
+            None => {}
+        }
+    }
 
     // Oracle join (optional).
     let mut admin_rows: HashMap<String, AdminRecord> = HashMap::new();
@@ -1085,6 +1201,104 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-endpoint HTTP/1.1 server answering every request with the given
+    /// body (what `GET /admin/fleet` returns), for the fleet sampler test.
+    async fn serve_json(body: &'static str) -> (String, JoinSet<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut server: JoinSet<()> = JoinSet::new();
+        server.spawn(async move {
+            let mut conns: JoinSet<()> = JoinSet::new();
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                conns.spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut n = 0;
+                    while n < buf.len() {
+                        let Ok(k) = sock.read(&mut buf[n..]).await else {
+                            return;
+                        };
+                        if k == 0 {
+                            return;
+                        }
+                        n += k;
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    #[tokio::test]
+    async fn fleet_series_has_a_header_and_one_row_per_worker_per_second() {
+        let (admin, _server) = serve_json(
+            r#"{"workers":[{"worker":"grpc:1","num_running_reqs":2,"num_waiting_reqs":1,"num_waiting_uncached_tokens":300,"token_usage":0.25,"num_cached_blocks":40,"num_preemptions":0,"num_kv_batches":9},{"worker":"grpc:2","num_running_reqs":0,"num_waiting_reqs":0,"token_usage":0.0,"num_cached_blocks":0,"num_preemptions":0,"num_kv_batches":0}]}"#,
+        )
+        .await;
+        let dir = std::env::temp_dir().join(format!("replay-fleet-{}", std::process::id()));
+        let path = dir.join("fleet.csv");
+        let (stop, rx) = watch::channel(false);
+        // The test server is local: no proxy from the environment.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let mut sampler: JoinSet<Result<usize>> = JoinSet::new();
+        sampler.spawn(sample_fleet(
+            client,
+            admin,
+            path.clone(),
+            Instant::now(),
+            rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        let _ = stop.send(true);
+        let rows = sampler
+            .join_next()
+            .await
+            .expect("a task")
+            .expect("join")
+            .expect("sampler");
+        let text = fs::read_to_string(&path).expect("fleet.csv");
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some(FLEET_CSV_HEADER));
+        let data: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();
+        assert_eq!(data.len(), rows);
+        // ticks at 0, 1 and 2 s inside 2.6 s, two workers each
+        assert!((4..=8).contains(&rows) && rows % 2 == 0, "rows {rows}");
+        assert_eq!(data[0][1], "grpc:1");
+        assert_eq!(data[1][1], "grpc:2");
+        assert_eq!(&data[0][2..], &["2", "1", "300", "0.2500", "40", "0", "9"]);
+        let t: Vec<f64> = data
+            .iter()
+            .step_by(2)
+            .map(|r| r[0].parse().expect("t_s"))
+            .collect();
+        for w in t.windows(2) {
+            assert!(
+                (w[1] - w[0] - 1.0).abs() < 0.3,
+                "one tick per second: {t:?}"
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
 
     #[test]
     fn block_text_is_deterministic_per_hash_id() {
