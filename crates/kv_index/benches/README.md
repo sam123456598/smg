@@ -89,6 +89,7 @@ export is deterministic: two exports of the same arguments hash identically.
 | `--query-lanes`, `--event-lanes`, `--issuer-threads`, `--query-issuer-threads` | Lane and issuer counts. |
 | `--issuer-cpus`, `--query-issuer-cpus`, `--backend-cpus`, `--pin-event-lanes`, `--issuer-by-lane` | Placement. Issuer CPUs inside the lane set are refused. |
 | `--owned-payloads`, `--payload-home main\|issuer` | The owned-payload cost model above. |
+| `--lane-scheduling owned\|stealing`, `--steal-after` | How event lanes share work: each lane applies its own workers only, or the event lanes of each shard form one lane pool that serves whole workers and takes a worker from a lane that is not running once its backlog is `--steal-after` events deep; the pools' counters go into the result. |
 | `--queries on\|off`, `--lookups all-shards\|per-shard`, `--count-shard-heads` | Diagnostics: events only; one lane per shard merged by the last to finish; a count of lookups by how many shards hold the request's first block. |
 | `--result-json-output` | The result record: rates, lookup percentiles, queue depths, per-lane CPU and completion times, the layout, and a provenance object (argv, binary and corpus hashes, trace parameters). |
 
