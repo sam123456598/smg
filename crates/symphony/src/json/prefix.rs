@@ -4,8 +4,8 @@
 //! The assembler and the constrained format promise that the argument fragments they emit always
 //! form a valid JSON prefix. [`scan`] is how they keep it: a byte-by-byte run of the JSON grammar
 //! over the value's text so far, which says how many leading bytes some value could still continue
-//! (`valid`) and, once the text holds a whole value, where it ends (`complete`). It is a function of
-//! the text alone, so where fragments stop and malformed text begins does not depend on how the
+//! (`valid`) and, once the text holds a whole value, where it ends (`complete`). It is a function
+//! of the text alone, so where fragments stop and malformed text begins does not depend on how the
 //! output was cut into deltas; the ported prefix parser, which decided this before, tolerated a
 //! literal's prefix differently whole and in pieces, and the boundary moved with the cuts.
 //!
@@ -13,13 +13,13 @@
 //! escapes and four hex digits after `\u`, numbers without leading zeros, `true`, `false` and
 //! `null`, and the four whitespace bytes between tokens. Two deliberate readings: a number at the
 //! very end of the text is a valid prefix but never whole, since more digits may come, so a bare
-//! number is whole only once a byte that cannot continue it has arrived; and a raw control character
-//! inside a string is taken as the string's content, as the model wrote it, rather than refused.
-//! Nesting beyond [`MAX_DEPTH`] is refused, as the ported parser refused it. One malformation the
-//! ported parser tolerated is refused here as the grammar refuses it: a trailing comma before a
-//! closing bracket, `{"a": 1,}`, which the old gateway healed into `{"a":1}`, stops the fragments
-//! before the bracket and makes the bracket malformed. Whether to heal it instead is a policy
-//! question for the formats, not for the acceptor.
+//! number is whole only once a byte that cannot continue it has arrived; and a raw control
+//! character inside a string is taken as the string's content, as the model wrote it, rather than
+//! refused. Nesting beyond [`MAX_DEPTH`] is refused, as the ported parser refused it. One
+//! malformation the ported parser tolerated is refused here as the grammar refuses it: a trailing
+//! comma before a closing bracket, `{"a": 1,}`, which the old gateway healed into `{"a":1}`, stops
+//! the fragments before the bracket and makes the bracket malformed. Whether to heal it instead is
+//! a policy question for the formats, not for the acceptor.
 
 /// Where a text stands as the prefix of one JSON value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
