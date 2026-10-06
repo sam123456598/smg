@@ -1446,6 +1446,15 @@ enum Queries {
 /// Which thread builds the owned event payloads of `--owned-payloads`, and so which
 /// allocator arena and NUMA node they live on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LaneScheduling {
+    /// Every event lane applies its own workers' events, in order, and nothing else (today).
+    Owned,
+    /// A lane whose queue is empty takes a waiting worker from a lane that has fallen behind by
+    /// `--steal-after` events; needs a lane pool with a `steal_after` setting.
+    Stealing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum PayloadHome {
     /// The main thread, before the trial, as a preparation step does: one arena for every
     /// payload, which every lane frees into. On two sockets that one arena's lock and free lists
@@ -1527,6 +1536,16 @@ struct Args {
     /// in its own pinned thread (payloads on the issuer's socket).
     #[arg(long, value_enum, default_value = "main")]
     payload_home: PayloadHome,
+    /// How event lanes share work: `owned` (each lane applies its own workers only) or
+    /// `stealing` (an idle lane takes a worker from a lane that has fallen behind by
+    /// `--steal-after` events). Recorded in the result; `stealing` with a non-zero
+    /// `--steal-after` needs a lane pool that takes the setting.
+    #[arg(long, value_enum, default_value = "owned")]
+    lane_scheduling: LaneScheduling,
+    /// Events a lane may fall behind by before another lane steals one of its workers under
+    /// `--lane-scheduling stealing`; 0 (the default) means no stealing.
+    #[arg(long, default_value = "0")]
+    steal_after: usize,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
     /// reference window when they differ.
     #[arg(long, conflicts_with = "offered_block_ops_per_sec")]
@@ -1584,6 +1603,14 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    // The pool that hands a fallen-behind lane's worker to an idle one is the index's; until its
+    // `steal_after` setting exists this build runs lanes as owners, and says so rather than
+    // measuring something else under the stealing label.
+    anyhow::ensure!(
+        !(args.lane_scheduling == LaneScheduling::Stealing && args.steal_after > 0),
+        "--lane-scheduling stealing with --steal-after {} needs a lane pool that takes steal_after; this build has none (use --steal-after 0, which runs owned lanes)",
+        args.steal_after
+    );
     let corpus = load_corpus(&args.corpus)?;
     let window_ns = match (args.benchmark_duration_ms, args.offered_block_ops_per_sec) {
         (Some(ms), _) => ms * 1_000_000,
@@ -1729,7 +1756,7 @@ fn run<B: ReplayBackend>(
     }
     // The layout, first line of every run log, so the provenance shows it at a glance.
     println!(
-        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores), shards {}, lane memory {:?}, event lanes {}, queries {:?}, lookups {:?}, payload home {:?}",
+        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores), shards {}, lane memory {:?}, event lanes {}, queries {:?}, lookups {:?}, payload home {:?}, lane scheduling {:?} (steal after {})",
         issuer_threads,
         issuer_cpus,
         query_issuers,
@@ -1744,6 +1771,8 @@ fn run<B: ReplayBackend>(
         args.queries,
         args.lookups,
         args.payload_home,
+        args.lane_scheduling,
+        args.steal_after,
     );
     if window_ns != corpus.reference_window_ns {
         let reference = corpus.reference_window_ns.max(1) as u128;
@@ -2236,6 +2265,8 @@ fn run<B: ReplayBackend>(
             Lookups::PerShard => "per-shard",
         },
         "payload_home": format!("{:?}", args.payload_home).to_lowercase(),
+        "lane_scheduling": format!("{:?}", args.lane_scheduling).to_lowercase(),
+        "steal_after": args.steal_after,
         "lookup_fanout": (fan > 1).then(|| json!({
             "fan": fan,
             "groups": lookup_groups,
