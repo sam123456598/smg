@@ -1015,9 +1015,20 @@ impl KvEventMonitor {
                 rank,
                 chunks = chunk.count,
                 blocks = chunk.blocks,
+                unknown_before = chunk.unknown_before,
                 through = batch.sequence_number + u64::from(chunk.count.saturating_sub(chunk.index + 1)),
                 "KV event relay served a state snapshot; replacing the worker's index state"
             );
+            if chunk.unknown_before > 0 {
+                warn!(
+                    worker_url = %worker_url,
+                    rank,
+                    unknown_before = chunk.unknown_before,
+                    "KV event relay snapshot starts late: the engine's blocks from before the \
+                     relay's record are unknown; the worker's index is partial until they leave \
+                     the engine (rank degraded)"
+                );
+            }
             Self::apply_cleared(worker_id, indexer, &mut state.index);
             for cursor in state.ranks.values_mut() {
                 cursor.reset();
@@ -1029,11 +1040,11 @@ impl KvEventMonitor {
                 blocks: chunk.blocks,
             });
         }
-        state
-            .ranks
-            .entry(rank)
-            .or_default()
-            .resync_to(batch.sequence_number);
+        let cursor = state.ranks.entry(rank).or_default();
+        cursor.resync_to(batch.sequence_number);
+        if chunk.unknown_before > 0 {
+            cursor.mark_degraded();
+        }
         on_batch(batch);
         for event in &batch.events {
             Self::apply_event(event, worker_id, indexer, &mut state.index);
@@ -2815,6 +2826,7 @@ mod tests {
                         index: index as u32,
                         count,
                         blocks,
+                        unknown_before: 0,
                     }),
                 }
             })
@@ -2945,6 +2957,28 @@ mod tests {
         assert_eq!(sim.deliver(&next), BatchOutcome::Applied);
         sim.assert_matches_reference();
         assert_eq!(sim.reference.worker_block_count(sim.worker), 1);
+    }
+
+    /// A snapshot whose relay joined the publisher late and could not replay
+    /// the start leaves the rank degraded, as an unrecovered gap would; a
+    /// whole one lifts it.
+    #[test]
+    fn a_snapshot_that_starts_late_marks_the_rank_degraded() {
+        let mut sim = Sim::new();
+        let mut late = snapshot_chunks(9, None, &[vec![stored(None, &[1])]], 1);
+        late[0].snapshot.as_mut().unwrap().unknown_before = 40;
+        assert_eq!(sim.feed(&late[0]), BatchOutcome::Applied);
+        assert!(sim.state.ranks[&0].is_degraded());
+        assert_eq!(sim.state.degraded_ranks(), 1);
+        assert_eq!(
+            sim.feed(&batch(10, None, vec![stored(Some(1), &[2])])),
+            BatchOutcome::Applied
+        );
+        assert!(sim.state.ranks[&0].is_degraded(), "until the next resync");
+        let whole = snapshot_chunks(12, None, &[vec![stored(None, &[1])]], 1);
+        assert_eq!(sim.feed(&whole[0]), BatchOutcome::Applied);
+        assert!(!sim.state.ranks[&0].is_degraded());
+        assert_eq!(sim.state.degraded_ranks(), 0);
     }
 
     /// A stream that ends with chunks still owed leaves a partial live set:

@@ -105,6 +105,24 @@ impl History {
         self.append(seq, Entry::Lost, ENTRY_OVERHEAD);
     }
 
+    /// Record that `from..=to` passed without batches (`from` the next
+    /// sequence, any when the history is empty). Only the newest
+    /// `max_batches` of them could stay in the window, so a longer run
+    /// starts the window over at the slots that would have survived.
+    pub fn push_lost_range(&mut self, from: u64, to: u64) {
+        if to < from {
+            return;
+        }
+        let mut from = from;
+        if to - from + 1 > self.max_batches as u64 {
+            self.clear();
+            from = to + 1 - self.max_batches as u64;
+        }
+        for seq in from..=to {
+            self.push_lost(seq);
+        }
+    }
+
     fn append(&mut self, seq: u64, entry: Entry, bytes: usize) {
         if let Some(newest) = self.newest() {
             if seq != newest + 1 {
@@ -299,6 +317,28 @@ mod tests {
             history.complete_from_start(),
             "a new incarnation starts over"
         );
+    }
+
+    #[test]
+    fn a_run_of_lost_sequences_keeps_only_what_the_window_would() {
+        let mut history = History::new(4, usize::MAX);
+        history.push_lost_range(0, 9);
+        assert_eq!((history.oldest(), history.newest()), (Some(6), Some(9)));
+        assert_eq!((history.len(), history.holes()), (4, 4));
+        history.push(10, batch(10, 1));
+        // The batch evicts the oldest hole: the window is 7..=10.
+        assert_eq!(history.after(5), Err(Window::Behind { oldest: 7 }));
+        assert_eq!(seqs(&history.after(6).unwrap()), vec![10]);
+        assert!(!history.complete_from_start());
+        // A short run after batches stays contiguous with them.
+        let mut short = History::new(10, usize::MAX);
+        short.push(0, batch(0, 1));
+        short.push_lost_range(1, 3);
+        short.push(4, batch(4, 1));
+        assert_eq!((history.len() + short.len(), short.holes()), (9, 3));
+        assert_eq!(seqs(&short.after(0).unwrap()), vec![4]);
+        short.push_lost_range(5, 4);
+        assert_eq!(short.newest(), Some(4), "an empty run is nothing");
     }
 
     #[test]

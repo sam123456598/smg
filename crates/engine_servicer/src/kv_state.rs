@@ -426,13 +426,16 @@ pub struct SnapshotChunks {
     through: u64,
     timestamp: f64,
     blocks: u64,
+    unknown_before: u64,
 }
 
 impl SnapshotChunks {
     /// Order `snapshot`, taken at sequence `through`, and size its chunks so
     /// that they can be stamped `through - count + 1 ..= through`; `timestamp`
-    /// is what the chunks carry (the gateway reads it as the publish time).
-    pub fn new(snapshot: Snapshot, through: u64, timestamp: f64) -> Self {
+    /// is what the chunks carry (the gateway reads it as the publish time),
+    /// `unknown_before` how many publisher sequences before the relay's
+    /// record the snapshot cannot cover (0 for a record from the start).
+    pub fn new(snapshot: Snapshot, through: u64, timestamp: f64, unknown_before: u64) -> Self {
         let blocks = snapshot.blocks;
         let ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)> = snapshot
             .ranks
@@ -468,6 +471,7 @@ impl SnapshotChunks {
             through,
             timestamp,
             blocks,
+            unknown_before,
         }
     }
 
@@ -533,6 +537,7 @@ impl SnapshotChunks {
                 index,
                 count: self.count,
                 blocks: self.blocks,
+                unknown_before: self.unknown_before,
             }),
         })
     }
@@ -753,7 +758,7 @@ mod tests {
     }
 
     fn chunks_of(state: &LiveState, through: u64) -> Vec<common::KvEventBatch> {
-        SnapshotChunks::new(state.snapshot(), through, 2.0).collect()
+        SnapshotChunks::new(state.snapshot(), through, 2.0, 0).collect()
     }
 
     #[test]
@@ -832,7 +837,8 @@ mod tests {
             Some(common::KvSnapshotChunk {
                 index: 0,
                 count: 1,
-                blocks: 5
+                blocks: 5,
+                unknown_before: 0,
             })
         );
         assert!(
@@ -956,10 +962,18 @@ mod tests {
             Some(common::KvSnapshotChunk {
                 index: 0,
                 count: 1,
-                blocks: 0
+                blocks: 0,
+                unknown_before: 0,
             })
         );
         assert_eq!(chunks[0].dp_rank, None);
+        // A record that starts late says so on every chunk.
+        let late: Vec<common::KvEventBatch> =
+            SnapshotChunks::new(state.snapshot(), 12, 2.0, 7).collect();
+        assert_eq!(
+            late[0].snapshot.as_ref().map(|chunk| chunk.unknown_before),
+            Some(7)
+        );
     }
 
     #[test]
@@ -985,7 +999,7 @@ mod tests {
         let snapshot = state.snapshot();
         let collected = started.elapsed();
         let started = Instant::now();
-        let mut chunks = SnapshotChunks::new(snapshot, 20_000, 3.0);
+        let mut chunks = SnapshotChunks::new(snapshot, 20_000, 3.0, 0);
         let ordered = started.elapsed();
         let started = Instant::now();
         let mut blocks = 0;

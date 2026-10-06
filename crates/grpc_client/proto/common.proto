@@ -51,6 +51,13 @@ message KvSnapshotChunk {
   uint32 count = 2;
   // Live blocks in the whole snapshot, physical copies counted.
   uint64 blocks = 3;
+  // Publisher sequences before the relay's record that it never saw: 0 when
+  // the record covers the engine's whole life (the relay joined before the
+  // publisher's second batch, or the engine's replay reached back to the
+  // start); otherwise the snapshot lacks whatever those batches stored and
+  // did not remove since, and the subscriber should treat the worker as
+  // partially known.
+  uint64 unknown_before = 4;
 }
 
 message KvCacheEvent {

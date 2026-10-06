@@ -302,6 +302,13 @@ impl RankState {
         self.tail_overflowed = false;
     }
 
+    /// The relay's snapshot could not cover the engine's whole life
+    /// (`KvSnapshotChunk.unknown_before`): the rank's blocks are a partial
+    /// set until the next resync, as after an unrecovered gap.
+    pub(crate) fn mark_degraded(&mut self) {
+        self.degraded = true;
+    }
+
     /// The server declared its history gone (`OUT_OF_RANGE` / `DATA_LOSS`) or
     /// the subscriber decided to drop the rank: forget the cursor so the next
     /// stream is taken from wherever it starts.

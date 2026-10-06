@@ -41,7 +41,18 @@
 //! ROUTER, the mock engine's too); what the replay cannot give leaves a hole
 //! in the window, counted, which a subscriber skips the way the live stream
 //! did. A payload that does not decode relays as an empty batch under its
-//! sequence, so nobody sees a gap for it.
+//! sequence, so nobody sees a gap for it. The batches before the first one
+//! the relay sees are treated the same way: ZMQ delivers nothing from before
+//! a subscription, so a relay whose first batch (of an incarnation) is past
+//! sequence 1 (the publishers count from 0, the mock engine from 1) asks the
+//! replay for everything from 0 before relaying it, unless that batch
+//! carries the engine's startup clear, after which nothing earlier matters.
+//! What the replay no longer reaches back to is counted as unknown before
+//! the record's start (`unknown_before_start`): the window is then not
+//! complete from the publisher's first batch, a subscriber from zero gets
+//! the snapshot, and the snapshot's chunks carry `unknown_before` so the
+//! gateway marks the worker degraded instead of trusting a silently partial
+//! state.
 //!
 //! A publisher restart is read the same way on every wire, from three signs
 //! (vLLM and SGLang count from 0 per process; SGLang's first batch after a
@@ -212,6 +223,10 @@ pub struct RelayCounts {
     pub gap_batches_recovered: u64,
     /// Batches of those gaps nobody had: holes in the window.
     pub gap_batches_lost: u64,
+    /// Publisher sequences before the relay's record that neither the stream
+    /// nor the engine's replay gave (summed over incarnations): how late the
+    /// history and the snapshots start.
+    pub unknown_before_start: u64,
     /// Publisher incarnations after the first.
     pub publisher_restarts: u64,
     /// Subscribers that fell behind the live channel and were refilled.
@@ -230,6 +245,9 @@ struct Shared {
     /// nothing from before it, which is how a relay that started (or
     /// restarted) after the publisher tells a resume from before its time.
     started_at: Option<u64>,
+    /// Sequences of this incarnation before the record that even the
+    /// engine's replay no longer had: what a snapshot cannot cover.
+    unknown_before: u64,
     /// Counts the publisher's restarts; sequences compare within one.
     generation: u64,
     counts: RelayCounts,
@@ -305,6 +323,7 @@ impl Shared {
         self.state.clear();
         self.cursor = None;
         self.started_at = None;
+        self.unknown_before = 0;
         self.counts.publisher_restarts += 1;
         self.generation
     }
@@ -364,6 +383,7 @@ impl KvEventRelay {
                 state: LiveState::new(),
                 cursor: None,
                 started_at: None,
+                unknown_before: 0,
                 generation: 0,
                 counts: RelayCounts::default(),
                 failed: None,
@@ -486,6 +506,7 @@ impl KvEventRelay {
                         collected,
                         oldest: shared.history.oldest(),
                         holes: shared.history.holes(),
+                        unknown_before: shared.unknown_before,
                     }
                 } else {
                     Serve::Live
@@ -554,6 +575,7 @@ impl KvEventRelay {
                 collected,
                 oldest,
                 holes,
+                unknown_before,
             } => {
                 info!(
                     endpoint = %self.config.endpoint,
@@ -564,6 +586,7 @@ impl KvEventRelay {
                     collected_us = u64::try_from(collected.as_micros()).unwrap_or(u64::MAX),
                     oldest,
                     holes,
+                    unknown_before,
                     "SubscribeKvEvents: the history no longer starts at the publisher's first \
                      batch; serving a state snapshot"
                 );
@@ -571,7 +594,7 @@ impl KvEventRelay {
                 // Ordering and sizing the chunks is a pass over every live
                 // block: off the runtime's workers, and off the lock.
                 let ordering = tokio::task::spawn_blocking(move || {
-                    SnapshotChunks::new(snapshot, through, timestamp)
+                    SnapshotChunks::new(snapshot, through, timestamp, unknown_before)
                 });
                 (Vec::new(), Some(through), SnapshotPhase::Ordering(ordering))
             }
@@ -605,6 +628,7 @@ enum Serve {
         collected: Duration,
         oldest: Option<u64>,
         holes: usize,
+        unknown_before: u64,
     },
     Live,
 }
@@ -785,7 +809,18 @@ async fn run(config: RelayConfig, shared: Arc<Mutex<Shared>>, live: broadcast::S
             Decoded::Batch(batch)
                 if matches!(batch.events.first(), Some(WireEvent::AllBlocksCleared { .. }))
         );
-        let mut admission = lock(&shared).admit(sequence, startup_clear);
+        let (first, mut admission) = {
+            let shared = lock(&shared);
+            (
+                shared.cursor.is_none(),
+                shared.admit(sequence, startup_clear),
+            )
+        };
+        if first && admission == Admission::Accept && joined_late(sequence, startup_clear) {
+            relay.recover_start(sequence).await;
+            // The replay may have given this sequence too.
+            admission = lock(&shared).admit(sequence, startup_clear);
+        }
         if let Admission::Gap { from, to } = admission {
             relay.recover_gap(from..=to).await;
             // The replay may have run past the live sequence.
@@ -811,10 +846,34 @@ async fn run(config: RelayConfig, shared: Arc<Mutex<Shared>>, live: broadcast::S
                 );
                 let _ = live.send(Live::Restart { generation });
                 relay.normalizer = Normalizer::from_env();
+                // The SUB re-joins a restarted publisher a moment late too.
+                if joined_late(sequence, startup_clear) {
+                    relay.recover_start(sequence).await;
+                    if lock(&shared).admit(sequence, startup_clear) != Admission::Accept {
+                        continue;
+                    }
+                }
                 relay.relay(sequence, decoded);
             }
         }
     }
+}
+
+/// Whether the first batch of an incarnation shows the relay joined after the
+/// publisher's start: the publishers count from 0 (vLLM, SGLang) or 1 (the
+/// mock engine), and a batch carrying the engine's startup clear needs
+/// nothing before it.
+fn joined_late(sequence: u64, startup_clear: bool) -> bool {
+    sequence > 1 && !startup_clear
+}
+
+/// What a replay request gave back for a range of sequences.
+struct Filled {
+    recovered: u64,
+    lost: u64,
+    /// Holes before the first recovered batch (the whole range when nothing
+    /// came back).
+    unknown_before: u64,
 }
 
 /// The publisher task's per-batch work.
@@ -860,11 +919,63 @@ impl Relaying<'_> {
         let _ = self.live.send(Live::Batch(batch));
     }
 
-    /// Fill `gap` from the engine's replay socket; what it does not give
-    /// becomes holes.
+    /// The publisher skipped `gap` on the socket: fill it from the engine's
+    /// replay; what it does not give becomes holes.
     async fn recover_gap(&mut self, gap: RangeInclusive<u64>) {
         let (from, to) = (*gap.start(), *gap.end());
         lock(self.shared).counts.publisher_gaps += 1;
+        let filled = self.fill(gap).await;
+        let counts = lock(self.shared).counts.clone();
+        warn!(
+            endpoint = %self.config.endpoint,
+            from,
+            to,
+            recovered = filled.recovered,
+            lost = filled.lost,
+            ?counts,
+            "KV event publisher skipped sequences"
+        );
+    }
+
+    /// The publisher was already past `first_seen` when the relay's
+    /// subscription reached it (ZMQ delivers nothing from before a join):
+    /// ask its replay for everything before, and record what even the replay
+    /// no longer had as unknown before the record's start.
+    async fn recover_start(&mut self, first_seen: u64) {
+        let filled = self.fill(0..=first_seen - 1).await;
+        let counts = {
+            let mut shared = lock(self.shared);
+            shared.unknown_before = filled.unknown_before;
+            shared.counts.unknown_before_start += filled.unknown_before;
+            shared.counts.clone()
+        };
+        if filled.unknown_before == 0 {
+            info!(
+                endpoint = %self.config.endpoint,
+                first_seen,
+                recovered = filled.recovered,
+                ?counts,
+                "KV event relay joined a publisher already counting; its replay covered the \
+                 batches before"
+            );
+        } else {
+            warn!(
+                endpoint = %self.config.endpoint,
+                first_seen,
+                recovered = filled.recovered,
+                unknown_before = filled.unknown_before,
+                ?counts,
+                "KV event relay joined a publisher already counting and its replay does not \
+                 reach back to the start; the history and the snapshots start late"
+            );
+        }
+    }
+
+    /// Fill `gap` from the engine's replay socket: what it gives back is
+    /// relayed under its sequence (past the gap's end too, when the replay
+    /// ran ahead of the live socket), what it does not becomes holes.
+    async fn fill(&mut self, gap: RangeInclusive<u64>) -> Filled {
+        let (from, to) = (*gap.start(), *gap.end());
         let replies = match &self.config.replay_endpoint {
             Some(endpoint) => match replay(endpoint, from, self.config.replay_timeout).await {
                 Ok(replies) => replies,
@@ -880,42 +991,42 @@ impl Relaying<'_> {
             None => Vec::new(),
         };
         let mut expected = from;
-        let mut recovered = 0u64;
+        let mut filled = Filled {
+            recovered: 0,
+            lost: 0,
+            unknown_before: 0,
+        };
+        let mut first_known = None;
         for (sequence, payload) in replies {
             if sequence < expected {
                 continue;
             }
-            self.lose(expected..sequence);
+            if expected < sequence {
+                filled.lost += sequence - expected;
+                self.lose(expected, sequence - 1);
+            }
+            if first_known.is_none() {
+                first_known = Some(sequence);
+            }
             self.relay(sequence, decode(&payload, sequence));
-            recovered += 1;
+            filled.recovered += 1;
             expected = sequence + 1;
         }
         if expected <= to {
-            self.lose(expected..=to);
+            filled.lost += to + 1 - expected;
+            self.lose(expected, to);
         }
-        let counts = {
-            let mut shared = lock(self.shared);
-            shared.counts.gap_batches_recovered += recovered;
-            shared.counts.clone()
-        };
-        warn!(
-            endpoint = %self.config.endpoint,
-            from,
-            to,
-            recovered,
-            lost = (to - from + 1).saturating_sub(recovered.min(to - from + 1)),
-            ?counts,
-            "KV event publisher skipped sequences"
-        );
+        filled.unknown_before = first_known.map_or(to + 1 - from, |first| first - from);
+        lock(self.shared).counts.gap_batches_recovered += filled.recovered;
+        filled
     }
 
-    fn lose(&mut self, sequences: impl Iterator<Item = u64>) {
+    /// `from..=to` passed without batches: holes in the window.
+    fn lose(&mut self, from: u64, to: u64) {
         let mut shared = lock(self.shared);
-        for sequence in sequences {
-            shared.history.push_lost(sequence);
-            shared.cursor = Some(sequence);
-            shared.counts.gap_batches_lost += 1;
-        }
+        shared.history.push_lost_range(from, to);
+        shared.cursor = Some(to);
+        shared.counts.gap_batches_lost += to + 1 - from;
     }
 }
 
@@ -1325,10 +1436,35 @@ mod tests {
                 .await
                 .expect("a replay request in time")
                 .expect("request");
-            let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
-            assert_eq!(frames.len(), 3, "[identity, empty, start]");
-            assert_eq!(frames[1], b"");
-            assert_eq!(frames[2], start.to_be_bytes());
+            let frames = replay_request_frames(&request, start);
+            self.send_replay(&frames, replies).await;
+        }
+
+        /// Publish `sequence` (the subscription reaches the publisher a
+        /// moment after the connect) until the relay asks the replay socket,
+        /// which it must do from `start`; the request's frames.
+        async fn publish_until_replay_requested(
+            &mut self,
+            sequence: u64,
+            payload: &[u8],
+            start: u64,
+        ) -> Vec<Vec<u8>> {
+            let router = self.router.as_mut().expect("a replay socket");
+            for _ in 0..250 {
+                self.publisher
+                    .send(golden::frame(b"kv", sequence, payload))
+                    .await
+                    .expect("publish");
+                if let Ok(request) = timeout(Duration::from_millis(20), router.recv()).await {
+                    return replay_request_frames(&request.expect("request"), start);
+                }
+            }
+            panic!("the relay never asked the replay socket");
+        }
+
+        /// Reply to the request `frames` with `replies` and the end marker.
+        async fn send_replay(&mut self, frames: &[Vec<u8>], replies: &[(u64, Vec<u8>)]) {
+            let router = self.router.as_mut().expect("a replay socket");
             for (sequence, payload) in replies {
                 let mut reply = ZmqMessage::from(frames[0].clone());
                 reply.push_back(Vec::new().into());
@@ -1344,6 +1480,16 @@ mod tests {
             end.push_back(Vec::new().into());
             router.send(end).await.expect("end marker");
         }
+    }
+
+    /// A replay request's frames (`[identity, empty, start]`), checked to
+    /// ask from `start`.
+    fn replay_request_frames(request: &ZmqMessage, start: u64) -> Vec<Vec<u8>> {
+        let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
+        assert_eq!(frames.len(), 3, "[identity, empty, start]");
+        assert_eq!(frames[1], b"");
+        assert_eq!(frames[2], start.to_be_bytes());
+        frames
     }
 
     fn refused(result: Result<BoxStream<common::KvEventBatch>, Status>) -> Status {
@@ -1465,8 +1611,10 @@ mod tests {
             Some(common::KvSnapshotChunk {
                 index: 0,
                 count: 1,
-                blocks: 1
-            })
+                blocks: 1,
+                unknown_before: 5,
+            }),
+            "the five sequences before the relay joined are unknown"
         );
         assert_eq!(chunk.dp_rank, Some(1));
         assert!(is_cleared(&chunk.events[0]));
@@ -1658,6 +1806,7 @@ mod tests {
             state: LiveState::new(),
             cursor: Some(500),
             started_at: Some(0),
+            unknown_before: 0,
             generation: 0,
             counts: RelayCounts::default(),
             failed: None,
@@ -1779,12 +1928,109 @@ mod tests {
         assert_eq!(read(&mut resumed).await.sequence_number, 2);
     }
 
-    /// A relay that comes up (or back up) while the publisher is already
-    /// counting holds nothing from before its first sequence: a cursor from
-    /// before it is refused, so the gateway clears and resubscribes from zero
-    /// instead of trusting a window with a silent gap in front of it.
+    /// A publisher already counting when the relay's subscription reaches
+    /// it: the relay asks the engine's replay for everything from 0 before
+    /// relaying what it saw, and the window is the publisher's whole life.
     #[tokio::test]
-    async fn a_relay_that_started_after_the_publisher_refuses_cursors_from_before_it() {
+    async fn a_publisher_already_counting_when_the_relay_joins_is_replayed_from_its_start() {
+        let mut lab = start_lab(100, true).await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        // Sequences 0..=2 went out before the subscription landed; 3 is the
+        // first the relay sees, and it must ask for 0 before relaying it.
+        let request = lab.publish_until_replay_requested(3, &batch2, 0).await;
+        lab.send_replay(
+            &request,
+            &[
+                (0, batch2.clone()),
+                (1, batch2.clone()),
+                (2, batch2.clone()),
+                (3, batch2.clone()),
+            ],
+        )
+        .await;
+        lab.wait_relayed(4).await;
+        let counts = lab.relay.counts();
+        assert_eq!(
+            (
+                counts.gap_batches_recovered,
+                counts.gap_batches_lost,
+                counts.unknown_before_start,
+                counts.publisher_gaps,
+            ),
+            (4, 0, 0, 0),
+            "{counts:?}"
+        );
+        let mut stream = lab.subscribe(0).expect("the whole history");
+        for expected in 0..=3 {
+            assert_eq!(read(&mut stream).await.sequence_number, expected);
+        }
+        lab.publish(4, &batch2).await;
+        assert_eq!(read(&mut stream).await.sequence_number, 4);
+        let counts = lab.relay.counts();
+        assert_eq!(
+            (counts.served_from_history, counts.served_snapshots),
+            (1, 0)
+        );
+    }
+
+    /// The replay that answers a late join may itself start past 0 (the
+    /// engine's buffer rolled): what it gives is relayed, the sequences
+    /// before it are holes and counted as unknown, a subscriber from zero
+    /// gets a snapshot that says so, and cursors inside the holes are served
+    /// past them.
+    #[tokio::test]
+    async fn a_replay_that_starts_past_zero_leaves_the_earlier_sequences_unknown() {
+        let mut lab = start_lab(100, true).await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        let request = lab.publish_until_replay_requested(7, &batch2, 0).await;
+        lab.send_replay(
+            &request,
+            &[
+                (5, batch2.clone()),
+                (6, batch2.clone()),
+                (7, batch2.clone()),
+            ],
+        )
+        .await;
+        lab.wait_relayed(3).await;
+        let counts = lab.relay.counts();
+        assert_eq!(
+            (
+                counts.gap_batches_recovered,
+                counts.gap_batches_lost,
+                counts.unknown_before_start,
+            ),
+            (3, 5, 5),
+            "{counts:?}"
+        );
+        let mut fresh = lab.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut fresh).await;
+        assert_eq!(chunk.sequence_number, 7);
+        assert_eq!(
+            chunk.snapshot,
+            Some(common::KvSnapshotChunk {
+                index: 0,
+                count: 1,
+                blocks: 3,
+                unknown_before: 5,
+            })
+        );
+        // A cursor inside the unknown stretch resumes at the first batch
+        // after it; the gateway settles the jump as a gap of its own.
+        let mut resumed = lab.subscribe(2).expect("served past the holes");
+        for expected in [5, 6, 7] {
+            assert_eq!(read(&mut resumed).await.sequence_number, expected);
+        }
+        lab.publish(8, &batch2).await;
+        assert_eq!(read(&mut fresh).await.sequence_number, 8);
+        assert_eq!(read(&mut resumed).await.sequence_number, 8);
+    }
+
+    /// Without a replay socket a late join cannot be filled: the sequences
+    /// before the first seen are holes, counted as unknown, and the snapshot
+    /// a fresh subscriber gets carries the count instead of passing as whole.
+    #[tokio::test]
+    async fn a_relay_without_a_replay_socket_marks_the_batches_before_its_start_unknown() {
         let mut late = start_lab(100, false).await;
         let batch2 = golden::bytes(golden::BATCH2);
         for _ in 0..250 {
@@ -1794,30 +2040,43 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let counts = late.relay.counts();
         assert_eq!(
-            late.relay.counts().relayed,
-            1,
-            "the relay saw sequence 5 first"
+            (
+                counts.relayed,
+                counts.gap_batches_lost,
+                counts.unknown_before_start,
+                counts.publisher_gaps,
+            ),
+            (1, 5, 5, 0),
+            "{counts:?}"
         );
-        let status = refused(late.subscribe(3));
-        assert_eq!(status.code(), tonic::Code::OutOfRange);
-        assert!(
-            status.message().contains("started at sequence 5"),
-            "{}",
-            status.message()
-        );
-        // Nothing is missing between cursor 4 and the relay's start.
-        let mut resumed = late.subscribe(4).expect("nothing missed");
-        assert_eq!(read(&mut resumed).await.sequence_number, 5);
-        // From zero: what the relay knows, as a snapshot cut at 5, then live.
         let mut fresh = late.subscribe(0).expect("a snapshot");
         let chunk = read(&mut fresh).await;
-        assert_eq!(chunk.sequence_number, 5);
+        assert_eq!((chunk.sequence_number, chunk.dp_rank), (5, Some(1)));
+        assert_eq!(
+            chunk.snapshot.as_ref().map(|chunk| chunk.unknown_before),
+            Some(5)
+        );
         assert_eq!(stored_hashes(&chunk), vec![(Some(41), vec![42])]);
+        // Cursors in the unknown stretch are served from the first batch.
+        let mut resumed = late.subscribe(3).expect("served past the holes");
+        assert_eq!(read(&mut resumed).await.sequence_number, 5);
         late.publish(6, &batch2).await;
-        assert_eq!(read(&mut fresh).await.sequence_number, 6);
         assert_eq!(read(&mut resumed).await.sequence_number, 6);
-        assert_eq!(late.relay.counts().out_of_range, 1);
+        assert_eq!(read(&mut fresh).await.sequence_number, 6);
+        assert_eq!(late.relay.counts().out_of_range, 0);
+    }
+
+    /// A publisher that counts from 1 (the mock engine) or whose first batch
+    /// is its startup clear (SGLang) has nothing before it to ask for.
+    #[test]
+    fn a_first_batch_at_the_counters_start_or_with_a_clear_is_not_a_late_join() {
+        assert!(!joined_late(0, false));
+        assert!(!joined_late(1, false));
+        assert!(joined_late(2, false));
+        assert!(!joined_late(2, true));
+        assert!(joined_late(500, false));
     }
 
     #[tokio::test]
@@ -1910,7 +2169,8 @@ mod tests {
             Some(common::KvSnapshotChunk {
                 index: 0,
                 count: 1,
-                blocks: 5
+                blocks: 5,
+                unknown_before: 0,
             })
         );
         assert_eq!(chunk.dp_rank, Some(0));

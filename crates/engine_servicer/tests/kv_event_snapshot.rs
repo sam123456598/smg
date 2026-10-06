@@ -285,7 +285,7 @@ fn snapshots_of_the_captured_streams_equal_their_live_sets() {
         }
         let through = batches.iter().map(|b| b.sequence_number).max().unwrap();
         let chunks: Vec<KvEventBatch> =
-            SnapshotChunks::new(state.snapshot(), through, 1.0).collect();
+            SnapshotChunks::new(state.snapshot(), through, 1.0, 0).collect();
 
         let want = reference(&batches);
         let got = emitted(&chunks);
@@ -381,7 +381,7 @@ fn snapshots_at_every_cut_of_the_vllm_stream_follow_the_reference() {
         state.apply(batch);
         let want = reference(&batches[..=index]);
         let chunks: Vec<KvEventBatch> =
-            SnapshotChunks::new(state.snapshot(), batch.sequence_number, 1.0).collect();
+            SnapshotChunks::new(state.snapshot(), batch.sequence_number, 1.0, 0).collect();
         assert_eq!(
             emitted(&chunks),
             want,
