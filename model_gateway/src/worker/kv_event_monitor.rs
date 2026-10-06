@@ -502,6 +502,7 @@ impl KvEventMonitor {
     async fn remove_indexer_worker(
         indexer: Arc<PositionalIndexer>,
         worker_id: u32,
+        worker_url: &str,
         worker_blocks: WorkerIndexState,
     ) {
         let Ok(permit) = INDEX_REMOVAL_PERMITS.acquire().await else {
@@ -527,6 +528,7 @@ impl KvEventMonitor {
         if let Err(error) = result {
             error!(worker_id, %error, "Positional-index worker cleanup task failed");
         }
+        Metrics::set_kv_index_blocks(worker_url, 0);
     }
 
     async fn subscription_loop(
@@ -591,8 +593,13 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, state.index)
-                            .await;
+                        Self::remove_indexer_worker(
+                            Arc::clone(&indexer),
+                            worker_id,
+                            &worker_url,
+                            state.index,
+                        )
+                        .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -609,8 +616,13 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, state.index)
-                            .await;
+                        Self::remove_indexer_worker(
+                            Arc::clone(&indexer),
+                            worker_id,
+                            &worker_url,
+                            state.index,
+                        )
+                        .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -660,8 +672,13 @@ impl KvEventMonitor {
                             "Backend does not implement SubscribeKvEvents, \
                              disabling KV event subscription for this worker"
                         );
-                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, state.index)
-                            .await;
+                        Self::remove_indexer_worker(
+                            Arc::clone(&indexer),
+                            worker_id,
+                            &worker_url,
+                            state.index,
+                        )
+                        .await;
                         return;
                     }
                     if e.code() == tonic::Code::OutOfRange {
@@ -693,8 +710,13 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, state.index)
-                            .await;
+                        Self::remove_indexer_worker(
+                            Arc::clone(&indexer),
+                            worker_id,
+                            &worker_url,
+                            state.index,
+                        )
+                        .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -714,6 +736,7 @@ impl KvEventMonitor {
                     Self::remove_indexer_worker(
                         Arc::clone(&indexer),
                         worker_id,
+                        &worker_url,
                         state.index,
                     )
                     .await;
@@ -735,8 +758,13 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, state.index)
-                            .await;
+                        Self::remove_indexer_worker(
+                            Arc::clone(&indexer),
+                            worker_id,
+                            &worker_url,
+                            state.index,
+                        )
+                        .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -773,8 +801,13 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, state.index)
-                            .await;
+                        Self::remove_indexer_worker(
+                            Arc::clone(&indexer),
+                            worker_id,
+                            &worker_url,
+                            state.index,
+                        )
+                        .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -909,6 +942,7 @@ impl KvEventMonitor {
         }
         Self::record_lag(worker_url, batch.timestamp);
         Metrics::record_kv_event_batch(worker_url, "applied");
+        Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
         if degraded_changed {
             Metrics::set_kv_event_degraded_ranks(worker_url, state.degraded_ranks());
         }
@@ -948,6 +982,7 @@ impl KvEventMonitor {
         }
         Metrics::record_kv_event_resync(worker_url, reason.as_str());
         Metrics::set_kv_event_degraded_ranks(worker_url, 0);
+        Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
     }
 
     /// Age of a batch when applied, from the publisher's wall-clock stamp.
@@ -1710,7 +1745,13 @@ mod tests {
             )
             .unwrap();
 
-        KvEventMonitor::remove_indexer_worker(Arc::clone(&indexer), worker_id, worker_blocks).await;
+        KvEventMonitor::remove_indexer_worker(
+            Arc::clone(&indexer),
+            worker_id,
+            "grpc://w1:9000",
+            worker_blocks,
+        )
+        .await;
 
         assert_eq!(indexer.current_size(), 0);
     }
@@ -2191,6 +2232,56 @@ mod tests {
             events,
             dp_rank: rank,
         }
+    }
+
+    /// `smg_kv_index_blocks{worker}` is set where applied batches are counted,
+    /// from the index's own per-worker counter: it follows stores, removals and
+    /// a clear, and costs the lookup path nothing.
+    #[test]
+    fn index_block_gauge_follows_stores_removals_and_a_clear() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn index_blocks(handle: &PrometheusHandle) -> Option<f64> {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with("smg_kv_index_blocks{worker=\"grpc://w1:9000\"}"))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            assert_eq!(index_blocks(&handle), None, "nothing applied yet");
+
+            assert_eq!(
+                sim.feed(&batch(1, None, vec![stored(None, &[1, 2, 3])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 3);
+            assert_eq!(index_blocks(&handle), Some(3.0), "three blocks stored");
+
+            assert_eq!(
+                sim.feed(&batch(2, None, vec![removed(&[3])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(index_blocks(&handle), Some(2.0), "one removed");
+
+            assert_eq!(
+                sim.feed(&batch(3, None, vec![stored(Some(2), &[4, 5])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(index_blocks(&handle), Some(4.0), "two more stored");
+
+            assert_eq!(
+                sim.feed(&batch(4, None, vec![cleared()])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 0);
+            assert_eq!(index_blocks(&handle), Some(0.0), "cleared");
+        });
     }
 
     /// The production subscriber's per-worker state next to a reference that

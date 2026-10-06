@@ -367,6 +367,12 @@ pub(crate) fn init_metrics() {
         "Live KV event batches held while a snapshot resync is in flight, by worker"
     );
     describe_gauge!(
+        "smg_kv_index_blocks",
+        "Blocks the positional index holds for a worker, as the index counts them; \
+         set when a KV event batch is applied, when the worker's state is reset \
+         and when the worker is removed"
+    );
+    describe_gauge!(
         "smg_workers_overloaded",
         "Workers currently flagged overloaded and excluded from routing, by model"
     );
@@ -1636,6 +1642,13 @@ impl Metrics {
     /// Live batches held for a worker while a snapshot resync is in flight.
     pub fn set_kv_event_tail_depth(worker_url: &str, depth: usize) {
         gauge!("smg_kv_event_tail_depth", "worker" => intern_string(worker_url)).set(depth as f64);
+    }
+
+    /// Publish the blocks the positional index holds for a worker. Called from
+    /// the KV event subscriber where it already counts applied batches, never
+    /// from the lookup path, so routing reads nothing that writes.
+    pub fn set_kv_index_blocks(worker_url: &str, blocks: usize) {
+        gauge!("smg_kv_index_blocks", "worker" => intern_string(worker_url)).set(blocks as f64);
     }
 
     // ========================================================================
