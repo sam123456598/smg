@@ -2214,13 +2214,11 @@ dependencies = [
 name = "engine-servicer"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "bytes",
  "chrono",
  "criterion",
  "engine-zmq-adapter",
  "engine-zmq-client",
- "flate2",
  "futures",
  "kv-index",
  "llm-tokenizer",
@@ -2229,6 +2227,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rmp-serde",
+ "rmpv",
  "serde",
  "serde_json",
  "sha2 0.11.0",

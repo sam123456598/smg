@@ -37,12 +37,10 @@ zeromq.workspace = true
 [dev-dependencies]
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 criterion = { version = "0.8", features = ["html_reports"] }
-# The captured engine streams (`tests/fixtures/captured`) are gzipped JSON
-# lines of base64 publisher payloads.
-base64 = "0.22"
-flate2 = "1"
-# The KV-event fixtures' round trip into the gateway's positional index.
+# The normalized KV-event streams' round trip into the gateway's reference index.
 kv-index.workspace = true
+# The engines' KV-event wire shapes, built in code for the normalizer tests.
+rmpv.workspace = true
 portpicker = "0.1"
 tempfile = "3"
 

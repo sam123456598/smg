@@ -4,9 +4,9 @@ One relay per ``SubscribeKvEvents`` call: a SUB socket per data-parallel rank
 (vLLM and SGLang publish one stream per rank on ``base_port + rank``, each
 with its own sequence counter), each rank's sequence followed with gap replay
 through the publisher's ROUTER, and every event normalized by the rules the
-Rust relay applies (``crates/engine_servicer/src/kv_wire.rs``; the fixtures
-under ``crates/engine_servicer/tests/fixtures/kv_events`` pin both to the same
-expected output).
+Rust relay applies (``crates/engine_servicer/src/kv_wire.rs``; the relay tests
+on both sides build the same engine wire shapes in code and expect the same
+output of them).
 
 What the gateway sees is one stream with its own contiguous sequence numbers
 and the rank on every batch. Recovery is the relay's: a gap on a rank is
