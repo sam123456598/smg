@@ -193,3 +193,27 @@ than the engine does at this pool: the fleet's round robin keeps TTFT p50 at 245
 Next lever: the admission rule itself, read from vLLM's scheduler on the fleet host (how many blocks a waiting
 request must be able to allocate to enter the running batch, chunk versus full length, lookahead, and when it
 preempts), then one change and a 12k re-run; the preemption counts are no longer the issue (17-28 per run).
+
+## The restricted-pool cause, and what the full-pool rows do not depend on (2026-10-05 21:20)
+
+The admission wait above was traced through the request records to residency, not to eviction. In-flight KV
+demand reconstructed per second from `requests.csv` (prompt plus output tokens of every admitted request still
+running): at 12,000 blocks the mock carries a mean of 629k tokens (p90 772k, max 860k) of the fleet's 768k with
+58.6 requests in flight, while the fleet carries 311k (p90 479k, max 574k) with 29.1 in flight, the same as both
+carry at the full pool (mock 305k and 28.3, fleet 326k and 30.3). The mock's requests lived twice as long at the
+small pool and filled it. The reason is the decode fit: it is a function of KV utilisation measured on the
+676,128-token pool, and under `--kv-blocks 12000` the mock divided the decoding context by 192,000 instead, so
+150k tokens of context read u = 0.78 rather than 0.22 and a decode step cost about 14 ms where the engine takes
+about 7; slower decode, longer residency, full pool, admission wait, longer residency again. The fix pins the
+decode utilisation to the calibration's capacity (`decode_reference_tokens`, from the fit file's
+`kv_capacity_tokens` whatever the pool flags say): a smaller pool changes how much fits, not how long a step
+takes. Two smaller alignments went in with it and are kept: the full-ISL admission is now a gate read at
+admission with only the chunk allocated (vLLM's `full_sequence_must_fit`, confirmed in the fleet host's vLLM
+source: `scheduler_reserve_full_isl` defaults to true and `allocate_slots` checks the full sequence against the
+free-block count before allocating the step's blocks), and a finished request's blocks are freed tail first.
+
+The full-pool rows are unaffected by construction: there the configured pool is the calibration's 676,128 tokens,
+so the decode utilisation is the same number before and after the fix; the admission gate and the free order did
+not bind at that pool (in-flight demand p90 127-162k per worker against 676k, and 0.008 of reuse on the tighter
+pool), so the full-pool table above stands and is not re-run. The restricted pool is re-run with the fixed mock
+(`t9dec`), and its table follows.
