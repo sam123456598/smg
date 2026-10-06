@@ -586,6 +586,46 @@ intervals for the 200 ms rows. Dynamo's published method is `--interleave=all`; 
 process bound to its socket is the deployment-realistic setting; both are reported and neither
 system was changed for either.
 
+### T7, first window (loaded host): the sharded run index on two sockets
+
+Replayer from `ce53d732` (`--shards`, `--lane-memory`), layout agreed with the index's owners: lane
+cores 8-71 and 72-135 (64 + 64), 128 event lanes pinned one per core so `--shards 2` follows the
+NUMA node, 128 query lanes, event issuers 0-3 and 136-139, query issuers 4-7 and 140-143,
+`--issuer-by-lane`. The 00:10-02:15 window on 2026-10-06 ran with other users' jobs on the
+measurement cores throughout (an editor server floating at 1.6-11 cores, a backup's tar and zstd,
+git, chef), so every row below is labelled loaded host and the clean repeat is scheduled; the
+protocol's half-core rule replaced shortfalls under foreign load (up to five per point in the
+rescued brackets) and every trial's foreign processes and their cores are in the records.
+
+- (e) one socket, lanes 8-71, `--shards 1 --lane-memory local`, no numactl: bracket keeps up at
+  951.4M (14.9M per lane core; fails at 1,037.6M on one trial at 97.6%); 20-trial series at 951.4M:
+  941.9M [881.4, 945.5], 10 of 20 kept up (the other ten fell short under foreign load below the
+  discard threshold), p50 1.0 / p99 7.3 us, lane CPU 5.0-6.2 us per event; against 1,061M kept up
+  at 300 ms with `cpunodebind=0 membind=0` on 59 cores, lane-local memory without the process
+  binding reads lower, which the clean window has to separate from the load.
+- (d) two sockets, `--shards 1 --lane-memory local`, interleave: bracket keeps up at 412.0M, fails
+  at 446.0M; lane CPU 9.0-13.3 us per event (the two-socket cliff of the unsharded index, as in the
+  diagnosis above).
+- (c) two sockets, `--shards 1`, interleave: no point verified (300M: two trials at 99.7% and four
+  replaced).
+- (a) two sockets, `--shards 2 --lane-memory local`, interleave: no kept-up point verified. At
+  1,067M and 800M the first pass lost two trials of three to foreign load; the rescued bracket at
+  700M ran eight trials, all under foreign load, achieving 572-684M (best three 96.7-97.7%, p50
+  1.8-1.9 / p99 10-11 us); at 500M two of three counted trials kept up (99.5%, 99.3%) and one did
+  not (96.5%). Lane CPU per event 6.4-8.3 us on socket 0 and 6.3-9.1 us on socket 1: the lowest of
+  any two-socket row and 1.3x the single socket's, where the unsharded index on two sockets pays
+  10-18 us. Duplicated content: 1,566,377 distinct blocks summed over the two shards against
+  1,532,076 in one shard, 1.022, so 2.2% of resident blocks are held on both shards (pair sharing of
+  stored events across the socket boundary is 50%, measured on events, not resident blocks); arena
+  55.0 MB against 52.9 MB.
+- A/B at 500M in the last minutes, three trials each interleaved: (a) 482, 439, 461M (87.7-96.5%,
+  drains 23-89 ms), (c) 329, 488, 497M (one trial disturbed to 65.7%), (d) 498, 495, 497M (kept up
+  3 of 3). In (a) the lanes finish the window on time (median 640 ms of 640) except one lane per
+  trial 25-55 ms late (a different lane each time, 15-17% busy like the others), which sets the
+  drain and costs 3-12% of achieved; its issue lag p99 is 15-35 ms against 4-25 ms unsharded. Whether
+  that tail is foreign preemption of mostly idle lanes or the shard path (lookups walk both shards;
+  p50 1.8 against 1.2-1.5 us) is for the clean window.
+
 ## Plugging in a new index
 
 `ReplayBackend` is four slice-based methods plus a per-lane state type. The run-compressed index
