@@ -228,9 +228,14 @@ no engine API; it is exact for everything the relay saw, and a hole in the relay
 the engine's replay could not fill) leaves it as inexact as the live stream was. The cut is
 atomic: the entries are collected (an `Arc` clone each) under the lock that admits batches,
 together with the relay's cursor; ordering, run merging and encoding happen outside the lock as
-the subscriber polls, so a slow snapshot reader never holds the publisher task. A 676k-block
-collection takes the lock for about 10 ms on the development host (`a_676k_block_snapshot_...`
-test prints the figure and the live latency another subscriber saw meanwhile).
+the subscriber polls, so a slow snapshot reader never holds the publisher task. Each rank's
+entries sit in a dense slot vector in store order under a hash index, so the collection is a
+sequential scan: for a 676k-block state (the GB300 8B workers' pool) it holds the lock for 11-13 ms
+in a release build on a Grace host (28 ms when it iterated a hash map; 160 ms in a debug build),
+and a second live subscriber's worst batch latency during the snapshot is exactly that figure
+(0.02 ms median otherwise); the ordering pass then takes about 0.5 s on the blocking pool and the
+331 chunks encode in 50 ms as they are polled (`a_676k_block_snapshot_is_cut_atomically_...` and
+`a_snapshot_of_a_large_state_is_one_brief_pass` print the figures).
 
 Differences from the proposal above: the marker is a message with the chunk's position and the
 block total instead of two flags; chunk 0 carries the `AllBlocksCleared` itself; the chunks are
