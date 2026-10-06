@@ -114,14 +114,6 @@ impl Config {
                 "--prefix-cache" => {
                     cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
                 }
-                "--server-arg" => {
-                    let raw = value(&mut args, &flag)?;
-                    let (k, v) = raw
-                        .split_once('=')
-                        .ok_or_else(|| format!("--server-arg expects key=value, got {raw}"))?;
-                    cfg.server_args.insert(k.to_string(), v.to_string());
-                }
-                "--weight-version" => cfg.weight_version = Some(value(&mut args, &flag)?),
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
             }
@@ -174,8 +166,6 @@ fn usage() -> String {
        --tokenizer <path>       tokenizer path for gRPC autoload (default = model)\n\
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
-       --server-arg <k=v>       extra GetServerInfo server_args entry (repeatable)\n\
-       --weight-version <v>     weight version stamped on generate responses (default unset)\n\
      \n\
      Realistic engine simulator (continuous batching; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
