@@ -1,4 +1,4 @@
-//! Exactness harness: the run-compressed `RunIndex` against the `ReferenceIndexer`
+//! Exactness harness: the run-compressed `ChainIndex` against the `ReferenceIndexer`
 //! (`docs/kv-router-leap.md`, guardrail 1).
 //!
 //! The same seeded corpus as `exactness.rs` (stores, extensions, divergent siblings, tail and
@@ -6,19 +6,19 @@
 //! middle of a chain, or its first block, goes away while the worker keeps the blocks after it.
 //! An engine with prefix caching produces exactly that when it evicts by block, and it keeps
 //! reporting the later blocks as stored until it evicts them too. The reference says such a chain
-//! matches up to the hole and no further; the run index must say the same, and must heal when the
+//! matches up to the hole and no further; the chain index must say the same, and must heal when the
 //! engine re-stores the missing block after its parent.
 //!
 //! After every round of events, lookups built from live chains and from mutated chains must score
-//! identically in both indexers; at the end, the run index must hold exactly the reference's
+//! identically in both indexers; at the end, the chain index must hold exactly the reference's
 //! blocks. Scale with `KV_INDEX_EXACTNESS_EVENTS` (default 20000) and `KV_INDEX_EXACTNESS_SEED`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use kv_index::{
-    request_prefix_hashes, ContentHash, ReferenceIndexer, RunBlockMap, RunIndex, SequenceHash,
-    ShardedRunIndex, StoredBlock,
+    request_prefix_hashes, ChainBlockMap, ChainIndex, ContentHash, ReferenceIndexer, SequenceHash,
+    ShardedChainIndex, StoredBlock,
 };
 use rustc_hash::FxHashMap;
 
@@ -80,9 +80,9 @@ struct Held {
 }
 
 struct Harness {
-    production: ShardedRunIndex,
+    production: ShardedChainIndex,
     reference: ReferenceIndexer,
-    maps: FxHashMap<u32, RunBlockMap>,
+    maps: FxHashMap<u32, ChainBlockMap>,
     workers: Vec<u32>,
     held: Vec<Held>,
     prompts: Vec<Vec<ContentHash>>,
@@ -115,9 +115,12 @@ impl Harness {
     fn new(seed: u64, workers: usize) -> Self {
         let mut rng = Rng::new(seed);
         let mut harness = Self {
-            // `KV_INDEX_EXACTNESS_SHARDS` shards (default one, the run index itself); workers are
+            // `KV_INDEX_EXACTNESS_SHARDS` shards (default one, the chain index itself); workers are
             // interned round robin, so two shards hold every other worker and share most content.
-            production: ShardedRunIndex::new(env_or("KV_INDEX_EXACTNESS_SHARDS", 1) as usize, 1024),
+            production: ShardedChainIndex::new(
+                env_or("KV_INDEX_EXACTNESS_SHARDS", 1) as usize,
+                1024,
+            ),
             reference: ReferenceIndexer::new(),
             maps: FxHashMap::default(),
             workers: Vec::new(),
@@ -153,7 +156,7 @@ impl Harness {
         let url = format!("http://worker-{}:8000", self.next_worker);
         self.next_worker += 1;
         let id = self.production.intern_worker(&url).expect("worker id");
-        self.maps.insert(id, RunBlockMap::default());
+        self.maps.insert(id, ChainBlockMap::default());
         self.workers.push(id);
         id
     }
@@ -523,7 +526,7 @@ impl Harness {
                 .iter()
                 .map(|(worker, position, content, prefix)| {
                     (
-                        ShardedRunIndex::shard_of(*worker),
+                        ShardedChainIndex::shard_of(*worker),
                         *position,
                         *content,
                         *prefix,
@@ -610,10 +613,10 @@ fn replayed_corpus_with_holes_matches_the_reference() {
 /// A worker holds [A, B, C]; a request [A, X, C] shares only A with it.
 #[test]
 fn a_divergence_at_the_tail_is_not_hidden() {
-    let production = RunIndex::new();
+    let production = ChainIndex::new();
     let mut reference = ReferenceIndexer::new();
     let worker = production.intern_worker("http://w:8000").unwrap();
-    let mut map = RunBlockMap::default();
+    let mut map = ChainBlockMap::default();
     let held: Vec<ContentHash> = (0..3).map(|p| content(1, p)).collect();
     let blocks = blocks_of(&held);
     production
@@ -633,7 +636,7 @@ fn a_divergence_at_the_tail_is_not_hidden() {
 /// w1 holds the whole chain, w2 only its first 6 blocks, and w3 everything but block 0.
 #[test]
 fn partial_holders_score_their_own_prefix() {
-    let production = RunIndex::new();
+    let production = ChainIndex::new();
     let mut reference = ReferenceIndexer::new();
     let w1 = production.intern_worker("http://w1:8000").unwrap();
     let w2 = production.intern_worker("http://w2:8000").unwrap();
@@ -641,9 +644,9 @@ fn partial_holders_score_their_own_prefix() {
     let held: Vec<ContentHash> = (0..20).map(|p| content(5, p)).collect();
     let blocks = blocks_of(&held);
     let (mut m1, mut m2, mut m3) = (
-        RunBlockMap::default(),
-        RunBlockMap::default(),
-        RunBlockMap::default(),
+        ChainBlockMap::default(),
+        ChainBlockMap::default(),
+        ChainBlockMap::default(),
     );
     production.apply_stored(w1, &blocks, None, &mut m1).unwrap();
     reference.apply_stored(w1, &blocks, None).unwrap();
@@ -672,10 +675,10 @@ fn partial_holders_score_their_own_prefix() {
 /// score follows the first remaining hole until both are healed.
 #[test]
 fn holes_heal_independently() {
-    let production = RunIndex::new();
+    let production = ChainIndex::new();
     let mut reference = ReferenceIndexer::new();
     let worker = production.intern_worker("http://w:8000").unwrap();
-    let mut map = RunBlockMap::default();
+    let mut map = ChainBlockMap::default();
     let held: Vec<ContentHash> = (0..24).map(|p| content(7, p)).collect();
     let blocks = blocks_of(&held);
     production
@@ -699,7 +702,7 @@ fn holes_heal_independently() {
     reference
         .apply_stored(worker, &sibling_blocks[10..], Some(blocks[9].seq_hash))
         .unwrap();
-    let agree = |production: &RunIndex, reference: &ReferenceIndexer, query: &[ContentHash]| {
+    let agree = |production: &ChainIndex, reference: &ReferenceIndexer, query: &[ContentHash]| {
         let produced: BTreeMap<u32, u32> = production
             .find_matches(query, false)
             .scores

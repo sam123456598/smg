@@ -13,10 +13,10 @@ use smg_data_connector::{
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
-    config::RouterConfig,
+    config::{KvIndexKind, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -800,6 +800,9 @@ impl AppContextBuilder {
             // The load records on the event streams are polls of the worker.
             if let Some(worker_monitor) = &self.worker_monitor {
                 monitor.set_load_sink(worker_monitor);
+            }
+            if KvIndexKind::deprecated_alias_used() {
+                warn!("--kv-index run is the deprecated spelling of --kv-index chain");
             }
 
             // Optional indexer bounding: prune entries by last-touch TTL and/or

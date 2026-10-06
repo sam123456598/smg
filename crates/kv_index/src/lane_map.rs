@@ -1,5 +1,5 @@
 //! The lane map: one worker's blocks by engine hash, as the event lane that owns the worker
-//! keeps them for the run index.
+//! keeps them for the chain index.
 //!
 //! An open-addressing table of 16-byte slots (engine hash, run id, offset) with a one-byte tag
 //! per slot beside them: Fibonacci home slot, linear probing over the tags (dense, so a probe
@@ -14,7 +14,7 @@
 //! absent key is a no-op, iteration yields every entry once. A differential test against a hash
 //! map model under random operations keeps the backshift right.
 
-use crate::{event_tree::SequenceHash, run_index::BlockRef};
+use crate::{chain_index::BlockRef, event_tree::SequenceHash};
 
 /// Smallest table a non-empty map allocates.
 const MIN_SLOTS: usize = 16;
@@ -38,8 +38,8 @@ const EMPTY_SLOT: Slot = Slot {
     offset: 0,
 };
 
-/// One worker's blocks by engine hash: where each lives in the run index.
-pub struct RunBlockMap {
+/// One worker's blocks by engine hash: where each lives in the chain index.
+pub struct ChainBlockMap {
     /// Power-of-two length, or empty before the first insert.
     slots: Box<[Slot]>,
     /// One tag per slot: `VACANT`, or the key's fingerprint.
@@ -48,7 +48,7 @@ pub struct RunBlockMap {
     shift: u32,
 }
 
-impl Default for RunBlockMap {
+impl Default for ChainBlockMap {
     fn default() -> Self {
         Self {
             slots: Box::default(),
@@ -66,7 +66,7 @@ fn fingerprint(key: u64) -> u8 {
     ((key >> 25) as u8) | 0x80
 }
 
-impl RunBlockMap {
+impl ChainBlockMap {
     pub fn new() -> Self {
         Self::default()
     }
@@ -319,7 +319,7 @@ impl RunBlockMap {
     }
 }
 
-impl IntoIterator for RunBlockMap {
+impl IntoIterator for ChainBlockMap {
     type Item = (SequenceHash, BlockRef);
     type IntoIter = std::vec::IntoIter<(SequenceHash, BlockRef)>;
 
@@ -328,9 +328,9 @@ impl IntoIterator for RunBlockMap {
     }
 }
 
-impl std::fmt::Debug for RunBlockMap {
+impl std::fmt::Debug for ChainBlockMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RunBlockMap")
+        f.debug_struct("ChainBlockMap")
             .field("len", &self.len)
             .field("slots", &self.slots.len())
             .finish()
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn matches_a_hash_map_under_random_operations() {
         let mut rng = Rng(20261005);
-        let mut table = RunBlockMap::default();
+        let mut table = ChainBlockMap::default();
         let mut model: FxHashMap<SequenceHash, BlockRef> = FxHashMap::default();
         // Keys from a small universe so the same ones come back after removal and probe runs
         // overlap; a few structured keys (multiples of a power of two) stress the home hash.
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn probe_lengths_at_three_quarters_load() {
         let mut rng = Rng(7);
-        let mut table = RunBlockMap::default();
+        let mut table = ChainBlockMap::default();
         let keys: Vec<SequenceHash> = (0..24_000).map(|_| SequenceHash(rng.next())).collect();
         for (index, key) in keys.iter().enumerate() {
             table.insert(*key, at(index as u64));
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn empty_map_answers_without_slots() {
-        let mut table = RunBlockMap::default();
+        let mut table = ChainBlockMap::default();
         assert_eq!(table.capacity(), 0);
         assert!(table.get(SequenceHash(1)).is_none());
         assert!(table.remove(SequenceHash(1)).is_none());

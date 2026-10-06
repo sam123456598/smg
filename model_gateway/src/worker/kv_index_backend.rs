@@ -1,7 +1,7 @@
 //! The event-driven KV index behind cache-aware routing, as one type over two
 //! implementations: the [`PositionalIndexer`] the gateway has routed with so
-//! far and the run-compressed run index ([`ShardedRunIndex`], one shard here),
-//! selected at startup by `--kv-index {positional,run}` ([`KvIndexKind`]).
+//! far and the chain index ([`ShardedChainIndex`], one shard here: chains stored as runs),
+//! selected at startup by `--kv-index {positional,chain}` ([`KvIndexKind`]).
 //!
 //! Both indexers are fed the same engine events and answer the same question
 //! (how many leading blocks of a request each worker holds), and their
@@ -22,25 +22,25 @@
 use std::{collections::BTreeSet, fmt};
 
 use kv_index::{
-    ApplyError, ContentHash, OverlapScores, PositionalIndexer, PruneStats, RunBlockMap,
-    RunIndexStats, SequenceHash, ShardedRunIndex, StoredBlock, WorkerBlockMap, WorkerIdExhausted,
+    ApplyError, ChainBlockMap, ChainIndexStats, ContentHash, OverlapScores, PositionalIndexer,
+    PruneStats, SequenceHash, ShardedChainIndex, StoredBlock, WorkerBlockMap, WorkerIdExhausted,
 };
 
 pub use crate::config::KvIndexKind;
 
-/// Workers one run index interns at once: the index's own ceiling per shard.
+/// Workers one chain index interns at once: the index's own ceiling per shard.
 /// Ids are handed back when a worker is removed, so this bounds the workers
 /// of one model that stream events at the same time, not the churn over a
 /// lifetime. Coverage costs one bit per worker per run, rounded up to 64,
 /// and the lookup ANDs that many words per run on the matched path.
-const RUN_INDEX_MAX_WORKERS: usize = 1024;
+const CHAIN_INDEX_MAX_WORKERS: usize = 1024;
 
-/// Shards of the run index: one. The sharded type keeps one run index per
+/// Shards of the chain index: one. The sharded type keeps one chain index per
 /// shard and merges lookups across them, so that a gateway whose runtime
 /// spans both sockets can later place each worker's index on the socket its
 /// event lane runs on; until that placement exists, one shard is the plain
-/// run index with the same ids.
-const RUN_INDEX_SHARDS: usize = 1;
+/// chain index with the same ids.
+const CHAIN_INDEX_SHARDS: usize = 1;
 
 /// The gateway's KV index: one per model, shared by the model's workers'
 /// event subscriptions (writers) and the cache-aware policy (readers).
@@ -52,27 +52,27 @@ const RUN_INDEX_SHARDS: usize = 1;
 pub enum KvIndex {
     /// One index entry per `(position, content hash)`, probed per block.
     Positional(PositionalIndexer),
-    /// Chains as runs with per-run worker coverage; lock-free, store-free
-    /// lookups.
-    Run(RunBackend),
+    /// The chain index: chains as runs with per-run worker coverage;
+    /// lock-free, store-free lookups.
+    Chain(ChainBackend),
     /// The single-threaded reference the other two are checked against.
     #[cfg(test)]
     Reference(reference::ReferenceBackend),
 }
 
-/// The run index with what the gateway keeps beside it. Every call the
-/// gateway makes into the run index goes through this type: a plain
-/// `RunIndex` and the sharded one share their call surface, so the payload
+/// The chain index with what the gateway keeps beside it. Every call the
+/// gateway makes into the chain index goes through this type: a plain
+/// `ChainIndex` and the sharded one share their call surface, so the payload
 /// is the sharded type at one shard, and a per-socket placement later is a
 /// matter of which shard a worker is interned into.
-pub struct RunBackend {
-    index: ShardedRunIndex,
+pub struct ChainBackend {
+    index: ShardedChainIndex,
 }
 
-impl RunBackend {
+impl ChainBackend {
     fn new() -> Self {
         Self {
-            index: ShardedRunIndex::new(RUN_INDEX_SHARDS, RUN_INDEX_MAX_WORKERS),
+            index: ShardedChainIndex::new(CHAIN_INDEX_SHARDS, CHAIN_INDEX_MAX_WORKERS),
         }
     }
 
@@ -91,20 +91,21 @@ impl RunBackend {
         parent: Option<SequenceHash>,
         held: &mut WorkerBlocks,
     ) -> Result<(), ApplyError> {
-        self.index.apply_stored(worker, blocks, parent, held.run())
+        self.index
+            .apply_stored(worker, blocks, parent, held.chain())
     }
 
     fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], held: &mut WorkerBlocks) {
-        self.index.apply_removed(worker, hashes, held.run());
+        self.index.apply_removed(worker, hashes, held.chain());
     }
 
     fn apply_cleared(&self, worker: u32, held: &mut WorkerBlocks) {
-        self.index.apply_cleared(worker, held.run());
+        self.index.apply_cleared(worker, held.chain());
     }
 
     fn remove_worker(&self, worker: u32, held: WorkerBlocks) {
         self.index
-            .remove_worker(worker, held.run.unwrap_or_default());
+            .remove_worker(worker, held.chain.unwrap_or_default());
     }
 
     #[inline]
@@ -129,7 +130,7 @@ impl RunBackend {
         self.index.entry_count()
     }
 
-    fn stats(&self) -> RunIndexStats {
+    fn stats(&self) -> ChainIndexStats {
         self.index.stats()
     }
 
@@ -145,7 +146,7 @@ impl RunBackend {
 #[derive(Default)]
 pub struct WorkerBlocks {
     positional: Option<WorkerBlockMap>,
-    run: Option<RunBlockMap>,
+    chain: Option<ChainBlockMap>,
     #[cfg(test)]
     reference: Option<reference::ReferenceBlocks>,
 }
@@ -156,7 +157,7 @@ impl WorkerBlocks {
         if let Some(map) = &self.positional {
             return map.contains_key(&seq_hash);
         }
-        if let Some(map) = &self.run {
+        if let Some(map) = &self.chain {
             return map.contains_key(seq_hash);
         }
         #[cfg(test)]
@@ -171,7 +172,7 @@ impl WorkerBlocks {
         if let Some(map) = &self.positional {
             return map.len();
         }
-        if let Some(map) = &self.run {
+        if let Some(map) = &self.chain {
             return map.len();
         }
         #[cfg(test)]
@@ -189,18 +190,18 @@ impl WorkerBlocks {
         self.positional.get_or_insert_with(WorkerBlockMap::default)
     }
 
-    fn run(&mut self) -> &mut RunBlockMap {
-        self.run.get_or_insert_with(RunBlockMap::default)
+    fn chain(&mut self) -> &mut ChainBlockMap {
+        self.chain.get_or_insert_with(ChainBlockMap::default)
     }
 }
 
 impl KvIndex {
     /// An index of `kind`. `jump_size` is the positional indexer's historical
-    /// tuning knob and is ignored by the run index.
+    /// tuning knob and is ignored by the chain index.
     pub fn new(kind: KvIndexKind, jump_size: usize) -> Self {
         match kind {
             KvIndexKind::Positional => Self::positional(jump_size),
-            KvIndexKind::Run => Self::run(),
+            KvIndexKind::Chain => Self::chain(),
         }
     }
 
@@ -208,8 +209,8 @@ impl KvIndex {
         Self::Positional(PositionalIndexer::new(jump_size))
     }
 
-    pub fn run() -> Self {
-        Self::Run(RunBackend::new())
+    pub fn chain() -> Self {
+        Self::Chain(ChainBackend::new())
     }
 
     #[cfg(test)]
@@ -221,7 +222,7 @@ impl KvIndex {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Positional(_) => "positional",
-            Self::Run(_) => "run",
+            Self::Chain(_) => "chain",
             #[cfg(test)]
             Self::Reference(_) => "reference",
         }
@@ -232,7 +233,7 @@ impl KvIndex {
     pub fn intern_worker(&self, worker: &str) -> Result<u32, WorkerIdExhausted> {
         match self {
             Self::Positional(index) => index.intern_worker(worker),
-            Self::Run(run) => run.intern_worker(worker),
+            Self::Chain(chain) => chain.intern_worker(worker),
             #[cfg(test)]
             Self::Reference(reference) => Ok(reference.intern_worker(worker)),
         }
@@ -242,7 +243,7 @@ impl KvIndex {
     pub fn worker_id(&self, worker: &str) -> Option<u32> {
         match self {
             Self::Positional(index) => index.worker_id(worker),
-            Self::Run(run) => run.worker_id(worker),
+            Self::Chain(chain) => chain.worker_id(worker),
             #[cfg(test)]
             Self::Reference(reference) => reference.worker_id(worker),
         }
@@ -260,7 +261,7 @@ impl KvIndex {
             Self::Positional(index) => {
                 index.apply_stored(worker, blocks, parent, held.positional())
             }
-            Self::Run(run) => run.apply_stored(worker, blocks, parent, held),
+            Self::Chain(chain) => chain.apply_stored(worker, blocks, parent, held),
             #[cfg(test)]
             Self::Reference(reference) => reference.apply_stored(worker, blocks, parent, held),
         }
@@ -270,7 +271,7 @@ impl KvIndex {
     pub fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], held: &mut WorkerBlocks) {
         match self {
             Self::Positional(index) => index.apply_removed(worker, hashes, held.positional()),
-            Self::Run(run) => run.apply_removed(worker, hashes, held),
+            Self::Chain(chain) => chain.apply_removed(worker, hashes, held),
             #[cfg(test)]
             Self::Reference(reference) => reference.apply_removed(worker, hashes, held),
         }
@@ -280,7 +281,7 @@ impl KvIndex {
     pub fn apply_cleared(&self, worker: u32, held: &mut WorkerBlocks) {
         match self {
             Self::Positional(index) => index.apply_cleared(worker, held.positional()),
-            Self::Run(run) => run.apply_cleared(worker, held),
+            Self::Chain(chain) => chain.apply_cleared(worker, held),
             #[cfg(test)]
             Self::Reference(reference) => reference.apply_cleared(worker, held),
         }
@@ -293,7 +294,7 @@ impl KvIndex {
             Self::Positional(index) => {
                 index.remove_worker(worker, held.positional.unwrap_or_default());
             }
-            Self::Run(run) => run.remove_worker(worker, held),
+            Self::Chain(chain) => chain.remove_worker(worker, held),
             #[cfg(test)]
             Self::Reference(reference) => reference.remove_worker(worker),
         }
@@ -306,7 +307,7 @@ impl KvIndex {
     pub fn find_matches(&self, content_hashes: &[ContentHash], early_exit: bool) -> OverlapScores {
         match self {
             Self::Positional(index) => index.find_matches(content_hashes, early_exit),
-            Self::Run(run) => run.find_matches(content_hashes, early_exit),
+            Self::Chain(chain) => chain.find_matches(content_hashes, early_exit),
             #[cfg(test)]
             Self::Reference(reference) => reference.find_matches(content_hashes, early_exit),
         }
@@ -316,7 +317,7 @@ impl KvIndex {
     pub fn worker_block_count(&self, worker: u32) -> usize {
         match self {
             Self::Positional(index) => index.worker_block_count(worker),
-            Self::Run(run) => run.worker_block_count(worker),
+            Self::Chain(chain) => chain.worker_block_count(worker),
             #[cfg(test)]
             Self::Reference(reference) => reference.worker_block_count(worker),
         }
@@ -324,12 +325,12 @@ impl KvIndex {
 
     /// Whether no worker holds a block. Read once per request before the
     /// lookup, so it must stay cheap: the positional indexer keeps a running
-    /// total; the run index reads its root's child table under one seqlock.
+    /// total; the chain index reads its root's child table under one seqlock.
     #[inline]
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Positional(index) => index.current_size() == 0,
-            Self::Run(run) => run.is_empty(),
+            Self::Chain(chain) => chain.is_empty(),
             #[cfg(test)]
             Self::Reference(reference) => reference.is_empty(),
         }
@@ -340,40 +341,40 @@ impl KvIndex {
     pub fn current_size(&self) -> usize {
         match self {
             Self::Positional(index) => index.current_size(),
-            Self::Run(run) => run.current_size(),
+            Self::Chain(chain) => chain.current_size(),
             #[cfg(test)]
             Self::Reference(reference) => reference.current_size(),
         }
     }
 
     /// Distinct index entries: `(position, content hash)` pairs in the
-    /// positional indexer, distinct blocks on a chain in the run index.
+    /// positional indexer, distinct blocks on a chain in the chain index.
     pub fn entry_count(&self) -> usize {
         match self {
             Self::Positional(index) => index.entry_count(),
-            Self::Run(run) => run.entry_count(),
+            Self::Chain(chain) => chain.entry_count(),
             #[cfg(test)]
             Self::Reference(reference) => reference.entry_count(),
         }
     }
 
     /// Evict stale and excess entries. Only the positional indexer has a prune
-    /// (its entries carry a last-touch stamp); the run index holds exactly
+    /// (its entries carry a last-touch stamp); the chain index holds exactly
     /// what the engines report and shrinks with their removals, so for it
     /// this is `None` and the bounds do not apply.
     pub fn prune(&self, ttl_secs: Option<u32>, max_entries: Option<usize>) -> Option<PruneStats> {
         match self {
             Self::Positional(index) => Some(index.prune(ttl_secs, max_entries)),
-            Self::Run(_) => None,
+            Self::Chain(_) => None,
             #[cfg(test)]
             Self::Reference(_) => None,
         }
     }
 
-    /// The run index's shape and memory counters; `None` for the others.
-    pub fn run_stats(&self) -> Option<RunIndexStats> {
+    /// The chain index's shape and memory counters; `None` for the others.
+    pub fn chain_stats(&self) -> Option<ChainIndexStats> {
         match self {
-            Self::Run(run) => Some(run.stats()),
+            Self::Chain(chain) => Some(chain.stats()),
             Self::Positional(_) => None,
             #[cfg(test)]
             Self::Reference(_) => None,
@@ -386,7 +387,7 @@ impl KvIndex {
     pub fn debug_blocks(&self) -> BTreeSet<(u32, usize, ContentHash, SequenceHash)> {
         match self {
             Self::Positional(index) => index.debug_blocks().into_iter().collect(),
-            Self::Run(run) => run.debug_blocks(),
+            Self::Chain(chain) => chain.debug_blocks(),
             #[cfg(test)]
             Self::Reference(reference) => reference.blocks(),
         }
@@ -569,7 +570,7 @@ mod tests {
     fn backends() -> Vec<KvIndex> {
         vec![
             KvIndex::positional(64),
-            KvIndex::run(),
+            KvIndex::chain(),
             KvIndex::reference(),
         ]
     }
@@ -653,8 +654,8 @@ mod tests {
     }
 
     #[test]
-    fn the_run_index_hands_back_removed_worker_ids_and_knows_when_it_is_empty() {
-        let index = KvIndex::run();
+    fn the_chain_index_hands_back_removed_worker_ids_and_knows_when_it_is_empty() {
+        let index = KvIndex::chain();
         let first = index.intern_worker("grpc://a").unwrap();
         let mut held = WorkerBlocks::default();
         let blocks = chain(&[&[1, 2, 3, 4]]);
@@ -668,16 +669,16 @@ mod tests {
         let mut held = WorkerBlocks::default();
         index.apply_stored(again, &blocks, None, &mut held).unwrap();
         assert!(!index.is_empty());
-        assert_eq!(index.run_stats().map(|s| s.blocks_live), Some(1));
+        assert_eq!(index.chain_stats().map(|s| s.blocks_live), Some(1));
     }
 
     #[test]
     fn only_the_positional_index_prunes() {
         let positional = KvIndex::positional(64);
         assert!(positional.prune(Some(1), None).is_some());
-        assert!(KvIndex::run().prune(Some(1), Some(1)).is_none());
-        assert!(KvIndex::run().run_stats().is_some());
-        assert!(positional.run_stats().is_none());
+        assert!(KvIndex::chain().prune(Some(1), Some(1)).is_none());
+        assert!(KvIndex::chain().chain_stats().is_some());
+        assert!(positional.chain_stats().is_none());
     }
 
     #[test]
@@ -686,10 +687,11 @@ mod tests {
             KvIndex::new(KvIndexKind::Positional, 8).name(),
             "positional"
         );
-        assert_eq!(KvIndex::new(KvIndexKind::Run, 8).name(), "run");
+        assert_eq!(KvIndexKind::Chain.as_str(), "chain");
+        assert_eq!(KvIndex::new(KvIndexKind::Chain, 8).name(), "chain");
         assert_eq!(
-            format!("{:?}", KvIndex::run()),
-            "KvIndex { kind: \"run\", blocks: 0 }"
+            format!("{:?}", KvIndex::chain()),
+            "KvIndex { kind: \"chain\", blocks: 0 }"
         );
     }
 }

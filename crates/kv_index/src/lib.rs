@@ -11,6 +11,7 @@
 //! - Concurrent access via DashMap and RwLock
 //! - Efficient prefix matching with match counts
 
+pub mod chain_index;
 /// Churn generator shared by the churn bench and the gate test; not a public API.
 #[doc(hidden)]
 pub mod churn;
@@ -20,27 +21,26 @@ mod lane_map;
 pub mod lane_pool;
 mod path_hash;
 pub mod reference;
-pub mod run_index;
 pub mod salt;
 pub mod sharded;
 pub mod snapshot;
 mod string_tree;
 mod token_tree;
 
+pub use chain_index::{BlockRef, ChainIndex, ChainIndexStats};
 pub use common::{MatchResult, TenantId};
 pub use event_tree::{
     chain_prefix_hash, compute_content_hash, compute_request_content_hashes, ApplyError,
     ContentHash, ContentSeq, OverlapScores, PositionalIndexer, PruneStats, SequenceHash,
     StoredBlock, WorkerBlockMap, WorkerId, WorkerIdExhausted, XXH3_SEED,
 };
-pub use lane_map::RunBlockMap;
+pub use lane_map::ChainBlockMap;
 pub use lane_pool::{
     Claimed, Control, LaneHooks, LanePool, LanePoolConfig, PoolMetrics, QueueFull,
 };
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
-pub use run_index::{BlockRef, RunIndex, RunIndexStats};
-pub use sharded::{ShardedRunIndex, SHARD_SHIFT};
+pub use sharded::{ShardedChainIndex, SHARD_SHIFT};
 // Re-export under names matching old tree.rs API for easier migration
 pub use string_tree::Tree;
 pub use string_tree::{

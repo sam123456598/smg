@@ -45,8 +45,8 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use kv_index::{
-    ContentHash, PositionalIndexer, ReferenceIndexer, RunBlockMap, SequenceHash, ShardedRunIndex,
-    StoredBlock, WorkerBlockMap,
+    ChainBlockMap, ContentHash, PositionalIndexer, ReferenceIndexer, SequenceHash,
+    ShardedChainIndex, StoredBlock, WorkerBlockMap,
 };
 use rustc_hash::FxHashMap;
 use serde_json::json;
@@ -468,8 +468,8 @@ impl ReplayBackend for Positional {
     }
 }
 
-struct Run {
-    inner: ShardedRunIndex,
+struct Chain {
+    inner: ShardedChainIndex,
     /// The shard of every backend CPU (by position in the backend CPU list): the NUMA node's
     /// index when the list spans exactly `shards` nodes, else contiguous groups of the list.
     shard_of_cpu: FxHashMap<usize, usize>,
@@ -479,7 +479,7 @@ struct Run {
     heads_held: Option<Vec<AtomicUsize>>,
 }
 
-impl Run {
+impl Chain {
     fn shard_for(&self, lane: usize, cpus: &[usize]) -> usize {
         let shards = self.inner.shards();
         if shards == 1 {
@@ -494,27 +494,27 @@ impl Run {
     }
 }
 
-struct RunLane {
+struct ChainLane {
     shard: usize,
-    workers: FxHashMap<(u64, u32), (u32, RunBlockMap)>,
+    workers: FxHashMap<(u64, u32), (u32, ChainBlockMap)>,
 }
 
-impl ReplayBackend for Run {
-    type Lane = RunLane;
+impl ReplayBackend for Chain {
+    type Lane = ChainLane;
 
     fn name(&self) -> &'static str {
-        "smg-run"
+        "smg-chain"
     }
 
     fn new_lane(&self) -> Self::Lane {
-        RunLane {
+        ChainLane {
             shard: 0,
             workers: FxHashMap::default(),
         }
     }
 
     fn new_lane_for(&self, lane: usize, cpus: &[usize]) -> Self::Lane {
-        RunLane {
+        ChainLane {
             shard: self.shard_for(lane, cpus),
             workers: FxHashMap::default(),
         }
@@ -564,7 +564,7 @@ impl ReplayBackend for Run {
                 .inner
                 .intern_worker_in(lane.shard, &format!("{}:{}", worker.0, worker.1))
                 .expect("worker slots; raise --max-workers");
-            (id, RunBlockMap::default())
+            (id, ChainBlockMap::default())
         });
         self.inner
             .apply_stored(*smg_id, blocks, parent, blocks_map)
@@ -1417,7 +1417,7 @@ fn issue_events(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Run
+// Chain
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1474,8 +1474,10 @@ enum BackendKind {
     Positional,
     /// The single-threaded reference indexer (small corpora only).
     Reference,
-    /// This crate's run-compressed RunIndex (worker slots from `--max-workers`).
-    Run,
+    /// This crate's run-compressed ChainIndex (worker slots from `--max-workers`); `run` is the
+    /// name it had and stays accepted until the positional indexer's removal.
+    #[value(alias = "run")]
+    Chain,
     /// No indexer: the harness's own ceiling on this layout.
     Null,
 }
@@ -1490,13 +1492,13 @@ struct Args {
     /// Jump size of the positional indexer's lookup.
     #[arg(long, default_value = "8")]
     jump_size: usize,
-    /// Worker slots of the run index (one coverage bit per slot per run, at most 1024).
+    /// Worker slots of the chain index (one coverage bit per slot per run, at most 1024).
     #[arg(long, default_value = "256")]
     max_workers: usize,
-    /// Run index shards, one per socket of the lane set: each shard is a complete run index
+    /// Chain index shards, one per socket of the lane set: each shard is a complete chain index
     /// written only by the lanes placed on it (a pinned lane goes to its CPU's NUMA node's
     /// shard when the lane set spans exactly this many nodes, else to its contiguous group of
-    /// the backend CPU list), and a lookup walks every shard. One shard is the run index itself.
+    /// the backend CPU list), and a lookup walks every shard. One shard is the chain index itself.
     #[arg(long, default_value = "1")]
     shards: usize,
     /// Memory policy of the event lanes: `inherit` the process policy, or `local`, which makes
@@ -1611,7 +1613,7 @@ fn main() -> anyhow::Result<()> {
                 }),
             )
         }
-        BackendKind::Run => {
+        BackendKind::Chain => {
             let backend_cpus = args
                 .backend_cpus
                 .as_deref()
@@ -1623,8 +1625,8 @@ fn main() -> anyhow::Result<()> {
                 &args,
                 corpus,
                 window_ns,
-                Arc::new(Run {
-                    inner: ShardedRunIndex::new(args.shards.max(1), args.max_workers),
+                Arc::new(Chain {
+                    inner: ShardedChainIndex::new(args.shards.max(1), args.max_workers),
                     shard_of_cpu,
                     event_lanes: args.event_lanes,
                     heads_held: args.count_shard_heads.then(|| {

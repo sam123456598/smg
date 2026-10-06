@@ -8,7 +8,7 @@
 
 use kv_index::{
     churn::{Churn, ChurnConfig, FreeOrder},
-    ReferenceIndexer, ShardedRunIndex,
+    ReferenceIndexer, ShardedChainIndex,
 };
 
 fn config(seed: u64) -> ChurnConfig {
@@ -39,7 +39,7 @@ fn requests() -> u64 {
 #[test]
 fn churn_with_decode_tails_and_restarts_is_exact() {
     for shards in [1usize, 2] {
-        let index = ShardedRunIndex::new(shards, 64);
+        let index = ShardedChainIndex::new(shards, 64);
         let mut reference = ReferenceIndexer::new();
         let mut churn = Churn::new(config(7 + shards as u64), &index);
         let total = requests();
@@ -76,7 +76,7 @@ fn churn_with_decode_tails_and_restarts_is_exact() {
 #[test]
 #[ignore = "passes once a divergence inside a run attaches a child instead of splitting the run"]
 fn runs_live_stay_within_the_content_shape() {
-    let index = ShardedRunIndex::new(1, 64);
+    let index = ShardedChainIndex::new(1, 64);
     let mut churn = Churn::new(config(11), &index);
     let total = requests() * 4;
     let shape = churn.pool.chains.len() + churn.pool.divergence_points();

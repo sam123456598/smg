@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use kv_index::{
-    compute_content_hash, request_prefix_hashes, ContentHash, RunBlockMap, ShardedRunIndex,
+    compute_content_hash, request_prefix_hashes, ChainBlockMap, ContentHash, ShardedChainIndex,
     StoredBlock,
 };
 
@@ -25,11 +25,11 @@ fn chain(stream: u64, shared: &[ContentHash], len: usize) -> Vec<StoredBlock> {
 
 #[test]
 fn splits_are_counted_by_cause() {
-    let index = ShardedRunIndex::new(2, 8);
+    let index = ShardedChainIndex::new(2, 8);
     // Both on shard 0: a split needs the chains in one index (sharding is by worker).
     let a = index.intern_worker_in(0, "a").unwrap();
     let b = index.intern_worker_in(0, "b").unwrap();
-    let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+    let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
     let chain_a = chain(1, &[], 100);
     index.apply_stored(a, &chain_a, None, &mut ma).unwrap();
     let before = index.stats();

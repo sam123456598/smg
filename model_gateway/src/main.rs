@@ -188,7 +188,7 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
 /// Parse the `--kv-index` value into a `KvIndexKind`.
 fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
     KvIndexKind::parse(value)
-        .ok_or_else(|| format!("invalid value '{value}'; expected positional or run"))
+        .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
 }
 
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
@@ -688,10 +688,11 @@ struct CliArgs {
     kv_indexer_max_entries: Option<usize>,
 
     /// The event-driven KV index behind cache-aware routing: `positional`
-    /// (one entry per block position, the default) or `run` (chains as runs
-    /// with per-run worker coverage; lock-free, store-free lookups). The
-    /// --kv-indexer-* prune bounds apply to the positional index only; the run
-    /// index holds what the engines report and shrinks with their removals.
+    /// (one entry per block position, the default) or `chain` (chains as runs
+    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
+    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
+    /// positional index only; the chain index holds what the engines report
+    /// and shrinks with their removals.
     #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
     kv_index: KvIndexKind,
 
@@ -2450,18 +2451,24 @@ mod tests {
     }
 
     /// `--kv-index` selects the event-driven index for cache-aware routing;
-    /// the positional indexer stays the default until the run index has
+    /// the positional indexer stays the default until the chain index has
     /// passed a soak in the gateway.
     #[test]
     fn kv_index_flag_flows_into_router_config() {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_index, KvIndexKind::Positional);
 
-        let cli = cli_args_from(&["--kv-index", "run"]);
+        let cli = cli_args_from(&["--kv-index", "chain"]);
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_index, KvIndexKind::Run);
+        assert_eq!(router_config.kv_index, KvIndexKind::Chain);
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.router_config.kv_index, KvIndexKind::Run);
+        assert_eq!(server_config.router_config.kv_index, KvIndexKind::Chain);
+        // The spelling before the rename still selects the chain index.
+        assert_eq!(
+            cli_args_from(&["--kv-index", "run"]).kv_index,
+            KvIndexKind::Chain
+        );
+        assert!(KvIndexKind::deprecated_alias_used());
 
         assert_eq!(
             cli_args_from(&["--kv-index", "Positional"]).kv_index,

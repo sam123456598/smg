@@ -1,6 +1,6 @@
 //! T6, the routing decision's cost: what one request pays in `cache_aware`'s
 //! `select_worker` (block hashing, the KV index lookup, the selection) against
-//! an index populated to 128 workers, for the positional indexer and the run
+//! an index populated to 128 workers, for the positional indexer and the chain
 //! index (`--kv-index`).
 //!
 //! The index is fed through the KV event monitor's own apply path: the
@@ -17,7 +17,7 @@
 //! on whatever core the process is pinned to, reporting p50/p99/p999 over the
 //! decisions with the lookup's and the hashing's own distributions beside
 //! them. `T6_WORKERS` (128) and `T6_BLOCKS_PER_WORKER` (8192) size the fleet;
-//! `T6_INDEX=positional|run` runs one backend alone, which is how the index's
+//! `T6_INDEX=positional|chain` runs one backend alone, which is how the index's
 //! RSS delta is measured (the second backend in a process reuses the first's
 //! freed pages and reads zero).
 //!
@@ -514,13 +514,13 @@ fn main() {
          lookup p50 | lookup p99 | lookup share | hash p50 | hash p99 | req tokens p50 | p99 |"
     );
     eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
-    // `T6_INDEX=positional|run` runs one backend in its own process: the second
+    // `T6_INDEX=positional|chain` runs one backend in its own process: the second
     // backend in one process reuses the pages the first freed, so its RSS
     // delta reads zero.
     let only = std::env::var("T6_INDEX")
         .ok()
         .and_then(|value| KvIndexKind::parse(&value));
-    for kind in [KvIndexKind::Positional, KvIndexKind::Run] {
+    for kind in [KvIndexKind::Positional, KvIndexKind::Chain] {
         if only.is_some_and(|only| only != kind) {
             continue;
         }

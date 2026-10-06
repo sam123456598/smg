@@ -403,7 +403,7 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_kv_index_lookup_seconds",
         "Time of one KV index lookup (overlap scoring of a request's block hashes) \
-         in cache-aware routing, by index kind (positional, run)"
+         in cache-aware routing, by index kind (positional, chain)"
     );
     describe_gauge!(
         "smg_kv_event_degraded_ranks",
@@ -421,33 +421,33 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_kv_index_entries",
         "Distinct entries in the KV index, by model: (position, content hash) pairs in \
-         the positional indexer, distinct blocks on a chain in the run index"
+         the positional indexer, distinct blocks on a chain in the chain index"
     );
     describe_gauge!(
         "smg_kv_index_runs_live",
-        "Runs linked in the run index, by model (blocks_live over runs_live is the \
+        "Runs linked in the chain index, by model (blocks_live over runs_live is the \
          mean run length; a falling ratio under steady traffic is fragmentation)"
     );
     describe_gauge!(
         "smg_kv_index_blocks_live",
-        "Content hashes held by the run index's live runs, by model"
+        "Content hashes held by the chain index's live runs, by model"
     );
     describe_gauge!(
         "smg_kv_index_arena_bytes",
-        "Bytes the run index's word arena has handed out (hash arrays, child tables, \
+        "Bytes the chain index's word arena has handed out (hash arrays, child tables, \
          free lists included), by model"
     );
     describe_gauge!(
         "smg_kv_index_arena_free_bytes",
-        "Bytes of the run index's word arena sitting in free lists, by model"
+        "Bytes of the chain index's word arena sitting in free lists, by model"
     );
     describe_gauge!(
         "smg_kv_index_slab_bytes",
-        "Bytes the run index's run slab holds from the allocator, by model"
+        "Bytes the chain index's run slab holds from the allocator, by model"
     );
     describe_gauge!(
         "smg_kv_index_moved_hashes",
-        "Stores that moved a held engine hash to another place in the run index \
+        "Stores that moved a held engine hash to another place in the chain index \
          (cumulative), by model"
     );
     describe_gauge!(
@@ -1801,9 +1801,9 @@ impl Metrics {
         gauge!("smg_kv_index_entries", "model" => model).set(entries as f64);
     }
 
-    /// Publish the run index's shape and memory for a model, from its own
+    /// Publish the chain index's shape and memory for a model, from its own
     /// counters: live runs and blocks, arena and slab bytes, moved hashes.
-    pub fn set_kv_index_run_stats(model_id: &str, stats: &kv_index::RunIndexStats) {
+    pub fn set_kv_index_chain_stats(model_id: &str, stats: &kv_index::ChainIndexStats) {
         let model = intern_string(model_id);
         gauge!("smg_kv_index_runs_live", "model" => model.clone()).set(stats.runs_live as f64);
         gauge!("smg_kv_index_blocks_live", "model" => model.clone()).set(stats.blocks_live as f64);

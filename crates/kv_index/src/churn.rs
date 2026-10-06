@@ -1,4 +1,4 @@
-//! Churn generator for the run index: workers with block-LRU caches serving prefix requests
+//! Churn generator for the chain index: workers with block-LRU caches serving prefix requests
 //! over a shared chain pool, the way the mock engines do in a soak, so the index sees the
 //! stores, evictions and heals that fragment runs over hours. Shared by the churn bench
 //! (timing, series, JSON) and the gate test (a few minutes of events, a bound on runs live).
@@ -19,8 +19,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
-    chain_prefix_hash, compute_content_hash, request_prefix_hashes, ContentHash, ReferenceIndexer,
-    RunBlockMap, SequenceHash, ShardedRunIndex, StoredBlock,
+    chain_prefix_hash, compute_content_hash, request_prefix_hashes, ChainBlockMap, ContentHash,
+    ReferenceIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
 };
 
 /// Order among equal-age blocks when a worker frees past its capacity.
@@ -177,7 +177,7 @@ struct EvictKey {
 
 struct Worker {
     id: u32,
-    map: RunBlockMap,
+    map: ChainBlockMap,
     held: HashMap<SequenceHash, Held>,
     order: BTreeMap<EvictKey, SequenceHash>,
 }
@@ -282,7 +282,7 @@ pub struct Churn {
 
 impl Churn {
     /// Interns `cfg.workers` workers round robin over the shards.
-    pub fn new(cfg: ChurnConfig, index: &ShardedRunIndex) -> Self {
+    pub fn new(cfg: ChurnConfig, index: &ShardedChainIndex) -> Self {
         let mut rng = Rng::new(cfg.seed);
         let pool = Pool::generate(&cfg, &mut rng);
         let workers = (0..cfg.workers)
@@ -290,7 +290,7 @@ impl Churn {
                 id: index
                     .intern_worker_in(w % index.shards(), &format!("churn-{w}"))
                     .expect("worker slots"),
-                map: RunBlockMap::default(),
+                map: ChainBlockMap::default(),
                 held: HashMap::new(),
                 order: BTreeMap::new(),
             })
@@ -324,7 +324,7 @@ impl Churn {
     /// which stores what it lacks and evicts past capacity. `reference` receives the same events.
     pub fn step(
         &mut self,
-        index: &ShardedRunIndex,
+        index: &ShardedChainIndex,
         mut reference: Option<&mut ReferenceIndexer>,
     ) -> StepReport {
         self.clock += 1;
@@ -465,7 +465,7 @@ impl Churn {
     /// Score a sample of chains against the reference: the exactness check at a checkpoint.
     pub fn check_exact(
         &mut self,
-        index: &ShardedRunIndex,
+        index: &ShardedChainIndex,
         reference: &ReferenceIndexer,
         samples: usize,
     ) -> Result<(), String> {

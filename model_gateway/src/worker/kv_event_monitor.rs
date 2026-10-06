@@ -2,7 +2,7 @@
 //!
 //! `KvEventMonitor` spawns a background tokio task per gRPC worker that subscribes
 //! to KV cache events and feeds them into a shared [`KvIndex`] (one per model;
-//! the positional indexer or the run index, per `--kv-index`).
+//! the positional indexer or the chain index, per `--kv-index`).
 //! This enables event-driven cache-aware routing as an alternative to the approximate
 //! radix tree approach.
 //!
@@ -53,7 +53,7 @@ const DEFAULT_JUMP_SIZE: usize = 64;
 /// policies' default eviction cadence).
 const PRUNE_INTERVAL_SECS: u64 = 30;
 
-/// Interval between publications of each model's index size and, for the run
+/// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
 const STATS_INTERVAL_SECS: u64 = 30;
 
@@ -256,7 +256,7 @@ impl KvEventMonitor {
 
     /// Prune every model's positional indexer with the given bounds.
     /// `ttl_secs`/`max_entries` of 0 disable the respective pass — see
-    /// [`KvIndex::prune`]. The run index has no prune and is left alone.
+    /// [`KvIndex::prune`]. The chain index has no prune and is left alone.
     pub fn prune_all(&self, ttl_secs: u64, max_entries: usize) {
         Self::prune_indexers(&self.indexers, ttl_secs, max_entries);
     }
@@ -284,17 +284,17 @@ impl KvEventMonitor {
         }
     }
 
-    /// Publish every model's index size, and the run index's shape and
+    /// Publish every model's index size, and the chain index's shape and
     /// memory, as gauges: what a soak reads to tell fragmentation or growth
-    /// from load. `current_size` and `entry_count` are counter reads; the run
+    /// from load. `current_size` and `entry_count` are counter reads; the chain
     /// index's `stats` walks its run headers, which is why this runs on a
     /// 30 s cadence and never on a request.
     fn publish_stats(indexers: &DashMap<String, Arc<KvIndex>>) {
         for entry in indexers {
             let index = entry.value();
             Metrics::set_kv_index_size(entry.key(), index.current_size(), index.entry_count());
-            if let Some(stats) = index.run_stats() {
-                Metrics::set_kv_index_run_stats(entry.key(), &stats);
+            if let Some(stats) = index.chain_stats() {
+                Metrics::set_kv_index_chain_stats(entry.key(), &stats);
             }
         }
     }
@@ -319,11 +319,11 @@ impl KvEventMonitor {
         if ttl_secs == 0 && max_entries == 0 {
             return;
         }
-        if self.kind == KvIndexKind::Run {
+        if self.kind == KvIndexKind::Chain {
             warn!(
                 ttl_secs,
                 max_entries,
-                "The run index has no prune: it holds what the engines report and \
+                "The chain index has no prune: it holds what the engines report and \
                  shrinks with their removals; --kv-indexer-ttl-secs and \
                  --kv-indexer-max-entries apply to --kv-index positional only"
             );
@@ -1443,7 +1443,7 @@ pub(crate) struct WorkerIndexCounters {
     /// Stores whose parent the index did not hold, placed as a new chain from
     /// the root instead, and the blocks they carried. Every one duplicates
     /// content the chain may already hold further down, so a rising count is
-    /// where fragmentation of the run index is looked for first.
+    /// where fragmentation of the chain index is looked for first.
     pub(crate) parentless_stores: u64,
     pub(crate) parentless_blocks: u64,
 }
@@ -2149,8 +2149,8 @@ mod tests {
     }
 
     /// The index-shape gauges come from the indexes' own counters, by model:
-    /// memberships and entries for both kinds, the run index's runs, blocks,
-    /// arena and slab bytes and moved hashes for the run kind.
+    /// memberships and entries for both kinds, the chain index's runs, blocks,
+    /// arena and slab bytes and moved hashes for the chain kind.
     #[test]
     fn index_shape_gauges_follow_the_indexes() {
         use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -2169,7 +2169,10 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             let monitor = KvEventMonitor::new(None);
-            for (model, kind) in [("pos", KvIndexKind::Positional), ("run", KvIndexKind::Run)] {
+            for (model, kind) in [
+                ("pos", KvIndexKind::Positional),
+                ("chain", KvIndexKind::Chain),
+            ] {
                 let index = Arc::new(KvIndex::new(kind, 8));
                 let worker = index.intern_worker("grpc://w1:9000").unwrap();
                 let mut held = WorkerBlocks::default();
@@ -2185,7 +2188,7 @@ mod tests {
                 monitor.indexers.insert(model.to_string(), index);
             }
             KvEventMonitor::publish_stats(&monitor.indexers);
-            for model in ["pos", "run"] {
+            for model in ["pos", "chain"] {
                 assert_eq!(
                     gauge(&handle, "smg_kv_index_memberships", model),
                     Some(3.0),
@@ -2197,21 +2200,24 @@ mod tests {
                     "{model}"
                 );
             }
-            assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "run"), Some(1.0));
-            assert_eq!(gauge(&handle, "smg_kv_index_blocks_live", "run"), Some(3.0));
+            assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "chain"), Some(1.0));
             assert_eq!(
-                gauge(&handle, "smg_kv_index_moved_hashes", "run"),
+                gauge(&handle, "smg_kv_index_blocks_live", "chain"),
+                Some(3.0)
+            );
+            assert_eq!(
+                gauge(&handle, "smg_kv_index_moved_hashes", "chain"),
                 Some(0.0)
             );
-            assert!(gauge(&handle, "smg_kv_index_arena_bytes", "run").is_some_and(|b| b > 0.0));
-            assert!(gauge(&handle, "smg_kv_index_slab_bytes", "run").is_some_and(|b| b > 0.0));
+            assert!(gauge(&handle, "smg_kv_index_arena_bytes", "chain").is_some_and(|b| b > 0.0));
+            assert!(gauge(&handle, "smg_kv_index_slab_bytes", "chain").is_some_and(|b| b > 0.0));
             assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "pos"), None);
         });
     }
 
     /// A store whose parent the index does not hold is placed from the root
     /// and counted, per worker, so a soak can see how much of a chain's
-    /// content arrives detached (where the run index fragments first).
+    /// content arrives detached (where the chain index fragments first).
     #[test]
     fn parentless_stores_are_counted_per_worker() {
         use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -2666,10 +2672,10 @@ mod tests {
     /// `smg_kv_index_blocks{worker}` is set where applied batches are counted,
     /// from the index's own per-worker counter: it follows stores, removals and
     /// a clear, and costs the lookup path nothing. Both indexes keep that
-    /// counter, so the gauge reads the same under `--kv-index run`.
+    /// counter, so the gauge reads the same under `--kv-index chain`.
     #[test]
     fn index_block_gauge_follows_stores_removals_and_a_clear() {
-        for kind in [KvIndexKind::Positional, KvIndexKind::Run] {
+        for kind in [KvIndexKind::Positional, KvIndexKind::Chain] {
             index_block_gauge_follows_the_index(kind);
         }
     }

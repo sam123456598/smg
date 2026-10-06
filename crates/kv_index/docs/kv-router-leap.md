@@ -194,7 +194,7 @@ builds and tests stay on cores 72–143.
 
 | Workstream | Owns | Deliverable |
 |---|---|---|
-| indexer-run | `crates/kv_index/src/run_index*`, `tests/exactness_run.rs` | run-compressed, chain-hash-keyed index with O(log D) lookups and O(1) amortised events, bitset coverage, lock-free reads, measured in the shared harness |
+| indexer-run | `crates/kv_index/src/chain_index.rs` (the chain index, formerly the run index), `src/sharded.rs`, `tests/exactness_chain.rs`, `tests/concurrency_chain.rs` | run-compressed, chain-hash-keyed index with O(log D) lookups and O(1) amortised events, bitset coverage, lock-free reads, measured in the shared harness |
 | indexer-fast | `crates/kv_index/src/event_tree.rs`, `tests/exactness.rs` | PositionalIndexer: store-free lookups, bitset coverage, batched write path, allocation-free probes, each change measured |
 | servicer-schema | proto `common.proto`, `engine_servicer` relay and tests, monitor field plumbing, `kv_index/src/salt.rs` | section 4.1: every engine field carried, normaliser rules, fixtures for both layouts and engines |
 | mock-engine | `crates/mock_worker/**`, new `crates/replay/`, `~/smg-perf/replay/` | KV-event-emitting mock with a real prefix cache and timing model; Mooncake replayer with TTFT/TPOT/goodput/hit-rate/oracle |

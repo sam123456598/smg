@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
@@ -188,7 +191,7 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_max_entries: Option<usize>,
     /// Which event-driven KV index cache-aware routing reads: the positional
-    /// indexer (default) or the run-compressed index. The prune bounds above
+    /// indexer (default) or the chain index. The prune bounds above
     /// apply to the positional indexer only.
     #[serde(default)]
     pub kv_index: KvIndexKind,
@@ -789,27 +792,43 @@ pub enum KvIndexKind {
     /// probed per block of a request (default).
     #[default]
     Positional,
-    /// The run-compressed index: chains stored as runs with per-run worker
-    /// coverage; lock-free, store-free lookups, memory proportional to the
-    /// blocks the engines report.
-    Run,
+    /// The chain index: chains stored as runs with per-run worker coverage;
+    /// lock-free, store-free lookups, memory proportional to the blocks the
+    /// engines report. `run`, its name before 2026-10-06, is accepted as a
+    /// deprecated alias until the positional indexer is removed.
+    #[serde(alias = "run")]
+    Chain,
 }
 
+/// Whether the deprecated `run` spelling of the chain index was given on the
+/// command line; read once at startup to log the deprecation.
+static DEPRECATED_KV_INDEX_ALIAS: AtomicBool = AtomicBool::new(false);
+
 impl KvIndexKind {
-    /// Parse from a case-insensitive string (`positional` | `run`).
+    /// Parse from a case-insensitive string (`positional` | `chain`, with
+    /// `run` as the deprecated spelling of `chain`).
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "positional" => Some(Self::Positional),
-            "run" => Some(Self::Run),
+            "chain" => Some(Self::Chain),
+            "run" => {
+                DEPRECATED_KV_INDEX_ALIAS.store(true, Ordering::Relaxed);
+                Some(Self::Chain)
+            }
             _ => None,
         }
+    }
+
+    /// Whether `parse` was given the deprecated `run` spelling.
+    pub fn deprecated_alias_used() -> bool {
+        DEPRECATED_KV_INDEX_ALIAS.load(Ordering::Relaxed)
     }
 
     /// Canonical lowercase name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Positional => "positional",
-            Self::Run => "run",
+            Self::Chain => "chain",
         }
     }
 }

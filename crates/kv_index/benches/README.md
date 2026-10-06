@@ -328,7 +328,7 @@ both below the points' own series medians, so the two heads are one system at th
 resolution and the row to cite for either is the 20-trial series above (kept up 13 of 20 and 16
 of 22, the shortfalls being the editor server).
 
-The run index re-measured in the same conditions (06:52-07:28 on 2026-10-06, competitor layout,
+The chain index (formerly the run index) re-measured in the same conditions (06:52-07:28 on 2026-10-06, competitor layout,
 the same harness build as the local-memory rows, kv-index `9f9c7c04`; the editor server closed,
 the soaks running from 07:00; `bisect-dynrun-quiet[-localmem]`, `protocol/dynrun-sustained-quiet[-localmem]`):
 
@@ -338,7 +338,7 @@ the soaks running from 07:00; `bisect-dynrun-quiet[-localmem]`, `protocol/dynrun
 | local | 1,383.8M (231 ms) | 1,509.0M (99.5%, 98.6%, 98.8%) | 1,379.3 [1,377.1, 1,380.0] | 23.4 | 16 of 20 (5 discarded) | 1.3 [1.3, 1.3] / 3.6 [3.6, 3.6] | 1,379.0 [1,377.2, 1,380.0], 18 of 21 |
 
 Equal cores, one binary build, 20 trials on both sides, the same night: under Dynamo's published
-method the run index sustains 1,063.6M against the competitor's 739.1M (1.44x; 18.0 against
+method the chain index sustains 1,063.6M against the competitor's 739.1M (1.44x; 18.0 against
 12.5M per lane core) at lookup p99 3.7 against 13.8 us; under local memory 1,379.3M against
 918.1M (1.50x; 23.4 against 15.6M per lane core) at p99 3.6 against 9.9 us. Both of the run
 index's points are the same as measured earlier under load (1,061.7M at 300 ms, 1,383.8M), so its
@@ -356,14 +356,14 @@ Dynamo's), and 64 event lanes plus 128 query lanes on 12-63 for every system, so
 ran on 52 lane cores and every total divides by the same number. The rows a publication cites are
 the same-binary ones: Dynamo's `mooncake_bench` running its CRTC and, through the adapter kept
 with the measurement scripts outside this repository, this crate's `PositionalIndexer` and
-`RunIndex`, one binary, one generator, one lane scheduler. The SMG harness rows are the
+`ChainIndex`, one binary, one generator, one lane scheduler. The SMG harness rows are the
 cross-check: the two harnesses agree to 0.2% at 107M (Parity) and the SMG harness reads lower at
 high rates, since it mirrors Dynamo's per-event costs but not its lane scheduling.
 
 Binaries, one build each, every trial of the entry on these: Dynamo `mooncake_bench` from
 ai-dynamo/dynamo `50bdb355f8` with features `mooncake,router-bench` (mimalloc), plus the
 out-of-tree wiring and lane-CPU patches; the same-binary build adds this crate as a path
-dependency at `408b3254` (indexers as in `perf/kv-router-leap` `b4943d69`, the run index with the
+dependency at `408b3254` (indexers as in `perf/kv-router-leap` `b4943d69`, the chain index with the
 lane pool); the SMG replayer `mooncake_replay` built from `93876aa0` (the same indexers). Every
 result JSON carries its command line and the hashes of its binary and of the trace or corpus, and
 every series directory carries a provenance file naming the build it ran on.
@@ -379,20 +379,20 @@ is the kept-up rate over the 52 lane cores.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Dynamo CRTC, Dynamo harness | 480.8M | 9.25 | 511.2M | 1.063 | 99.7%, 99.7%, 89.4% | 3.5-3.6 / 14 | 6, 0 |
 | SMG `PositionalIndexer`, Dynamo harness | 132.4M | 2.55 | 143.1M | 1.080 | 93.9%, 94.3%, 95.2% | 30.6-31.7 / 449-516 | 7, 0 |
-| SMG `RunIndex`, Dynamo harness | 656.4M | 12.62 | 718.7M | 1.095 | 99.7%, 99.8%, 98.9% | 1.3-1.4 / 4 | 6, 3 |
+| SMG `ChainIndex`, Dynamo harness | 656.4M | 12.62 | 718.7M | 1.095 | 99.7%, 99.8%, 98.9% | 1.3-1.4 / 4 | 6, 3 |
 | SMG `PositionalIndexer`, SMG harness | 122.6M | 2.36 | 132.4M | 1.080 | 99.4%, 96.2%, 96.3% | 28.1-34.4 / 347-487 | 7, 0 |
-| SMG `RunIndex`, SMG harness | 571.7M | 10.99 | 611.3M | 1.069 | 99.8%, 99.8%, 96.9% | 1.1 / 6 | 7, 0 |
+| SMG `ChainIndex`, SMG harness | 571.7M | 10.99 | 611.3M | 1.069 | 99.8%, 99.8%, 96.9% | 1.1 / 6 | 7, 0 |
 | no indexer (harness ceiling), SMG harness | 1669.9M | 32.11 | 1766.1M | 1.058 | 98.5%, 98.9%, 99.8% | 0.4-0.5 / 3-4 | 7, 0 |
 
 The strict rule makes every bracket conservative: the competitor's failing point at 511.2M and
-the run index's at 718.7M each lost one trial of three (89.4% with nothing above 5% of a core in
+the chain index's at 718.7M each lost one trial of three (89.4% with nothing above 5% of a core in
 the samples around it; 98.9%), and the competitor achieved 98.9-99.3% at 653.3M and 69-74% of
-1.07B (736-790M) when overloaded, while the run index achieved 99.5-99.6% in two trials of three
-at 1,033M. In one binary and on the same 52 cores the run index keeps up with 1.37x the
+1.07B (736-790M) when overloaded, while the chain index achieved 99.5-99.6% in two trials of three
+at 1,033M. In one binary and on the same 52 cores the chain index keeps up with 1.37x the
 competitor's sustained rate (12.6 against 9.3M block ops/s per lane core) with lookups at p50
 1.3 us and p99 4 us against 3.5 us and 14 us; the positional design keeps up at 0.28x of it. The
 SMG harness brackets read 7-13% lower than Dynamo's for the same indexers (positional 122.6
-against 132.4M, run index 571.7 against 656.4M); the null backend's 1.67B is the harness's own
+against 132.4M, chain index 571.7 against 656.4M); the null backend's 1.67B is the harness's own
 ceiling on this layout (the generator, with the lanes doing nothing).
 
 ### 20-trial series
@@ -402,7 +402,7 @@ followed by a control trial of the same binary and configuration, one lock hold 
 measurement cores sampled around every trial (record 5%, discard 50%), medians with bootstrap 95%
 intervals. Sustained points are the kept-up ends of the brackets above (the window that offers
 them in Dynamo's harness is given); overload is the 300 ms window for the competitor and the
-positional index in Dynamo's harness, 200 ms for the run index there, and twice the sustained rate
+positional index in Dynamo's harness, 200 ms for the chain index there, and twice the sustained rate
 in the SMG harness. Per lane core divides the achieved median by the 52 lane cores.
 
 Same-binary rows, Dynamo's harness (one binary, one generator, one lane scheduler):
@@ -417,10 +417,10 @@ Same-binary rows, Dynamo's harness (one binary, one generator, one lane schedule
 | control (same binary) (SMG PositionalIndexer) | same | 21 / 1 | 15 of 21 | 131.6 [131.4, 131.7] | | 30.8 [27.2, 31.6] | 457 [393, 482] | |
 | SMG PositionalIndexer, Dynamo harness | overload (300 ms window, 1.07B offered) | 20 / 0 | 0 of 20 | 144.7 [143.9, 145.1] | 2.78 (52 cores) | 23.4 [23.1, 23.6] | 565 [558, 571] | +0.4 [-0.8, +1.3], +0.1 [-0.4, +0.3], +3.0 [-6.1, +15.3] |
 | control (same binary) (SMG PositionalIndexer) | same | 20 / 0 | 0 of 20 | 144.3 [143.4, 145.3] | | 23.3 [23.3, 23.6] | 562 [550, 567] | |
-| SMG RunIndex, Dynamo harness | sustained bracket (488 ms window, 656M offered) | 20 / 4 | 17 of 20 | 654.6 [654.4, 654.6] | 12.59 (52 cores) | 1.3 [1.2, 1.3] | 4 [4, 4] | +0.1 [-0.2, +0.3], -0.0 [-0.1, +0.1], -0.0 [-0.2, +0.1] |
-| control (same binary) (SMG RunIndex) | same | 22 / 2 | 19 of 22 | 654.5 [654.3, 654.6] | | 1.3 [1.3, 1.3] | 4 [4, 4] | |
-| SMG RunIndex, Dynamo harness | overload (200 ms window, 1.60B offered) | 20 / 2 | 0 of 20 | 1171.0 [1140.1, 1227.9] | 22.52 (52 cores) | 1.2 [1.2, 1.2] | 4 [3, 4] | -7.1 [-66.8, +61.3], +0.0 [-0.0, +0.0], +0.0 [-0.2, +0.3] |
-| control (same binary) (SMG RunIndex) | same | 20 / 2 | 0 of 20 | 1178.1 [1155.8, 1220.5] | | 1.2 [1.2, 1.2] | 3 [3, 4] | |
+| SMG ChainIndex, Dynamo harness | sustained bracket (488 ms window, 656M offered) | 20 / 4 | 17 of 20 | 654.6 [654.4, 654.6] | 12.59 (52 cores) | 1.3 [1.2, 1.3] | 4 [4, 4] | +0.1 [-0.2, +0.3], -0.0 [-0.1, +0.1], -0.0 [-0.2, +0.1] |
+| control (same binary) (SMG ChainIndex) | same | 22 / 2 | 19 of 22 | 654.5 [654.3, 654.6] | | 1.3 [1.3, 1.3] | 4 [4, 4] | |
+| SMG ChainIndex, Dynamo harness | overload (200 ms window, 1.60B offered) | 20 / 2 | 0 of 20 | 1171.0 [1140.1, 1227.9] | 22.52 (52 cores) | 1.2 [1.2, 1.2] | 4 [3, 4] | -7.1 [-66.8, +61.3], +0.0 [-0.0, +0.0], +0.0 [-0.2, +0.3] |
+| control (same binary) (SMG ChainIndex) | same | 20 / 2 | 0 of 20 | 1178.1 [1155.8, 1220.5] | | 1.2 [1.2, 1.2] | 3 [3, 4] | |
 
 SMG harness rows (the cross-check):
 
@@ -430,12 +430,12 @@ SMG harness rows (the cross-check):
 | control (same binary) (SMG PositionalIndexer) | same | 20 / 3 | 14 of 20 | 121.9 [121.1, 122.0] | | 34.0 [33.7, 35.0] | 490 [481, 571] | |
 | SMG PositionalIndexer, SMG harness | overload (1305 ms window, 245M offered) | 21 / 1 | 0 of 21 | 132.1 [130.9, 134.1] | 2.54 (52 cores) | 32.0 [31.2, 32.4] | 605 [601, 615] | -0.5 [-2.2, +2.4], +0.1 [-0.8, +1.5], +7.7 [-2.4, +18.9] |
 | control (same binary) (SMG PositionalIndexer) | same | 20 / 2 | 0 of 20 | 132.6 [131.2, 133.1] | | 31.9 [30.5, 32.1] | 597 [592, 605] | |
-| SMG RunIndex, SMG harness | sustained bracket (559 ms window, 572M offered) | 21 / 0 | 18 of 21 | 570.3 [570.0, 570.6] | 10.97 (52 cores) | 1.1 [1.1, 1.1] | 6 [6, 6] | -0.1 [-0.5, +0.4], -0.0 [-0.0, +0.0], +0.0 [-0.0, +0.1] |
-| control (same binary) (SMG RunIndex) | same | 20 / 1 | 20 of 20 | 570.3 [570.1, 570.5] | | 1.1 [1.1, 1.1] | 6 [6, 6] | |
-| SMG RunIndex, SMG harness | sustained, re-bracketed (470 ms window, 682M offered; the 571.7M point was decided by one trial at 96.9% of 611.3M, the new bracket keeps up at 681.6M and fails at 719.8M on one generator-invalid trial, 760M fails) | 20 / 6 | 19 of 20 | 679.6 [679.3, 679.8] | 13.07 (52 cores) | 1.1 [1.1, 1.1] | 6 [6, 6] | +0.0 [-0.4, +0.5], +0.0 [-0.0, +0.0], -0.0 [-0.2, +0.2] |
-| control (same binary) (SMG RunIndex) | same | 21 / 5 | 20 of 21 | 679.6 [679.1, 679.7] | | 1.1 [1.1, 1.1] | 6 [6, 6] | |
-| SMG RunIndex, SMG harness | overload (279 ms window, 1.14B offered) | 21 / 0 | 2 of 21 | 1069.9 [980.0, 1114.6] | 20.58 (52 cores) | 1.0 [1.0, 1.1] | 8 [7, 8] | +41.7 [-71.4, +127.2], +0.0 [-0.1, +0.1], -1.0 [-2.0, +0.1] |
-| control (same binary) (SMG RunIndex) | same | 20 / 1 | 1 of 20 | 1028.3 [958.0, 1076.7] | | 1.0 [1.0, 1.1] | 9 [8, 9] | |
+| SMG ChainIndex, SMG harness | sustained bracket (559 ms window, 572M offered) | 21 / 0 | 18 of 21 | 570.3 [570.0, 570.6] | 10.97 (52 cores) | 1.1 [1.1, 1.1] | 6 [6, 6] | -0.1 [-0.5, +0.4], -0.0 [-0.0, +0.0], +0.0 [-0.0, +0.1] |
+| control (same binary) (SMG ChainIndex) | same | 20 / 1 | 20 of 20 | 570.3 [570.1, 570.5] | | 1.1 [1.1, 1.1] | 6 [6, 6] | |
+| SMG ChainIndex, SMG harness | sustained, re-bracketed (470 ms window, 682M offered; the 571.7M point was decided by one trial at 96.9% of 611.3M, the new bracket keeps up at 681.6M and fails at 719.8M on one generator-invalid trial, 760M fails) | 20 / 6 | 19 of 20 | 679.6 [679.3, 679.8] | 13.07 (52 cores) | 1.1 [1.1, 1.1] | 6 [6, 6] | +0.0 [-0.4, +0.5], +0.0 [-0.0, +0.0], -0.0 [-0.2, +0.2] |
+| control (same binary) (SMG ChainIndex) | same | 21 / 5 | 20 of 21 | 679.6 [679.1, 679.7] | | 1.1 [1.1, 1.1] | 6 [6, 6] | |
+| SMG ChainIndex, SMG harness | overload (279 ms window, 1.14B offered) | 21 / 0 | 2 of 21 | 1069.9 [980.0, 1114.6] | 20.58 (52 cores) | 1.0 [1.0, 1.1] | 8 [7, 8] | +41.7 [-71.4, +127.2], +0.0 [-0.1, +0.1], -1.0 [-2.0, +0.1] |
+| control (same binary) (SMG ChainIndex) | same | 20 / 1 | 1 of 20 | 1028.3 [958.0, 1076.7] | | 1.0 [1.0, 1.1] | 9 [8, 9] | |
 | no indexer (harness ceiling), SMG harness | sustained bracket (191 ms window, 1.67B offered) | 20 / 2 | 18 of 20 | 1667.9 [1667.5, 1668.1] | 32.07 (52 cores) | 0.5 [0.5, 0.5] | 4 [4, 4] | -0.1 [-0.5, +2.6], +0.0 [+0.0, +0.0], +0.0 [-0.0, +0.0] |
 | control (same binary) (no indexer (harness ceiling)) | same | 21 / 1 | 19 of 21 | 1667.9 [1665.4, 1668.1] | | 0.5 [0.5, 0.5] | 4 [4, 4] | |
 
@@ -444,19 +444,19 @@ the generator was invalid in all 40 subject trials, which places the harness's o
 layout between 1.67B (kept up) and 3.34B, as the query-issuer grid above predicts (2.13B on
 schedule with four query issuers).
 
-Reading the rows. In one binary and on the same 52 cores the run index sustains 654.6M against
+Reading the rows. In one binary and on the same 52 cores the chain index sustains 654.6M against
 the competitor's 479.3M (1.37x; 12.6 against 9.2M block ops/s per lane core) with lookups at p50
 1.3 us and p99 4 us against 3.5 us and 14 us; overloaded it achieves 1,171M at the 200 ms window
 (22.5M per core, p99 still 4 us) where the competitor achieves 764.5M at 300 ms (14.7M per core,
 p99 12 us). The positional design sustains 131.6M (2.5M per core) at p99 413 us and is the
-reference for what the run index replaced. The control pairs put the noise floor at or below one
+reference for what the chain index replaced. The control pairs put the noise floor at or below one
 unit in the last digit for sustained throughput and lookup p50 and within 0.3 us for the run
 index's p99; the overload (capacity) rows carry the widest intervals (the competitor's 300 ms
-subject and control differ by 5.4M inside [-56, +41]; the run index's 200 ms pair by 7.1M inside
+subject and control differ by 5.4M inside [-56, +41]; the chain index's 200 ms pair by 7.1M inside
 [-67, +61]), so capacities are compared within one harness and layout only; the competitor's
 capacity on this layout (764.5M on 52 cores) is below its competitor-layout figure (857.4M on 59
 cores). The SMG harness reads 7% lower than Dynamo's for the same indexers at their sustained
-points (positional 122.0 against 131.6M, run index 570.3 against 654.6M) with the same latencies
+points (positional 122.0 against 131.6M, chain index 570.3 against 654.6M) with the same latencies
 within 2 us at p99, and its run-index overload row shows the bracket is conservative: at 1.14B
 offered the index still achieved 1,069.9M [980, 1,115] (94% of offered, 2 of 21 trials kept up),
 so its ceiling in this harness lies near 1.1B; the re-bracketed point (681.6M kept up, 719.8M
@@ -479,7 +479,7 @@ set and prints the layout at the top of every log.
 A same-binary comparison on all lane cores of both sockets (lanes 5-63 and 72-143, 131 cores, 128
 event lanes and 128 query lanes, event issuers on 0-3 and 64-71, query issuer on 4, `numactl
 --interleave=all`) was prepared and smoke-tested with the out-of-tree adapter built against the
-run index at `9f9c7c04` (binary and commits in the measurement scripts' provenance file). At the
+chain index at `9f9c7c04` (binary and commits in the measurement scripts' provenance file). At the
 3000 ms window (107M) it keeps up; at 500 ms (640M offered) the generator is invalid: the issue
 span is 743 ms, read and update issue lag p99 240 ms, issuers busy the whole time, 430M achieved.
 One trial each at 500 ms localises it: lanes on socket 0 only (5-63) with the same issuers keep up
@@ -488,20 +488,20 @@ ms; both sockets with 32 query lanes still fail (span 519 ms); 64 event lanes on
 worse (span 815 ms). Dynamo's harness has one query issuer and its event issuers wait for it at
 every deadline, so each publish to a lane parked on the other socket costs a cross-socket wake:
 its generator ceiling on a two-socket lane set is 430-550M block ops/s, below the single-socket
-52-lane sustained points above (run index 656M, competitor 481M). Brackets on that layout would be
+52-lane sustained points above (chain index 656M, competitor 481M). Brackets on that layout would be
 generator rows for both systems, so none were run; the harness was not changed. The SMG harness
 with five query issuers issues on schedule on the same 131 lanes (read lag p99 78 us) but the run
 index achieved only 528M of 640M there, a lane-side cliff that the rows below take apart.
 
 ### Two-socket lane sets in the SMG harness: where the lane cost goes
 
-One variable per row, run index at `9f9c7c04` through the replayer at `0d8f3ba9` (this branch's
+One variable per row, chain index at `9f9c7c04` through the replayer at `0d8f3ba9` (this branch's
 `70702f80` on that tree: `--issuer-by-lane`), three fresh processes at the 500 ms window (640M
 offered) and one at 300 ms (1,067M), the host otherwise idle (19:05-19:25). Lane CPU per event is
 the median lane's event-lane CPU over its events, read per socket from the pinning (lane `i` on
 backend CPU `i mod n`); per lane core divides the achieved median by the lane cores.
 
-| Row | Configuration (run index unless said, 500 ms window = 640M offered, 3 trials) | Achieved (M), kept up | Per lane core (M) | Lane CPU per event, socket 0 / 1 (us) | Lookup p50 / p99 (us) | 300 ms (1,067M offered): achieved (M) |
+| Row | Configuration (chain index unless said, 500 ms window = 640M offered, 3 trials) | Achieved (M), kept up | Per lane core (M) | Lane CPU per event, socket 0 / 1 (us) | Lookup p50 / p99 (us) | 300 ms (1,067M offered): achieved (M) |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | socket 0 only: 60 lane cores (12-71), issuers 0-7 and 8-11, 64 lanes pinned, interleave | 637 (637-638), 3 of 3 | 10.62 (60) | 5.7 / - | 1.1 / 6 | 749 |
 | 2 | socket 1 only: 60 lane cores (72-131), issuers 136-143 and 132-135, 64 lanes pinned, interleave | 602 (537-616), 2 of 3, generator invalid in 1 | 10.03 (60) | - / 5.7 | 1.1 / 6 | 899 |
@@ -523,7 +523,7 @@ backend CPU `i mod n`); per lane core divides the achieved median by the lane co
 | 18 | both sockets, pinned, null backend (harness floor) | 639 (636-640), 3 of 3 | 4.88 (131) | 4.7 / 4.7 | 0.4 / 6 | 897 (generator invalid) |
 | 19 | socket 0 only, null backend | 639 (610-640), 3 of 3 | 10.65 (60) | 1.4 / - | 0.4 / 4 | 1062 |
 
-Reading, for the run index's owners:
+Reading, for the chain index's owners:
 
 - **Not wake latency or feeding.** Lanes fed across the interconnect keep up as well as lanes fed
   locally: row 15 (socket-1 issuers feeding socket-0 lanes) keeps up at 640M and achieves 1,060M at
@@ -544,7 +544,7 @@ Reading, for the run index's owners:
 - **What is left is the index's shared writable state.** Lanes applying events on both sockets pay
   two to three times the per-event CPU of lanes on one socket, with the same events per lane, the
   same binary (the `b4943d69` index behaves the same, row 9) and lookups unaffected; the extra time
-  is cache lines of the run index written from both sockets bouncing across the interconnect. The
+  is cache lines of the chain index written from both sockets bouncing across the interconnect. The
   duplicated corpus makes the sharing true sharing: twenty workers carry the same content, so the
   runs they converge on (coverage words, run metadata, arena and lane-map lines) are written by
   lanes on both sockets. The fix is placement or partition, not parking: route the workers that
@@ -555,7 +555,7 @@ Reading, for the run index's owners:
 ### Local memory on one socket: what `--interleave=all` costs each system
 
 Dynamo's harness, competitor layout (lanes 5-63, event issuers 0-3, query issuer 4, 64 event and
-128 query lanes), run index at `9f9c7c04` and the competitor in the same binary build, 300 ms and
+128 query lanes), chain index at `9f9c7c04` and the competitor in the same binary build, 300 ms and
 200 ms windows, `numactl --cpunodebind=0 --membind=0` against `--interleave=all` (the published
 method), three fresh processes each, all interleaved inside one lock hold (19:30-19:35, host
 quiet). Per lane core divides the median by the 59 lane cores. Kept up is the protocol's rule
@@ -565,19 +565,19 @@ rows the rule says no to.
 
 | Window (offered) | Memory | System | Achieved per trial (M) | Median (M) | Per lane core (M) | Achieved / offered | Kept up (99% rule) | Harness flag | Lookup p50 / p99 (us) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 300 ms (1,067M) | local | SMG `RunIndex` | 1,063.0, 1,064.2, 1,064.1 | 1,064.1 | 18.0 | 99.6-99.7% | 3 of 3 | 3 of 3 | 1.2 / 3 |
+| 300 ms (1,067M) | local | SMG `ChainIndex` | 1,063.0, 1,064.2, 1,064.1 | 1,064.1 | 18.0 | 99.6-99.7% | 3 of 3 | 3 of 3 | 1.2 / 3 |
 | 300 ms (1,067M) | local | Dynamo CRTC | 991.1, 1,031.2, 1,026.8 | 1,026.8 | 17.4 | 92.9-96.6% | 0 of 3 | 3 of 3 | 2.6 / 9 |
-| 300 ms (1,067M) | interleaved | SMG `RunIndex` | 1,061.7, 1,059.1, 1,062.6 | 1,061.7 | 18.0 | 99.3-99.6% | 3 of 3 | 3 of 3 | 1.3 / 4 |
+| 300 ms (1,067M) | interleaved | SMG `ChainIndex` | 1,061.7, 1,059.1, 1,062.6 | 1,061.7 | 18.0 | 99.3-99.6% | 3 of 3 | 3 of 3 | 1.3 / 4 |
 | 300 ms (1,067M) | interleaved | Dynamo CRTC | 802.5, 860.6, 847.7 | 847.7 | 14.4 | 75.2-80.7% | 0 of 3 | 0 of 3 | 2.9 / 13 |
-| 200 ms (1,601M) | local | SMG `RunIndex` | 1,573.9, 1,552.5, 1,555.7 | 1,555.7 | 26.4 | 97.0-98.3% | 0 of 3 | 3 of 3 | 1.2 / 3 |
+| 200 ms (1,601M) | local | SMG `ChainIndex` | 1,573.9, 1,552.5, 1,555.7 | 1,555.7 | 26.4 | 97.0-98.3% | 0 of 3 | 3 of 3 | 1.2 / 3 |
 | 200 ms (1,601M) | local | Dynamo CRTC | 1,129.5, 1,106.4, 1,149.4 | 1,129.5 | 19.1 | 69.1-71.8% | 0 of 3 | 0 of 3 | 2.1 / 8 |
-| 200 ms (1,601M) | interleaved | SMG `RunIndex` | 1,279.6, 1,301.6, 1,177.6 | 1,279.6 | 21.7 | 73.6-81.3% | 0 of 3 (generator invalid in 2) | 0 of 3 | 1.2 / 4 |
+| 200 ms (1,601M) | interleaved | SMG `ChainIndex` | 1,279.6, 1,301.6, 1,177.6 | 1,279.6 | 21.7 | 73.6-81.3% | 0 of 3 (generator invalid in 2) | 0 of 3 | 1.2 / 4 |
 | 200 ms (1,601M) | interleaved | Dynamo CRTC | 933.2, 898.4, 972.1 | 933.2 | 15.8 | 56.1-60.7% | 0 of 3 (generator invalid in 2) | 0 of 3 | 2.3 / 10 |
 
 Local memory is worth 21% to the competitor at 300 ms (848M to 1,027M, lookup p99 13 to 9 us,
-still short of the 99% bar at 93-97%) and nothing to the run index there, which keeps up either
+still short of the 99% bar at 93-97%) and nothing to the chain index there, which keeps up either
 way at p99 3-4 us (its 1,062-1,064M at 300 ms is the first kept-up point above 1.06B in Dynamo's
-harness, under both memory settings); at 200 ms the run index reaches 97-98% of 1.6B with local
+harness, under both memory settings); at 200 ms the chain index reaches 97-98% of 1.6B with local
 memory (1,556M, 26.4M per lane core, drain 2-6 ms) against 74-81% interleaved, the competitor
 69-72% against 56-61%, and under interleaving the generator itself is invalid in two trials of
 three for both systems at that window. The kept-up points under local memory are bracketed in the
@@ -597,32 +597,32 @@ trials with interleaved same-binary controls, one hold per series, discards at h
 | Indexer, harness | Keeps up at | Per lane core (M) | Fails at | Ratio | Trials at the failing rate (achieved / offered) | Lookup p50 / p99 (us) at the kept-up rate | Points |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Dynamo CRTC, Dynamo harness | 859.7M (372 ms) | 14.6 | 923.9M | 1.075 | 98.9%, 98.4%, 98.6% (1,067M: 93.6-95.4%) | 2.7 / 10 | 4 |
-| SMG `RunIndex`, Dynamo harness | 1,383.8M (231 ms) | 23.5 | 1,509.0M | 1.091 | 97.9%, 99.3%, 99.1% (2,134M: generator invalid in all three) | 1.2-1.3 / 3-4 | 5 |
+| SMG `ChainIndex`, Dynamo harness | 1,383.8M (231 ms) | 23.5 | 1,509.0M | 1.091 | 97.9%, 99.3%, 99.1% (2,134M: generator invalid in all three) | 1.2-1.3 / 3-4 | 5 |
 
 | System, harness | Load | Used / discarded | Kept up | Achieved median [95% CI] (M block ops/s) | Per lane core (M) | Lookup p50 [CI] (us) | Lookup p99 [CI] (us) | Subject minus control: achieved, p50, p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| SMG `RunIndex`, Dynamo harness | sustained bracket (231 ms window, 1,384M offered) | 22 / 3 | 21 of 22 | 1,379.4 [1,378.2, 1,379.8] | 23.4 | 1.3 [1.3, 1.3] | 3 [3, 4] | -0.2 [-1.6, +1.5], +0.0 [+0.0, +0.1], +0.0 [-0.0, +0.1] |
-| control (same binary) (SMG `RunIndex`) | same | 20 / 5 | 20 of 20 | 1,379.6 [1,378.1, 1,380.4] | | 1.2 [1.2, 1.3] | 3 [3, 4] | |
+| SMG `ChainIndex`, Dynamo harness | sustained bracket (231 ms window, 1,384M offered) | 22 / 3 | 21 of 22 | 1,379.4 [1,378.2, 1,379.8] | 23.4 | 1.3 [1.3, 1.3] | 3 [3, 4] | -0.2 [-1.6, +1.5], +0.0 [+0.0, +0.1], +0.0 [-0.0, +0.1] |
+| control (same binary) (SMG `ChainIndex`) | same | 20 / 5 | 20 of 20 | 1,379.6 [1,378.1, 1,380.4] | | 1.2 [1.2, 1.3] | 3 [3, 4] | |
 | Dynamo CRTC, Dynamo harness | sustained bracket (372 ms window, 860M offered) | 20 / 4 | 19 of 20 | 856.7 [856.2, 856.8] | 14.5 | 2.7 [2.7, 2.7] | 10 [10, 10] | +0.3 [-0.4, +1.0], +0.0 [-0.0, +0.0], +0.0 [-0.1, +0.1] |
 | control (same binary) (Dynamo CRTC) | same | 21 / 3 | 19 of 21 | 856.3 [855.8, 856.7] | | 2.7 [2.7, 2.7] | 10 [10, 10] | |
-| SMG `RunIndex`, Dynamo harness | 200 ms window (1.60B offered) | 21 / 0 | 1 of 21 | 1,564.3 [1,536.4, 1,568.1] | 26.5 | 1.2 [1.2, 1.2] | 3 [3, 4] | +15.4 [-16.1, +37.3], -0.0 [-0.0, +0.0], -0.0 [-0.1, +0.1] |
-| control (same binary) (SMG `RunIndex`) | same | 20 / 1 | 0 of 20 | 1,548.9 [1,527.1, 1,566.1] | | 1.2 [1.2, 1.3] | 4 [3, 4] | |
+| SMG `ChainIndex`, Dynamo harness | 200 ms window (1.60B offered) | 21 / 0 | 1 of 21 | 1,564.3 [1,536.4, 1,568.1] | 26.5 | 1.2 [1.2, 1.2] | 3 [3, 4] | +15.4 [-16.1, +37.3], -0.0 [-0.0, +0.0], -0.0 [-0.1, +0.1] |
+| control (same binary) (SMG `ChainIndex`) | same | 20 / 1 | 0 of 20 | 1,548.9 [1,527.1, 1,566.1] | | 1.2 [1.2, 1.3] | 4 [3, 4] | |
 | Dynamo CRTC, Dynamo harness | 200 ms window (1.60B offered) | 20 / 7 | 0 of 20 | 1,120.2 [1,109.0, 1,126.0] | 19.0 | 2.1 [2.1, 2.1] | 8 [8, 8] | -5.0 [-20.2, +10.6], -0.0 [-0.0, +0.0], -0.1 [-0.2, +0.1] |
 | control (same binary) (Dynamo CRTC) | same | 21 / 6 | 0 of 21 | 1,125.2 [1,112.6, 1,134.1] | | 2.1 [2.1, 2.1] | 8 [8, 8] | |
 
-Under local memory on one socket, in one binary and on the same 59 lane cores, the run index's
+Under local memory on one socket, in one binary and on the same 59 lane cores, the chain index's
 kept-up point is 1,383.8M against the competitor's 859.7M (1.61x; 23.5 against 14.6M block ops/s
-per lane core) at lookup p99 3-4 us against 10 us, and at the 200 ms window the run index achieves
+per lane core) at lookup p99 3-4 us against 10 us, and at the 200 ms window the chain index achieves
 1,564M (26.5M per core, p99 3 us, 97.7% of offered) against the competitor's 1,120M (19.0M per
 core, p99 8 us, 70%). Against the published interleaved rows on this layout, local memory moves the
-competitor's kept-up point from 682M to 860M (+26%) and the run index's from 1,062M to 1,384M
+competitor's kept-up point from 682M to 860M (+26%) and the chain index's from 1,062M to 1,384M
 (at least +30%); the ratio between the two systems is 1.56x interleaved and 1.61x local. The
 control pairs stay within one unit in the last digit for the sustained rows and within the
 intervals for the 200 ms rows. Dynamo's published method is `--interleave=all`; on one socket a
 process bound to its socket is the deployment-realistic setting; both are reported and neither
 system was changed for either.
 
-### T7, first window (loaded host): the sharded run index on two sockets
+### T7, first window (loaded host): the sharded chain index on two sockets
 
 Replayer from `ce53d732` (`--shards`, `--lane-memory`), layout agreed with the index's owners: lane
 cores 8-71 and 72-135 (64 + 64), 128 event lanes pinned one per core so `--shards 2` follows the
@@ -710,9 +710,9 @@ index's owners' stealing lanes, since freeing cores does not remove a socket-wid
 ## Plugging in a new index
 
 `ReplayBackend` is four slice-based methods plus a per-lane state type. The run-compressed index
-(`RunIndex`: `intern_worker`, `apply_stored(worker, &[StoredBlock], parent, &mut RunBlockMap)`,
+(`ChainIndex`: `intern_worker`, `apply_stored(worker, &[StoredBlock], parent, &mut ChainBlockMap)`,
 `apply_removed`, `apply_cleared`, `find_matches(&[ContentHash], early_exit)`) maps onto it exactly
-as `Positional` does, with `RunBlockMap` as the per-worker map held in the lane; add a
+as `Positional` does, with `ChainBlockMap` as the per-worker map held in the lane; add a
 `BackendKind` variant and a `run()` arm in `main`.
 
 ## Parity

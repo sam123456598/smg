@@ -7,8 +7,8 @@
 //! the request's chain. It is fed by the same engine events (stored / removed / cleared, keyed by
 //! the engine's block hashes) and keeps the same per-worker block map the gateway's event monitor
 //! owns, so it drops into the same call sites. Its results are checked against
-//! [`ReferenceIndexer`](crate::ReferenceIndexer) by `tests/exactness_run.rs` (including evictions
-//! that leave holes in a chain) and under concurrent lanes by `tests/concurrency_run.rs`.
+//! [`ReferenceIndexer`](crate::ReferenceIndexer) by `tests/exactness_chain.rs` (including evictions
+//! that leave holes in a chain) and under concurrent lanes by `tests/concurrency_chain.rs`.
 //!
 //! Shape:
 //! - A **run** is a maximal stretch of consecutive positions on one chain whose set of holding
@@ -119,7 +119,7 @@ pub struct BlockRef {
     pub offset: u32,
 }
 
-pub use crate::lane_map::RunBlockMap;
+pub use crate::lane_map::ChainBlockMap;
 
 /// Hash array capacity class: `8, 16, .., 128` in steps of 8, then four classes per octave
 /// (`160, 192, 224, 256, 320, ..`), so an array wastes at most a quarter of its words to the
@@ -212,7 +212,7 @@ impl WordArena {
             let end = start + count;
             assert!(
                 end <= WORD_DIR * WORD_CHUNK,
-                "run index arena exhausted: more than 2^32 hash words"
+                "chain index arena exhausted: more than 2^32 hash words"
             );
             if self
                 .next
@@ -992,7 +992,7 @@ impl RunSlab {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         assert!(
             (id as usize) < RUN_DIR * RUN_CHUNK,
-            "run index slab exhausted: more than 2^26 runs"
+            "chain index slab exhausted: more than 2^26 runs"
         );
         let run = self.run(id);
         run.start.store(start as u32, Ordering::Relaxed);
@@ -1071,7 +1071,7 @@ fn workers(coverage: &[AtomicU64]) -> Vec<u32> {
 
 /// Memory and shape counters, for the scoreboard.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct RunIndexStats {
+pub struct ChainIndexStats {
     /// Run headers ever created (resident).
     pub runs_allocated: usize,
     /// Dead headers waiting for reuse.
@@ -1215,7 +1215,7 @@ struct WorkerRegistry {
 }
 
 /// The run-compressed index. Worker ids are interned `u32`s, as in the positional indexer.
-pub struct RunIndex {
+pub struct ChainIndex {
     slab: RunSlab,
     arena: WordArena,
     words: usize,
@@ -1242,7 +1242,7 @@ pub struct RunIndex {
     counters: LaneCounters,
 }
 
-impl Default for RunIndex {
+impl Default for ChainIndex {
     fn default() -> Self {
         Self::new()
     }
@@ -1289,7 +1289,7 @@ enum Claim {
     Changed,
 }
 
-/// What [`RunIndex::store_in_run`] found.
+/// What [`ChainIndex::store_in_run`] found.
 enum InRun<'b> {
     /// Every block is placed.
     Done,
@@ -1328,7 +1328,7 @@ struct Removal {
     offsets: Vec<u32>,
 }
 
-impl RunIndex {
+impl ChainIndex {
     /// An index for up to 256 workers.
     pub fn new() -> Self {
         Self::with_max_workers(256)
@@ -1624,7 +1624,7 @@ impl RunIndex {
     }
 
     /// Whether `worker`'s lane map holds the block with engine hash `key`.
-    pub fn is_held(&self, map: &RunBlockMap, key: SequenceHash) -> bool {
+    pub fn is_held(&self, map: &ChainBlockMap, key: SequenceHash) -> bool {
         let _ = self;
         map.contains_key(key)
     }
@@ -2030,7 +2030,7 @@ impl RunIndex {
         worker: u32,
         blocks: &[StoredBlock],
         parent: Option<SequenceHash>,
-        map: &mut RunBlockMap,
+        map: &mut ChainBlockMap,
     ) -> Result<(), ApplyError> {
         if blocks.is_empty() {
             return Ok(());
@@ -2071,7 +2071,7 @@ impl RunIndex {
         worker: u32,
         blocks: &[StoredBlock],
         origin: Option<(SequenceHash, BlockRef)>,
-        map: &mut RunBlockMap,
+        map: &mut ChainBlockMap,
     ) -> Walk {
         let mut pending: Vec<Placed> = Vec::new();
         let walk = tick();
@@ -2136,7 +2136,7 @@ impl RunIndex {
         worker: u32,
         blocks: &[StoredBlock],
         origin: Option<(SequenceHash, BlockRef)>,
-        map: &mut RunBlockMap,
+        map: &mut ChainBlockMap,
         pending: &mut Vec<Placed>,
     ) -> Walk {
         let resolving = tick();
@@ -2622,7 +2622,7 @@ impl RunIndex {
     }
 
     /// Forget the named blocks of `worker`; unknown hashes are ignored.
-    pub fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], map: &mut RunBlockMap) {
+    pub fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], map: &mut ChainBlockMap) {
         #[cfg(feature = "lane-stats")]
         {
             self.counters.removes.fetch_add(1, Ordering::Relaxed);
@@ -2726,19 +2726,19 @@ impl RunIndex {
     }
 
     /// Forget every block of `worker` (the engine cleared its cache); the map is emptied.
-    pub fn apply_cleared(&self, worker: u32, map: &mut RunBlockMap) {
+    pub fn apply_cleared(&self, worker: u32, map: &mut ChainBlockMap) {
         let drained = std::mem::take(map);
         self.drop_worker(worker, drained);
     }
 
     /// Forget every block of `worker` (the worker left) and free its slot; the same name interns
     /// afresh afterwards.
-    pub fn remove_worker(&self, worker: u32, map: RunBlockMap) {
+    pub fn remove_worker(&self, worker: u32, map: ChainBlockMap) {
         self.drop_worker(worker, map);
         self.release_worker(worker);
     }
 
-    fn drop_worker(&self, worker: u32, map: RunBlockMap) {
+    fn drop_worker(&self, worker: u32, map: ChainBlockMap) {
         // Keyed by (run, generation): a forwarding record to a dead generation of an id must not
         // shadow the live run that reused the id.
         let mut seen: FxHashSet<(u32, Option<u32>)> = FxHashSet::default();
@@ -3059,9 +3059,9 @@ impl RunIndex {
     }
 
     /// Shape and memory counters.
-    pub fn stats(&self) -> RunIndexStats {
+    pub fn stats(&self) -> ChainIndexStats {
         let allocated = self.slab.allocated();
-        let mut stats = RunIndexStats {
+        let mut stats = ChainIndexStats {
             runs_allocated: allocated,
             runs_free: self.slab.free.len(),
             arena_bytes: self.arena.used() as usize * size_of::<AtomicU64>(),
@@ -3076,7 +3076,7 @@ impl RunIndex {
             splits_by_hole: self.splits_hole.load(Ordering::Relaxed),
             splits_by_mid_run_store: self.splits_mid_run.load(Ordering::Relaxed),
             runs_died: self.runs_died.load(Ordering::Relaxed),
-            ..RunIndexStats::default()
+            ..ChainIndexStats::default()
         };
         for id in 1..allocated as u32 {
             let run = self.slab.run(id);
@@ -3188,7 +3188,7 @@ mod tests {
             .collect()
     }
 
-    fn scores(index: &RunIndex, query: &[ContentHash]) -> Vec<(u32, u32)> {
+    fn scores(index: &ChainIndex, query: &[ContentHash]) -> Vec<(u32, u32)> {
         let mut v: Vec<(u32, u32)> = index
             .find_matches(query, false)
             .scores
@@ -3212,9 +3212,9 @@ mod tests {
 
     #[test]
     fn store_lookup_and_divergence() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
         index
             .apply_stored(w, &blocks_of(&held), None, &mut map)
@@ -3234,10 +3234,10 @@ mod tests {
 
     #[test]
     fn two_workers_share_a_prefix_and_split_at_the_fork() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let a = index.intern_worker("a").expect("id");
         let b = index.intern_worker("b").expect("id");
-        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
         let base: Vec<ContentHash> = (0..6).map(|p| content(1, p)).collect();
         let mut fork = base[..3].to_vec();
         fork.extend((0..4).map(|p| content(2, p)));
@@ -3266,9 +3266,9 @@ mod tests {
 
     #[test]
     fn a_worker_holds_both_sides_of_its_own_divergence() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let base: Vec<ContentHash> = (0..6).map(|p| content(1, p)).collect();
         let mut fork = base[..3].to_vec();
         fork.extend((0..2).map(|p| content(2, p)));
@@ -3287,9 +3287,9 @@ mod tests {
 
     #[test]
     fn a_hole_stops_the_match_at_the_hole() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let held: Vec<ContentHash> = (0..8).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index
@@ -3310,10 +3310,10 @@ mod tests {
 
     #[test]
     fn a_hole_in_a_shared_run_affects_only_the_evicting_worker() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let v = index.intern_worker("v").expect("id");
         let w = index.intern_worker("w").expect("id");
-        let (mut mv, mut mw) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut mv, mut mw) = (ChainBlockMap::default(), ChainBlockMap::default());
         let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index.apply_stored(v, &blocks, None, &mut mv).expect("v");
@@ -3335,9 +3335,9 @@ mod tests {
 
     #[test]
     fn tail_removal_truncates_and_a_clear_empties() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let held: Vec<ContentHash> = (0..8).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index
@@ -3366,9 +3366,9 @@ mod tests {
 
     #[test]
     fn dead_runs_and_arrays_are_reused() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         for round in 0..200u64 {
             let held: Vec<ContentHash> = (0..12).map(|p| content(10 + round, p)).collect();
             let blocks = blocks_of(&held);
@@ -3394,10 +3394,10 @@ mod tests {
 
     #[test]
     fn appends_reuse_the_array_until_another_worker_joins() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
         let v = index.intern_worker("v").expect("id");
-        let (mut mw, mut mv) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut mw, mut mv) = (ChainBlockMap::default(), ChainBlockMap::default());
         let held: Vec<ContentHash> = (0..40).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index
@@ -3442,9 +3442,9 @@ mod tests {
 
     #[test]
     fn many_children_grow_the_table_and_stay_findable() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let prompt: Vec<ContentHash> = (0..3).map(|p| content(1, p)).collect();
         index
             .apply_stored(w, &blocks_of(&prompt), None, &mut map)
@@ -3493,10 +3493,10 @@ mod tests {
 
     #[test]
     fn tail_evictions_and_regrowth_do_not_split() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
         let v = index.intern_worker("v").expect("id");
-        let (mut mw, mut mv) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut mw, mut mv) = (ChainBlockMap::default(), ChainBlockMap::default());
         let held: Vec<ContentHash> = (0..40).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index.apply_stored(w, &blocks, None, &mut mw).expect("w");
@@ -3539,10 +3539,10 @@ mod tests {
 
     #[test]
     fn a_staircase_of_prefix_holders_is_one_run() {
-        let index = RunIndex::with_max_workers(128);
+        let index = ChainIndex::with_max_workers(128);
         let held: Vec<ContentHash> = (0..64).map(|p| content(3, p)).collect();
         let blocks = blocks_of(&held);
-        let mut maps: Vec<RunBlockMap> = (0..64).map(|_| RunBlockMap::default()).collect();
+        let mut maps: Vec<ChainBlockMap> = (0..64).map(|_| ChainBlockMap::default()).collect();
         let mut reference = ReferenceIndexer::new();
         for step in 0..64usize {
             assert_eq!(index.intern_worker(&format!("w{step}")), Ok(step as u32));
@@ -3612,9 +3612,9 @@ mod tests {
             }
         }
         // A whole walk over an index keeps working after the headers it reads are rewritten.
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let held: Vec<ContentHash> = (0..12).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index
@@ -3631,10 +3631,10 @@ mod tests {
     /// scores nothing, and a worker interned later into the freed id inherits nothing.
     #[test]
     fn a_hash_stored_again_at_another_position_releases_its_old_place() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let mut reference = ReferenceIndexer::new();
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let chain: Vec<ContentHash> = (0..6).map(|p| content(23, p)).collect();
         let blocks = blocks_of(&chain);
         index
@@ -3680,10 +3680,10 @@ mod tests {
     /// is released.
     #[test]
     fn a_re_store_across_a_split_moves_nothing() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let a = index.intern_worker("a").expect("id");
         let b = index.intern_worker("b").expect("id");
-        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
         let chain: Vec<ContentHash> = (0..30).map(|p| content(24, p)).collect();
         let blocks = blocks_of(&chain);
         index.apply_stored(a, &blocks, None, &mut ma).expect("a");
@@ -3714,11 +3714,11 @@ mod tests {
     /// is removed, cleared or taken with its worker.
     #[test]
     fn emptiness_follows_the_blocks() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         assert!(index.is_empty());
         let a = index.intern_worker("a").expect("id");
         let b = index.intern_worker("b").expect("id");
-        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
         let chain: Vec<ContentHash> = (0..12).map(|p| content(21, p)).collect();
         let blocks = blocks_of(&chain);
         index.apply_stored(a, &blocks, None, &mut ma).expect("a");
@@ -3744,9 +3744,9 @@ mod tests {
     /// both arrays) never runs past the twin into the words behind it.
     #[test]
     fn the_engine_twin_is_as_large_as_a_recycled_content_array() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut mw = RunBlockMap::default();
+        let mut mw = ChainBlockMap::default();
         // One freed array two classes above what 140 blocks ask for: the content array takes
         // it, the twin must not come out smaller.
         let big = index.arena.alloc_array(&[0; 200], 200);
@@ -3798,7 +3798,7 @@ mod tests {
     /// reference agrees on every block and no counter moves.
     #[test]
     fn stores_match_a_run_by_its_engine_chain() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let mut reference = ReferenceIndexer::new();
         let chain: Vec<ContentHash> = (0..100).map(|p| content(5, p)).collect();
         let mut forked = chain[..57].to_vec();
@@ -3816,7 +3816,7 @@ mod tests {
             ("early", &early_fork),
         ] {
             let worker = index.intern_worker(name).expect("id");
-            let mut map = RunBlockMap::default();
+            let mut map = ChainBlockMap::default();
             index
                 .apply_stored(worker, &blocks_of(contents), None, &mut map)
                 .expect("store");
@@ -3861,10 +3861,10 @@ mod tests {
     /// after its own parent hash and removals by its hashes all stay exact.
     #[test]
     fn a_worker_with_other_engine_hashes_matches_by_content() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let a = index.intern_worker("a").expect("id");
         let b = index.intern_worker("b").expect("id");
-        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
         let chain: Vec<ContentHash> = (0..50).map(|p| content(8, p)).collect();
         let blocks = blocks_of(&chain);
         let other: Vec<StoredBlock> = blocks
@@ -3903,10 +3903,10 @@ mod tests {
     /// and placed by its content: the match ends where the content does.
     #[test]
     fn other_content_under_known_engine_hashes_is_counted_and_placed_by_content() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let a = index.intern_worker("a").expect("id");
         let b = index.intern_worker("b").expect("id");
-        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
         let chain: Vec<ContentHash> = (0..20).map(|p| content(9, p)).collect();
         let blocks = blocks_of(&chain);
         let mut other = chain[..10].to_vec();
@@ -3939,10 +3939,10 @@ mod tests {
     /// end. Replayed deterministically: plan (take the version), split, then try the insert.
     #[test]
     fn a_child_insert_planned_before_a_split_gives_up() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
         let v = index.intern_worker("v").expect("id");
-        let (mut mw, mut mv) = (RunBlockMap::default(), RunBlockMap::default());
+        let (mut mw, mut mv) = (ChainBlockMap::default(), ChainBlockMap::default());
         let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index.apply_stored(w, &blocks, None, &mut mw).expect("w");
@@ -4006,7 +4006,7 @@ mod tests {
     /// or the two deadlock (this test hung within seconds before the order was fixed).
     #[test]
     fn worker_slots_churn_from_many_threads_without_deadlock() {
-        let index = RunIndex::with_max_workers(64);
+        let index = ChainIndex::with_max_workers(64);
         std::thread::scope(|scope| {
             for thread in 0..8u32 {
                 let index = &index;
@@ -4014,7 +4014,7 @@ mod tests {
                     for round in 0..2_000u32 {
                         let name = format!("t{thread}-r{}", round % 5);
                         let id = index.intern_worker(&name).expect("slot");
-                        let mut map = RunBlockMap::default();
+                        let mut map = ChainBlockMap::default();
                         let held: Vec<ContentHash> =
                             (0..3).map(|p| content(u64::from(id) + 1, p)).collect();
                         index
@@ -4034,9 +4034,9 @@ mod tests {
 
     #[test]
     fn parent_errors_match_the_positional_indexer() {
-        let index = RunIndex::with_max_workers(8);
+        let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let held: Vec<ContentHash> = (0..3).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         assert!(matches!(
@@ -4054,12 +4054,12 @@ mod tests {
 
     #[test]
     fn worker_slots_are_bounded_and_reused_after_removal() {
-        let index = RunIndex::with_max_workers(2);
+        let index = ChainIndex::with_max_workers(2);
         assert_eq!(index.intern_worker("a"), Ok(0));
         assert_eq!(index.intern_worker("b"), Ok(1));
         assert_eq!(index.intern_worker("a"), Ok(0));
         assert_eq!(index.intern_worker("c"), Err(WorkerIdExhausted));
-        let mut map = RunBlockMap::default();
+        let mut map = ChainBlockMap::default();
         let held: Vec<ContentHash> = (0..4).map(|p| content(1, p)).collect();
         index
             .apply_stored(0, &blocks_of(&held), None, &mut map)

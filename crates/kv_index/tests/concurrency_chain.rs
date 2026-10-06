@@ -1,4 +1,4 @@
-//! Concurrency harness for `RunIndex`: many event lanes writing shared chains at once while
+//! Concurrency harness for `ChainIndex`: many event lanes writing shared chains at once while
 //! readers look them up, then the end state against the `ReferenceIndexer`.
 //!
 //! Lanes own one worker each and replay random stores, extensions, tail and middle evictions,
@@ -22,8 +22,8 @@ use std::{
 };
 
 use kv_index::{
-    request_prefix_hashes, ContentHash, ReferenceIndexer, RunBlockMap, SequenceHash,
-    ShardedRunIndex, StoredBlock,
+    request_prefix_hashes, ChainBlockMap, ContentHash, ReferenceIndexer, SequenceHash,
+    ShardedChainIndex, StoredBlock,
 };
 
 struct Rng(u64);
@@ -111,13 +111,13 @@ struct Logged {
 }
 
 struct Lane<'a> {
-    index: &'a ShardedRunIndex,
+    index: &'a ShardedChainIndex,
     pool: &'a [Vec<ContentHash>],
     clock: &'a AtomicU64,
     worker: u32,
     name_counter: u64,
     lane: usize,
-    map: RunBlockMap,
+    map: ChainBlockMap,
     rng: Rng,
     log: Vec<Logged>,
     steps: u32,
@@ -238,7 +238,11 @@ impl Lane<'_> {
     }
 }
 
-fn scores(index: &ShardedRunIndex, query: &[ContentHash], early_exit: bool) -> BTreeMap<u32, u32> {
+fn scores(
+    index: &ShardedChainIndex,
+    query: &[ContentHash],
+    early_exit: bool,
+) -> BTreeMap<u32, u32> {
     index
         .find_matches(query, early_exit)
         .scores
@@ -285,7 +289,7 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
         .unwrap_or(1usize);
     // Lanes intern their workers round robin over the shards, so with two shards every
     // other lane writes the other index and every lookup merges both.
-    let index = ShardedRunIndex::new(shards, 64);
+    let index = ShardedChainIndex::new(shards, 64);
     let clock = AtomicU64::new(0);
     let stop = Arc::new(AtomicBool::new(false));
     let logs: Mutex<Vec<Logged>> = Mutex::new(Vec::new());
@@ -343,7 +347,7 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
                     worker,
                     name_counter: 0,
                     lane,
-                    map: RunBlockMap::default(),
+                    map: ChainBlockMap::default(),
                     rng: Rng::new(seed),
                     log: Vec::new(),
                     steps: 0,
@@ -473,7 +477,7 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
             .iter()
             .map(|(worker, position, content, prefix)| {
                 (
-                    ShardedRunIndex::shard_of(*worker),
+                    ShardedChainIndex::shard_of(*worker),
                     *position,
                     *content,
                     *prefix,

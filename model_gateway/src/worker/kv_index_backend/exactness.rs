@@ -1,5 +1,5 @@
 //! Exactness of the gateway's index backends (`docs/kv-router-leap.md`,
-//! guardrails 1 to 3): the positional indexer and the run index, fed through
+//! guardrails 1 to 3): the positional indexer and the chain index, fed through
 //! the monitor's own apply path, must answer every lookup exactly as the
 //! reference indexer does, after every batch, and hold exactly the same blocks.
 //!
@@ -116,7 +116,7 @@ impl Trio {
             backends: vec![
                 Backend::new(KvIndex::reference()),
                 Backend::new(KvIndex::positional(64)),
-                Backend::new(KvIndex::run()),
+                Backend::new(KvIndex::chain()),
             ],
             lookups: 0,
         }
@@ -904,15 +904,15 @@ fn a_hash_stored_again_at_its_true_position_after_a_fallback() {
 }
 
 // ---------------------------------------------------------------------------
-// Guardrails 2 and 3 on the run index
+// Guardrails 2 and 3 on the chain index
 // ---------------------------------------------------------------------------
 
-/// Lookups leave the run index as they found it: the same runs, arena words
+/// Lookups leave the chain index as they found it: the same runs, arena words
 /// and blocks before and after a burst of queries (the store-free property of
 /// the read path is established in `kv_index`; this checks the gateway's use
 /// of it adds nothing).
 #[test]
-fn run_index_lookups_change_nothing() {
+fn chain_index_lookups_change_nothing() {
     let mut trio = Trio::new();
     let mut corpus = Corpus::new(11, 4);
     for worker in corpus.workers.clone() {
@@ -921,38 +921,42 @@ fn run_index_lookups_change_nothing() {
     for _ in 0..200 {
         corpus.step(&mut trio);
     }
-    let run = trio
+    let chain = trio
         .backends
         .iter()
-        .find(|backend| backend.index.name() == "run")
-        .expect("run backend");
-    let before = run.index.run_stats().expect("run stats");
-    let blocks = run.blocks();
+        .find(|backend| backend.index.name() == "chain")
+        .expect("chain backend");
+    let before = chain.index.chain_stats().expect("run stats");
+    let blocks = chain.blocks();
     let queries = query_set(&corpus.chains);
     for _ in 0..20 {
         for query in &queries {
-            let _ = run.index.find_matches(query, false);
-            let _ = run.index.find_matches(query, true);
+            let _ = chain.index.find_matches(query, false);
+            let _ = chain.index.find_matches(query, true);
         }
     }
-    let after = run.index.run_stats().expect("run stats");
+    let after = chain.index.chain_stats().expect("run stats");
     assert_eq!(
         format!("{after:?}"),
         format!("{before:?}"),
         "lookups changed the index's counters"
     );
-    assert_eq!(run.blocks(), blocks, "lookups changed the index's content");
+    assert_eq!(
+        chain.blocks(),
+        blocks,
+        "lookups changed the index's content"
+    );
 }
 
-/// A clear and a worker removal give the run index's memory back: nothing
+/// A clear and a worker removal give the chain index's memory back: nothing
 /// stays live, every arena word is back in a free list, and the same corpus
 /// stored again after the release is served from what was freed, so neither
 /// the run slab nor the arena grows across fill-release cycles (guardrail 3:
 /// bounded, recycled).
 #[test]
-fn run_index_releases_state_on_clear_and_worker_removal() {
+fn chain_index_releases_state_on_clear_and_worker_removal() {
     let mut trio = Trio {
-        backends: vec![Backend::new(KvIndex::run())],
+        backends: vec![Backend::new(KvIndex::chain())],
         lookups: 0,
     };
     let mut first_fill: Option<(usize, usize)> = None;
@@ -964,12 +968,12 @@ fn run_index_releases_state_on_clear_and_worker_removal() {
         for _ in 0..300 {
             corpus.step(&mut trio);
         }
-        let run = &mut trio.backends[0];
+        let chain = &mut trio.backends[0];
         assert!(
-            run.index.current_size() > 0,
+            chain.index.current_size() > 0,
             "cycle {cycle}: nothing indexed"
         );
-        let filled = run.index.run_stats().expect("stats");
+        let filled = chain.index.chain_stats().expect("stats");
         match first_fill {
             None => first_fill = Some((filled.runs_allocated, filled.arena_bytes)),
             // The root's child table may be rebuilt once more; nothing else may grow.
@@ -979,30 +983,38 @@ fn run_index_releases_state_on_clear_and_worker_removal() {
             ),
         }
         // Half the workers clear and leave, the rest just leave.
-        let names: Vec<String> = run.workers.keys().cloned().collect();
+        let names: Vec<String> = chain.workers.keys().cloned().collect();
         for (n, name) in names.iter().enumerate() {
-            let (id, mut state) = run.workers.remove(name).expect("state");
+            let (id, mut state) = chain.workers.remove(name).expect("state");
             if n % 2 == 0 {
-                run.index.apply_cleared(id, &mut state.blocks);
+                chain.index.apply_cleared(id, &mut state.blocks);
                 assert!(
                     state.blocks.is_empty(),
                     "cycle {cycle}: {name} cleared state"
                 );
-                assert_eq!(run.index.worker_block_count(id), 0, "cycle {cycle}: {name}");
+                assert_eq!(
+                    chain.index.worker_block_count(id),
+                    0,
+                    "cycle {cycle}: {name}"
+                );
             }
-            run.index.remove_worker(id, state.blocks);
-            assert_eq!(run.index.worker_block_count(id), 0, "cycle {cycle}: {name}");
+            chain.index.remove_worker(id, state.blocks);
+            assert_eq!(
+                chain.index.worker_block_count(id),
+                0,
+                "cycle {cycle}: {name}"
+            );
         }
-        let stats = run.index.run_stats().expect("stats");
+        let stats = chain.index.chain_stats().expect("stats");
         assert_eq!(stats.runs_live, 0, "cycle {cycle}: live runs after release");
         assert_eq!(
             stats.blocks_live, 0,
             "cycle {cycle}: live blocks after release"
         );
-        assert_eq!(run.index.current_size(), 0, "cycle {cycle}");
-        assert_eq!(run.index.entry_count(), 0, "cycle {cycle}");
-        assert!(run.index.is_empty(), "cycle {cycle}");
-        assert!(run.index.debug_blocks().is_empty(), "cycle {cycle}");
+        assert_eq!(chain.index.current_size(), 0, "cycle {cycle}");
+        assert_eq!(chain.index.entry_count(), 0, "cycle {cycle}");
+        assert!(chain.index.is_empty(), "cycle {cycle}");
+        assert!(chain.index.debug_blocks().is_empty(), "cycle {cycle}");
         // Everything but the root's own child table is back in a free list.
         assert!(
             stats.arena_free_bytes + 16 * 1024 >= stats.arena_bytes,

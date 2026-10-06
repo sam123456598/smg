@@ -29,7 +29,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 use kv_index::{
     churn::{Churn, ChurnConfig, FreeOrder, StepReport},
-    ReferenceIndexer, ShardedRunIndex,
+    ReferenceIndexer, ShardedChainIndex,
 };
 use serde_json::json;
 
@@ -43,7 +43,7 @@ enum FreeOrderArg {
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Block-LRU churn on shared chains against the run index, with the fragmentation series"
+    about = "Block-LRU churn on shared chains against the chain index, with the fragmentation series"
 )]
 struct Args {
     #[arg(long, default_value = "128")]
@@ -149,7 +149,7 @@ fn main() -> anyhow::Result<()> {
         refill_requests: args.refill_requests,
         seed: args.seed,
     };
-    let index = ShardedRunIndex::new(args.shards.max(1), args.max_workers);
+    let index = ShardedChainIndex::new(args.shards.max(1), args.max_workers);
     let mut reference = ReferenceIndexer::new();
     let mut churn = Churn::new(cfg.clone(), &index);
     let divergence_points = churn.pool.divergence_points();

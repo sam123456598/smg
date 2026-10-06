@@ -1,4 +1,4 @@
-//! The run index split into shards: each shard is a complete [`RunIndex`] holding the workers
+//! The chain index split into shards: each shard is a complete [`ChainIndex`] holding the workers
 //! assigned to it, a lookup walks every shard and unions the scores.
 //!
 //! Why: with lanes on both sockets of a host, a single index has every run's version, length,
@@ -12,11 +12,11 @@
 //! the caller's affinity, the worker sets of the shards are disjoint, so the union of their
 //! scores is the single index's answer. A caller with no control over which thread applies
 //! which worker (the gateway's runtime workers on both sockets) is exact and merely pays the
-//! sharing it did not avoid. `shards = 1` is the run index itself behind one indirection:
+//! sharing it did not avoid. `shards = 1` is the chain index itself behind one indirection:
 //! the same ids, the same lookups, the same memory.
 //!
 //! Worker ids carry the shard: `shard << SHARD_SHIFT | local id`, so an id names its shard
-//! without a table, and with one shard the ids are the run index's own. Content held by workers
+//! without a table, and with one shard the ids are the chain index's own. Content held by workers
 //! on two shards is stored once per shard (hash arrays and run headers; the lane maps are per
 //! worker either way), which is the price of the split; `entry_count` counts it once per shard.
 
@@ -26,28 +26,28 @@ use std::{
 };
 
 use crate::{
+    chain_index::{ChainIndex, ChainIndexStats, LaneStats},
     event_tree::{
         ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock, WorkerIdExhausted,
     },
-    lane_map::RunBlockMap,
-    run_index::{LaneStats, RunIndex, RunIndexStats},
+    lane_map::ChainBlockMap,
 };
 
 /// Bits of a worker id below the shard number; a shard holds at most `1 << SHARD_SHIFT` worker
-/// slots (the run index allows 1,024).
+/// slots (the chain index allows 1,024).
 pub const SHARD_SHIFT: u32 = 16;
 
 const LOCAL_MASK: u32 = (1 << SHARD_SHIFT) - 1;
 
-/// A run index per shard; see the module documentation.
-pub struct ShardedRunIndex {
-    shards: Box<[RunIndex]>,
+/// A chain index per shard; see the module documentation.
+pub struct ShardedChainIndex {
+    shards: Box<[ChainIndex]>,
     /// Where the next worker interned without a shard goes (round robin).
     next_shard: AtomicUsize,
 }
 
-impl ShardedRunIndex {
-    /// `shards` run indexes (at least one) with `max_workers` worker slots each.
+impl ShardedChainIndex {
+    /// `shards` chain indexes (at least one) with `max_workers` worker slots each.
     pub fn new(shards: usize, max_workers: usize) -> Self {
         let shards = shards.max(1);
         assert!(
@@ -57,17 +57,17 @@ impl ShardedRunIndex {
         );
         Self {
             shards: (0..shards)
-                .map(|_| RunIndex::with_max_workers(max_workers))
+                .map(|_| ChainIndex::with_max_workers(max_workers))
                 .collect(),
             next_shard: AtomicUsize::new(0),
         }
     }
 
-    /// `shards` run indexes with the run index's default worker slots.
+    /// `shards` chain indexes with the chain index's default worker slots.
     pub fn with_shards(shards: usize) -> Self {
         let shards = shards.max(1);
         Self {
-            shards: (0..shards).map(|_| RunIndex::new()).collect(),
+            shards: (0..shards).map(|_| ChainIndex::new()).collect(),
             next_shard: AtomicUsize::new(0),
         }
     }
@@ -77,7 +77,7 @@ impl ShardedRunIndex {
     }
 
     /// One shard's index, for per-shard figures.
-    pub fn shard(&self, shard: usize) -> &RunIndex {
+    pub fn shard(&self, shard: usize) -> &ChainIndex {
         &self.shards[shard]
     }
 
@@ -99,7 +99,7 @@ impl ShardedRunIndex {
     }
 
     #[inline]
-    fn index_of(&self, worker: u32) -> &RunIndex {
+    fn index_of(&self, worker: u32) -> &ChainIndex {
         &self.shards[Self::shard_of(worker)]
     }
 
@@ -147,32 +147,32 @@ impl ShardedRunIndex {
         worker: u32,
         blocks: &[StoredBlock],
         parent: Option<SequenceHash>,
-        map: &mut RunBlockMap,
+        map: &mut ChainBlockMap,
     ) -> Result<(), ApplyError> {
         self.index_of(worker)
             .apply_stored(Self::local_id(worker), blocks, parent, map)
     }
 
     /// Forget the named blocks of `worker`; unknown hashes are ignored.
-    pub fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], map: &mut RunBlockMap) {
+    pub fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], map: &mut ChainBlockMap) {
         self.index_of(worker)
             .apply_removed(Self::local_id(worker), hashes, map);
     }
 
     /// Forget every block of `worker` (the engine cleared its cache); the map is emptied.
-    pub fn apply_cleared(&self, worker: u32, map: &mut RunBlockMap) {
+    pub fn apply_cleared(&self, worker: u32, map: &mut ChainBlockMap) {
         self.index_of(worker)
             .apply_cleared(Self::local_id(worker), map);
     }
 
     /// Forget every block of `worker` (the worker left) and free its slot in its shard.
-    pub fn remove_worker(&self, worker: u32, map: RunBlockMap) {
+    pub fn remove_worker(&self, worker: u32, map: ChainBlockMap) {
         self.index_of(worker)
             .remove_worker(Self::local_id(worker), map);
     }
 
     /// Whether `worker`'s lane map holds the block with engine hash `key`.
-    pub fn is_held(&self, worker: u32, map: &RunBlockMap, key: SequenceHash) -> bool {
+    pub fn is_held(&self, worker: u32, map: &ChainBlockMap, key: SequenceHash) -> bool {
         self.index_of(worker).is_held(map, key)
     }
 
@@ -184,18 +184,18 @@ impl ShardedRunIndex {
 
     /// Whether no worker of any shard holds a block (O(shards), each under its root's version).
     pub fn is_empty(&self) -> bool {
-        self.shards.iter().all(RunIndex::is_empty)
+        self.shards.iter().all(ChainIndex::is_empty)
     }
 
     /// Blocks held across all workers (a block two workers hold counts twice).
     pub fn current_size(&self) -> usize {
-        self.shards.iter().map(RunIndex::current_size).sum()
+        self.shards.iter().map(ChainIndex::current_size).sum()
     }
 
     /// Distinct blocks held, per shard and summed: content held on two shards counts twice,
     /// which is exactly the memory the split costs.
     pub fn entry_count(&self) -> usize {
-        self.shards.iter().map(RunIndex::entry_count).sum()
+        self.shards.iter().map(ChainIndex::entry_count).sum()
     }
 
     /// Score every worker by how many leading blocks of the request it holds; the union over
@@ -282,28 +282,28 @@ impl ShardedRunIndex {
     }
 
     /// Mergeable adjacent pairs and the blocks their children hold, summed over the shards (see
-    /// [`RunIndex::debug_mergeable`]).
+    /// [`ChainIndex::debug_mergeable`]).
     #[doc(hidden)]
     pub fn debug_mergeable(&self) -> (usize, usize) {
         self.shards
             .iter()
-            .map(RunIndex::debug_mergeable)
+            .map(ChainIndex::debug_mergeable)
             .fold((0, 0), |(p, b), (q, c)| (p + q, b + c))
     }
 
-    /// As [`RunIndex::debug_mergeable_by_rule`], summed over the shards.
+    /// As [`ChainIndex::debug_mergeable_by_rule`], summed over the shards.
     #[doc(hidden)]
     pub fn debug_mergeable_by_rule(&self) -> (usize, usize, usize) {
         self.shards
             .iter()
-            .map(RunIndex::debug_mergeable_by_rule)
+            .map(ChainIndex::debug_mergeable_by_rule)
             .fold((0, 0, 0), |(s, g, b), (x, y, z)| (s + x, g + y, b + z))
     }
 
     /// Shape and memory counters summed over the shards.
-    pub fn stats(&self) -> RunIndexStats {
-        let mut total = RunIndexStats::default();
-        for stats in self.shards.iter().map(RunIndex::stats) {
+    pub fn stats(&self) -> ChainIndexStats {
+        let mut total = ChainIndexStats::default();
+        for stats in self.shards.iter().map(ChainIndex::stats) {
             total.runs_allocated += stats.runs_allocated;
             total.runs_free += stats.runs_free;
             total.runs_live += stats.runs_live;
@@ -325,14 +325,14 @@ impl ShardedRunIndex {
     }
 
     /// Shape and memory counters of each shard.
-    pub fn shard_stats(&self) -> Vec<RunIndexStats> {
-        self.shards.iter().map(RunIndex::stats).collect()
+    pub fn shard_stats(&self) -> Vec<ChainIndexStats> {
+        self.shards.iter().map(ChainIndex::stats).collect()
     }
 
     /// Lane-side counters summed over the shards (zero without the `lane-stats` feature).
     pub fn lane_stats(&self) -> LaneStats {
         let mut total = LaneStats::default();
-        for stats in self.shards.iter().map(RunIndex::lane_stats) {
+        for stats in self.shards.iter().map(ChainIndex::lane_stats) {
             for i in 0..3 {
                 total.locks[i] += stats.locks[i];
                 total.contended[i] += stats.contended[i];
@@ -371,7 +371,7 @@ impl ShardedRunIndex {
     }
 }
 
-impl Default for ShardedRunIndex {
+impl Default for ShardedChainIndex {
     fn default() -> Self {
         Self::with_shards(1)
     }
@@ -403,12 +403,12 @@ mod tests {
         v
     }
 
-    /// One shard is the run index: the same ids, scores, blocks and counters for the same
+    /// One shard is the chain index: the same ids, scores, blocks and counters for the same
     /// events.
     #[test]
-    fn one_shard_is_the_run_index() {
-        let single = RunIndex::with_max_workers(8);
-        let sharded = ShardedRunIndex::new(1, 8);
+    fn one_shard_is_the_chain_index() {
+        let single = ChainIndex::with_max_workers(8);
+        let sharded = ShardedChainIndex::new(1, 8);
         let chain: Vec<ContentHash> = (0..40).map(|p| content(1, p)).collect();
         let mut fork = chain[..10].to_vec();
         fork.extend((10..30).map(|p| content(2, p)));
@@ -418,7 +418,7 @@ mod tests {
                 sharded.intern_worker(name).expect("id"),
             );
             assert_eq!(w1, w2);
-            let (mut m1, mut m2) = (RunBlockMap::default(), RunBlockMap::default());
+            let (mut m1, mut m2) = (ChainBlockMap::default(), ChainBlockMap::default());
             single
                 .apply_stored(w1, &blocks_of(contents), None, &mut m1)
                 .expect("store");
@@ -449,11 +449,11 @@ mod tests {
         assert_eq!(single.stats().arena_bytes, sharded.stats().arena_bytes);
         assert_eq!(sharded.shards(), 1);
         assert_eq!(
-            ShardedRunIndex::shard_of(sharded.worker_id("b").expect("b")),
+            ShardedChainIndex::shard_of(sharded.worker_id("b").expect("b")),
             0
         );
         assert_eq!(single.is_empty(), sharded.is_empty());
-        assert!(ShardedRunIndex::new(2, 4).is_empty());
+        assert!(ShardedChainIndex::new(2, 4).is_empty());
     }
 
     /// Two shards, workers placed round robin and by hand: every lookup, with and without the
@@ -461,7 +461,7 @@ mod tests {
     /// extensions, a divergence, a hole, a clear and a worker's removal.
     #[test]
     fn two_shards_are_exact_against_the_reference() {
-        let index = ShardedRunIndex::new(2, 8);
+        let index = ShardedChainIndex::new(2, 8);
         let mut reference = ReferenceIndexer::new();
         let chain: Vec<ContentHash> = (0..60).map(|p| content(3, p)).collect();
         let mut fork = chain[..20].to_vec();
@@ -474,13 +474,13 @@ mod tests {
         let e = index.intern_worker_in(1, "e").expect("id");
         assert_eq!(
             ids.iter()
-                .map(|&id| ShardedRunIndex::shard_of(id))
+                .map(|&id| ShardedChainIndex::shard_of(id))
                 .collect::<Vec<_>>(),
             vec![0, 1, 0, 1]
         );
-        assert_eq!(ShardedRunIndex::shard_of(e), 1);
+        assert_eq!(ShardedChainIndex::shard_of(e), 1);
         assert_eq!(index.intern_worker("e").expect("again"), e);
-        let mut maps: Vec<RunBlockMap> = (0..5).map(|_| RunBlockMap::default()).collect();
+        let mut maps: Vec<ChainBlockMap> = (0..5).map(|_| ChainBlockMap::default()).collect();
         let workers = [ids[0], ids[1], ids[2], ids[3], e];
         let stores = [
             (0usize, blocks_of(&chain)),
@@ -560,12 +560,12 @@ mod tests {
     /// lookup reports, and a shard reports only the workers it holds.
     #[test]
     fn a_lookup_fanned_out_per_shard_is_the_union_lookup() {
-        let index = ShardedRunIndex::new(2, 8);
+        let index = ShardedChainIndex::new(2, 8);
         let contents: Vec<ContentHash> = (0..40).map(|p| content(7, p)).collect();
         let mut workers = Vec::new();
         for (shard, name, len) in [(0, "a", 40), (1, "b", 25), (0, "c", 10), (1, "d", 40)] {
             let worker = index.intern_worker_in(shard, name).expect("id");
-            let mut map = RunBlockMap::default();
+            let mut map = ChainBlockMap::default();
             index
                 .apply_stored(worker, &blocks_of(&contents[..len]), None, &mut map)
                 .expect("store");
@@ -608,9 +608,9 @@ mod tests {
 
     #[test]
     fn interning_is_idempotent_across_shards() {
-        let index = ShardedRunIndex::new(3, 4);
+        let index = ShardedChainIndex::new(3, 4);
         let a = index.intern_worker_in(2, "a").expect("a");
-        assert_eq!(ShardedRunIndex::shard_of(a), 2);
+        assert_eq!(ShardedChainIndex::shard_of(a), 2);
         assert_eq!(index.intern_worker_in(0, "a").expect("a again"), a);
         assert_eq!(index.intern_worker("a").expect("a once more"), a);
         assert_eq!(index.worker_id("a"), Some(a));
@@ -618,7 +618,7 @@ mod tests {
         // Round robin fills the shards evenly for names without a placement.
         let placed: Vec<usize> = ["p", "q", "r", "s", "t", "u"]
             .iter()
-            .map(|name| ShardedRunIndex::shard_of(index.intern_worker(name).expect("id")))
+            .map(|name| ShardedChainIndex::shard_of(index.intern_worker(name).expect("id")))
             .collect();
         assert_eq!(placed.iter().filter(|&&s| s == 0).count(), 2);
         assert_eq!(placed.iter().filter(|&&s| s == 1).count(), 2);
