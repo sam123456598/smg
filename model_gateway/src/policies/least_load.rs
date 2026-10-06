@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, RwLock},
+    time::Instant,
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
@@ -14,11 +15,51 @@ pub use crate::worker::expected_wait::{
 };
 use crate::worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worker};
 
-/// Since-poll dispatch tally for one worker.
-#[derive(Clone, Copy, Debug, Default)]
+/// Dispatches kept per worker between reports. A worker that never reports
+/// (a dark fleet is scored by its live in-flight count instead) would
+/// otherwise accumulate them without end; past this the oldest are dropped.
+const SINCE_POLL_DISPATCHES_KEPT: usize = 8_192;
+
+/// Since-poll dispatch tally for one worker: the token-work and request count
+/// of the dispatches no report has reflected yet, with each dispatch's
+/// instant, so a report that says when the engine was sampled releases
+/// exactly the dispatches it saw and keeps the later ones as credit.
+#[derive(Clone, Debug, Default)]
 struct SincePollDispatch {
     tokens: u64,
     requests: u64,
+    /// `(dispatched_at, tokens)` per dispatch, oldest first.
+    dispatches: VecDeque<(Instant, u64)>,
+}
+
+impl SincePollDispatch {
+    fn record(&mut self, at: Instant, tokens: u64) {
+        self.tokens += tokens;
+        self.requests += 1;
+        self.dispatches.push_back((at, tokens));
+        if self.dispatches.len() > SINCE_POLL_DISPATCHES_KEPT {
+            self.pop_oldest();
+        }
+    }
+
+    /// Release the dispatches a report sampled at `sampled_at` already
+    /// reflects: those made at or before it.
+    fn release_through(&mut self, sampled_at: Instant) {
+        while self
+            .dispatches
+            .front()
+            .is_some_and(|&(at, _)| at <= sampled_at)
+        {
+            self.pop_oldest();
+        }
+    }
+
+    fn pop_oldest(&mut self) {
+        if let Some((_, tokens)) = self.dispatches.pop_front() {
+            self.tokens -= tokens;
+            self.requests -= 1;
+        }
+    }
 }
 
 /// Least-(token-)work routing — route to the worker with the lowest estimated
@@ -89,9 +130,11 @@ struct SincePollDispatch {
 pub struct LeastLoadPolicy {
     /// Cached load reports from the worker monitor (keyed by worker URL).
     cached_loads: RwLock<HashMap<String, WorkerLoadResponse>>,
-    /// Per-worker dispatch tally since the last load poll (keyed by worker
-    /// URL); reset when a fresh report arrives. Token-work feeds the score's
-    /// in-flight term; the request count feeds the waiting-queue veto.
+    /// Per-worker dispatch tally since the last load report (keyed by worker
+    /// URL): a report that carries `sampled_at` releases the dispatches made
+    /// up to that instant, one without it resets the tally. Token-work feeds
+    /// the score's in-flight term; the request count feeds the waiting-queue
+    /// veto.
     inflight_tokens: RwLock<HashMap<String, SincePollDispatch>>,
     /// KV-pressure weight `λ_t` (seconds).
     kv_pressure_weight: f64,
@@ -194,14 +237,16 @@ impl LeastLoadPolicy {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(url);
-        let dispatch = self
+        let inflight = self
             .inflight_tokens
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(url)
-            .copied()
-            .unwrap_or_default();
-        (has_load, dispatch.tokens, dispatch.requests)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dispatch = inflight.get(url);
+        (
+            has_load,
+            dispatch.map_or(0, |dispatch| dispatch.tokens),
+            dispatch.map_or(0, |dispatch| dispatch.requests),
+        )
     }
 
     /// Expected-wait score for a worker (lower is better).
@@ -224,7 +269,7 @@ impl LeastLoadPolicy {
         let url = worker.url();
         match Self::fresh_load(loads, complete_snapshot, url) {
             Some(load) => {
-                let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens;
+                let inflight_tokens = inflight.get(url).map_or(0, |dispatch| dispatch.tokens);
                 let queued_tokens = self.queued_tokens(load);
                 ExpectedWait::new(
                     queued_tokens,
@@ -360,7 +405,7 @@ impl LeastLoadPolicy {
                 let worker = &workers[idx];
                 let url = worker.url();
                 let dispatched_since_report =
-                    inflight.get(url).copied().unwrap_or_default().requests;
+                    inflight.get(url).map_or(0, |dispatch| dispatch.requests);
                 let (seconds, drain_tokens_per_sec) =
                     match Self::fresh_load(loads, complete_snapshot, url) {
                         Some(load) => (self.score(worker, &inputs), self.drain_rate(load)),
@@ -459,9 +504,7 @@ impl LeastLoadPolicy {
                         Some(load) => {
                             let since_poll = inflight_guard
                                 .get(url)
-                                .copied()
-                                .unwrap_or_default()
-                                .requests;
+                                .map_or(0, |dispatch| dispatch.requests);
                             (load.total_waiting_reqs().max(0) as u64) + since_poll < cap
                         }
                         None => true,
@@ -506,9 +549,10 @@ impl LeastLoadPolicy {
         // In-flight correction: credit the chosen worker with this request's
         // token-work until its next poll refreshes the snapshot.
         let req_tokens = self.request_tokens(info);
-        let tally = inflight.entry(workers[best].url().to_string()).or_default();
-        tally.tokens += req_tokens;
-        tally.requests += 1;
+        inflight
+            .entry(workers[best].url().to_string())
+            .or_default()
+            .record(Instant::now(), req_tokens);
         drop(inflight);
 
         debug!(
@@ -536,10 +580,23 @@ impl LeastLoadPolicy {
         };
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
         after_publish();
-        // A fresh snapshot already reflects work up to the poll, so reset the
-        // since-poll in-flight estimate for the workers it covers.
-        for url in loads.keys() {
-            inflight.insert(url.clone(), SincePollDispatch::default());
+        // A report reflects the work dispatched up to the instant the engine
+        // was sampled: release those dispatches and keep the later ones as
+        // credit, so a record republished unchanged (the monitor republishes
+        // the shared snapshot when a pushed record arrives) releases nothing
+        // twice and a dispatch made after the sample is not lost. A report
+        // with no sample instant resets the tally as before.
+        for (url, load) in loads {
+            match load.sampled_at {
+                Some(sampled_at) => {
+                    if let Some(dispatch) = inflight.get_mut(url) {
+                        dispatch.release_through(sampled_at);
+                    }
+                }
+                None => {
+                    inflight.insert(url.clone(), SincePollDispatch::default());
+                }
+            }
         }
     }
 }
@@ -813,6 +870,59 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn a_report_releases_the_dispatches_made_up_to_its_sample_and_keeps_the_rest() {
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000")];
+        let info = SelectWorkerInfo::default();
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        policy.update_loads(&loads);
+
+        // Two dispatches, then the engine is sampled, then one more.
+        policy.select_min_expected_wait(&workers, &[0], &info, "test");
+        policy.select_min_expected_wait(&workers, &[0], &info, "test");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let sampled_at = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        policy.select_min_expected_wait(&workers, &[0], &info, "test");
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 3072, 3));
+
+        let mut sampled = make_load(0, 0.1, 100.0);
+        sampled.sampled_at = Some(sampled_at);
+        loads.insert("http://a:8000".to_string(), sampled.clone());
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.load_state_for_test("http://a:8000"),
+            (true, 1024, 1),
+            "the dispatch after the sample stays as credit"
+        );
+
+        // The same record republished (the monitor's shared snapshot on a
+        // pushed record from another worker) releases nothing more.
+        policy.update_loads(&loads);
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 1024, 1));
+
+        // A report without a sample instant resets, as every poll did before.
+        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        policy.update_loads(&loads);
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 0, 0));
+    }
+
+    #[test]
+    fn the_tally_keeps_a_bounded_history_for_a_worker_that_never_reports() {
+        let mut dispatch = SincePollDispatch::default();
+        let at = Instant::now();
+        for _ in 0..(SINCE_POLL_DISPATCHES_KEPT + 100) {
+            dispatch.record(at, 7);
+        }
+        assert_eq!(dispatch.dispatches.len(), SINCE_POLL_DISPATCHES_KEPT);
+        assert_eq!(dispatch.requests as usize, SINCE_POLL_DISPATCHES_KEPT);
+        assert_eq!(dispatch.tokens as usize, 7 * SINCE_POLL_DISPATCHES_KEPT);
+        dispatch.release_through(at);
+        assert_eq!((dispatch.tokens, dispatch.requests), (0, 0));
     }
 
     #[test]
