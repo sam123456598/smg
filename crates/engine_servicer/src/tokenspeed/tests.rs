@@ -899,6 +899,113 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The relay asks the engine's replay for the batches it missed before its
+/// subscription joined: a publisher already at sequence 3 when the servicer
+/// starts, whose replay covers 0..=3, leaves the window whole from the
+/// publisher's first batch, and the first gateway gets all four from it.
+#[tokio::test]
+async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
+    use zeromq::{prelude::*, PubSocket, RouterSocket, ZmqMessage};
+
+    use crate::kv_events::golden;
+
+    let pub_port = pick_unused_port().expect("a free publisher port");
+    let replay_port = pick_unused_port().expect("a free replay port");
+    let mut publisher = PubSocket::new();
+    publisher
+        .bind(&format!("tcp://127.0.0.1:{pub_port}"))
+        .await
+        .expect("publisher binds");
+    let mut router = RouterSocket::new();
+    router
+        .bind(&format!("tcp://127.0.0.1:{replay_port}"))
+        .await
+        .expect("replay socket binds");
+    let mut model = model_info();
+    model.kv_events_endpoint = format!("tcp://*:{pub_port}");
+    model.kv_events_replay_endpoint = format!("tcp://*:{replay_port}");
+    model.kv_events_topic = "kv".to_string();
+    let mut h = harness(model, None).await;
+    let relay = h
+        .server
+        .state
+        .kv_relay
+        .clone()
+        .expect("a relay for the publisher");
+    // Sequences 0..=2 went out before the subscription landed: publish 3
+    // until the relay asks the replay socket, which it must do from 0.
+    let batch1 = golden::bytes(golden::BATCH1);
+    let batch2 = golden::bytes(golden::BATCH2);
+    let mut request = None;
+    for _ in 0..250 {
+        publisher
+            .send(golden::frame(b"kv", 3, &batch2))
+            .await
+            .expect("publish");
+        if let Ok(message) = tokio::time::timeout(Duration::from_millis(20), router.recv()).await {
+            request = Some(message.expect("a replay request"));
+            break;
+        }
+    }
+    let request = request.expect("the relay asked the replay socket");
+    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
+    assert_eq!(frames.len(), 3, "[identity, empty, start]");
+    assert_eq!(
+        frames[2],
+        0u64.to_be_bytes(),
+        "asked from the publisher's start"
+    );
+    for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
+        let mut reply = ZmqMessage::from(frames[0].clone());
+        reply.push_back(Vec::new().into());
+        reply.push_back(b"kv".to_vec().into());
+        reply.push_back(sequence.to_be_bytes().to_vec().into());
+        reply.push_back(payload.clone().into());
+        router.send(reply).await.expect("reply");
+    }
+    let mut end = ZmqMessage::from(frames[0].clone());
+    end.push_back(Vec::new().into());
+    end.push_back(Vec::new().into());
+    end.push_back([0xff; 8].to_vec().into());
+    end.push_back(Vec::new().into());
+    router.send(end).await.expect("end marker");
+    for _ in 0..250 {
+        if relay.counts().relayed >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let counts = relay.counts();
+    assert_eq!(
+        (
+            counts.relayed,
+            counts.gap_batches_recovered,
+            counts.unknown_before_start
+        ),
+        (4, 4, 0),
+        "{counts:?}"
+    );
+
+    // The window is the publisher's whole life: the first gateway gets it.
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect("subscribe")
+        .into_inner();
+    for expected in 0..=3 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a batch in time")
+            .expect("stream open")
+            .expect("a batch");
+        assert_eq!(batch.sequence_number, expected);
+    }
+    assert_eq!(relay.counts().served_from_history, 1);
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A scheduler that never dials in fails the link at the configured bound (not
 /// a fixed one: a cold kernel cache makes a real start exceed ten minutes), the
 /// server stays up to report it, and `stop` releases the handshake port.

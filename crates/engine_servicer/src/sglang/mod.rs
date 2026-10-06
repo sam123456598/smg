@@ -87,6 +87,10 @@ pub struct SglangModelInfo {
     /// (`tcp://*:5557` style, rank 0's port), or empty when events are off;
     /// `SubscribeKvEvents` relays it through [`crate::kv_wire`]'s rules.
     pub kv_events_endpoint: String,
+    /// The same config's `replay_endpoint` (SGLang's replay ROUTER), or
+    /// empty when it runs none: what the relay asks for gaps in flight and
+    /// for the batches published before its subscription joined.
+    pub kv_events_replay_endpoint: String,
     /// The publisher's topic prefix (empty by default).
     pub kv_events_topic: String,
 }
@@ -206,7 +210,7 @@ impl SglangServicerServer {
         }
         let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
-            None,
+            Some(&config.model.kv_events_replay_endpoint),
             &config.model.kv_events_topic,
         );
         let state = Arc::new(State {

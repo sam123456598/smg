@@ -269,7 +269,11 @@ To retain cache knowledge across a recoverable event gap, configure SGLang's
 The bridge subscribes to live events before requesting missed batches from the
 replay endpoint, preserves publisher sequence numbers, and removes overlap at
 handoff. Both subscriptions currently use DP rank 0; allocate non-overlapping
-port ranges if multiple DP ranks publish events.
+port ranges if multiple DP ranks publish events. The Rust servicer's relay
+uses the same replay endpoint (the vLLM, SGLang and TokenSpeed launchers all
+pass `replay_endpoint` from the engine's kv-events config) for gaps in flight
+and for the batches published before its subscription joined the publisher;
+without one those are counted as lost or unknown, never silently skipped.
 
 Without replay, or when history is expired, empty, malformed, or unavailable
 (timeout: five seconds), the bridge reports `OUT_OF_RANGE` before streaming or

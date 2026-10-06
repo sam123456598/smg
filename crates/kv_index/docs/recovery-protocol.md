@@ -356,7 +356,9 @@ failed round trip and exposes them as metrics.
   next to the history's 256 MiB cap), keeps a bounded history (the engines' `buffer_steps`,
   10,000, within a byte budget) that serves resumes before live events, and the live-block
   record that serves the state snapshot, so a servicer that outlives a gateway outage or restarts
-  beside a warm engine knows the engine from its first batch. Its counters are logged with every gap, restart and refusal (the servicer has no
+  beside a warm engine knows the engine from its first batch; the vLLM, SGLang and TokenSpeed
+  launchers all pass the publisher's `replay_endpoint`, so a late join is filled from the engine's
+  replay on each of them, not only marked. Its counters are logged with every gap, restart and refusal (the servicer has no
   metrics endpoint): `relayed`, `undecodable_batches`, `served_from_history`, `served_snapshots`,
   `out_of_range`, `publisher_gaps`, `gap_batches_recovered`, `gap_batches_lost`,
   `publisher_restarts`, `subscribers_lagged`, `unknown_before_start`; a served snapshot logs one

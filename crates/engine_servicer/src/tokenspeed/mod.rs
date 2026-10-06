@@ -80,6 +80,10 @@ pub struct TokenSpeedModelInfo {
     /// TokenSpeed's ZMQ KV-event publisher endpoint and topic; an empty
     /// endpoint means `SubscribeKvEvents` is UNIMPLEMENTED.
     pub kv_events_endpoint: String,
+    /// The same config's `replay_endpoint` (the publisher's replay ROUTER),
+    /// or empty when it runs none: what the relay asks for gaps in flight
+    /// and for the batches published before its subscription joined.
+    pub kv_events_replay_endpoint: String,
     pub kv_events_topic: String,
 }
 
@@ -211,7 +215,7 @@ impl TokenSpeedServicerServer {
         }
         let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
-            None,
+            Some(&config.model.kv_events_replay_endpoint),
             &config.model.kv_events_topic,
         );
         let state = Arc::new(State {
