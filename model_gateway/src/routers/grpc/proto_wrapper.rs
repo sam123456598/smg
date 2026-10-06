@@ -2162,13 +2162,24 @@ impl ProtoGenerateStreamChunk {
     }
 
     /// Weight version the engine reported for this chunk. Only TokenSpeed
-    /// carries it on the wire; an empty string counts as unset.
+    /// carries it on the wire; see [`is_reported_version`] for what counts.
     pub fn weight_version(&self) -> Option<&str> {
         match self {
-            Self::TokenSpeed(c) => c.weight_version.as_deref().filter(|v| !v.is_empty()),
+            Self::TokenSpeed(c) => c
+                .weight_version
+                .as_deref()
+                .filter(|v| is_reported_version(v)),
             Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
+}
+
+/// Whether an engine-stamped `weight_version` names a real version. TokenSpeed
+/// always stamps `server_args.weight_version`, whose default is the literal
+/// `"default"`: that is the engine saying it was never given a version, so it
+/// must not shadow a registration label, exactly like an empty string.
+fn is_reported_version(version: &str) -> bool {
+    !version.is_empty() && version != "default"
 }
 
 /// Unified GenerateComplete response
@@ -2394,10 +2405,13 @@ impl ProtoGenerateComplete {
     }
 
     /// Weight version the engine reported for this completion. Only TokenSpeed
-    /// carries it on the wire; an empty string counts as unset.
+    /// carries it on the wire; see [`is_reported_version`] for what counts.
     pub fn weight_version(&self) -> Option<&str> {
         match self {
-            Self::TokenSpeed(c) => c.weight_version.as_deref().filter(|v| !v.is_empty()),
+            Self::TokenSpeed(c) => c
+                .weight_version
+                .as_deref()
+                .filter(|v| is_reported_version(v)),
             Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
@@ -3572,6 +3586,15 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(empty.weight_version(), None, "empty is the same as unset");
+        let placeholder = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some("default".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            placeholder.weight_version(),
+            None,
+            "the engine's own placeholder is not a version and must not shadow a label"
+        );
         let unset = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete::default());
         assert_eq!(unset.weight_version(), None);
 

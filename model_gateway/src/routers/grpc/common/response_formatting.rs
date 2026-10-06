@@ -44,8 +44,9 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
 }
 
 /// The version to report on a generate response: what the engine stamped on
-/// this very response beats the dispatch-time label (M2's table, then the
-/// registration label), which beats the historical `"default"`.
+/// this very response (the proto accessors already treat an empty string and
+/// the engine's `"default"` placeholder as unset) beats the dispatch-time
+/// label, which beats the historical `"default"`.
 ///
 /// Borrowed on purpose: the SSE call sites run once per chunk and serialize
 /// the value straight into the event, so no per-chunk allocation.
@@ -53,10 +54,7 @@ pub(crate) fn effective_weight_version<'a>(
     reported: Option<&'a str>,
     dispatch: Option<&'a str>,
 ) -> &'a str {
-    reported
-        .filter(|v| !v.is_empty())
-        .or(dispatch)
-        .unwrap_or("default")
+    reported.or(dispatch).unwrap_or("default")
 }
 
 /// Tracks per-index completion token counts across streaming chunks.
@@ -200,10 +198,5 @@ mod tests {
         assert_eq!(effective_weight_version(Some("v7"), Some("v3")), "v7");
         assert_eq!(effective_weight_version(None, Some("v3")), "v3");
         assert_eq!(effective_weight_version(None, None), "default");
-        assert_eq!(
-            effective_weight_version(Some(""), None),
-            "default",
-            "empty is unset"
-        );
     }
 }
