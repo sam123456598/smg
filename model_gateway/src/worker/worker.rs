@@ -639,6 +639,18 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         indexed
     }
 
+    /// Gateway clock (`liveness::now_ms`) before which a thin worker with
+    /// requests in flight takes no further diverted hit (see
+    /// `CacheAwarePolicy::warmup_divert`); zero for a worker that does not
+    /// track it.
+    fn divert_until_ms(&self) -> u64 {
+        0
+    }
+
+    /// A hit was diverted to this thin worker; the next one waits until
+    /// `until_ms` while it has anything in flight.
+    fn note_diverted(&self, _until_ms: u64) {}
+
     /// A request of `tokens` prompt tokens was dispatched: work the engine
     /// still has to prefill before its first token (see
     /// [`Self::prefill_backlog`]).
@@ -1349,6 +1361,9 @@ pub struct WorkerRuntime {
     /// blocks the index held for the worker then (see [`Self::warmup_growth`]).
     warmup_base_admitted_ms: AtomicU64,
     warmup_base_blocks: AtomicUsize,
+    /// Clock before which this thin worker, with requests in flight, takes
+    /// no further diverted hit.
+    divert_until_ms: AtomicU64,
     /// When the current run of in-flight requests began (the load counter
     /// left zero), in [`super::liveness::now_ms`] milliseconds; zero while
     /// idle. The no-progress clock of the wedged rule starts here, not at
@@ -1397,6 +1412,7 @@ impl WorkerRuntime {
             admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
             warmup_base_admitted_ms: AtomicU64::new(u64::MAX),
             warmup_base_blocks: AtomicUsize::new(0),
+            divert_until_ms: AtomicU64::new(0),
             busy_since_ms: AtomicU64::new(0),
             prefill_tokens_pending: AtomicU64::new(0),
             prefill_rate_tps: AtomicU64::new(0),
@@ -1423,6 +1439,14 @@ impl WorkerRuntime {
     /// drops to zero when the index was cleared underneath (the count went
     /// down). Two racing callers may both take the same baseline; nothing
     /// worse.
+    pub fn divert_until_ms(&self) -> u64 {
+        self.divert_until_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn note_diverted(&self, until_ms: u64) {
+        self.divert_until_ms.store(until_ms, Ordering::Relaxed);
+    }
+
     pub fn warmup_growth(&self, indexed: usize) -> usize {
         let admitted = self.admitted_at_ms.load(Ordering::Relaxed);
         if self.warmup_base_admitted_ms.load(Ordering::Relaxed) != admitted {
@@ -2231,6 +2255,14 @@ impl Worker for BasicWorker {
 
     fn warmup_growth(&self, indexed: usize) -> usize {
         self.runtime.load().warmup_growth(indexed)
+    }
+
+    fn divert_until_ms(&self) -> u64 {
+        self.runtime.load().divert_until_ms()
+    }
+
+    fn note_diverted(&self, until_ms: u64) {
+        self.runtime.load().note_diverted(until_ms);
     }
 
     fn note_prefill_started(&self, tokens: u64) {

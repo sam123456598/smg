@@ -651,6 +651,13 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
     worker_warmup_thin_ratio: f32,
 
+    /// One cache hit in this many is diverted to a thin worker although
+    /// another worker holds its prefix (shallow overlaps first, one in flight
+    /// per thin worker), so an index emptied by a resync refills on a
+    /// workload where every request has a holder. 0 disables.
+    #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
+    worker_warmup_divert_every: u64,
+
     /// Only poll worker loads when a load-aware routing policy,
     /// --engine-metrics, or worker overload protection needs the data. By
     /// default every worker group is polled from registration onward; this
@@ -2035,6 +2042,7 @@ impl CliArgs {
                 self.worker_warmup_share,
                 self.worker_warmup_blocks,
                 self.worker_warmup_thin_ratio,
+                self.worker_warmup_divert_every,
             )
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)

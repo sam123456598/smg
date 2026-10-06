@@ -112,6 +112,15 @@ use crate::{
 /// recomputing it costs less than keeping a returned worker idle.
 const WARMUP_MISS_BLOCKS: f64 = 4.0;
 
+/// A hit whose best overlap is at most this share of the request is a
+/// shallow one: diverting it to a thin worker recomputes little, so these go
+/// first (see [`CacheAwarePolicy::warmup_divert`]).
+const DIVERT_SHALLOW_SHARE: f64 = 0.5;
+
+/// A thin worker with requests in flight gets no second diversion sooner than
+/// this after its last one.
+const DIVERT_WINDOW_MS: u64 = 2_000;
+
 /// How many eligible workers an event-driven decision reads beside the
 /// holders of the request's blocks once the pool is larger than twice this:
 /// they are the miss path's choices, the spill targets, the rows an
@@ -171,6 +180,10 @@ pub struct CacheAwarePolicy {
     /// Misses seen by the warm-up slice; every `period`th goes to a warming
     /// worker (see [`liveness::Warmup`]).
     warmup_misses: AtomicU64,
+    /// Hits seen since the last diversion to a thin worker, and whether a
+    /// shallow one was among them (see [`Self::warmup_divert`]).
+    divert_hits: AtomicU64,
+    divert_shallow_seen: AtomicBool,
     /// Each routing pool's workers by KV index id and position, built once
     /// per pool snapshot (see [`PoolTable`]).
     pool_tables: ArcSwap<Vec<Arc<PoolTable>>>,
@@ -447,6 +460,8 @@ impl CacheAwarePolicy {
             kv_monitor: RwLock::new(None),
             load_rx: RwLock::new(None),
             warmup_misses: AtomicU64::new(0),
+            divert_hits: AtomicU64::new(0),
+            divert_shallow_seen: AtomicBool::new(false),
             pool_tables: ArcSwap::from_pointee(Vec::new()),
             pool_table_building: AtomicBool::new(false),
             hash_index,
@@ -1207,6 +1222,9 @@ struct PoolTable {
     /// (admitted within it, index still growing) unless every worker was (a
     /// young fleet slices nothing).
     warming: Vec<u32>,
+    /// Positions of the thin workers alone, the targets of the hit diversion
+    /// (see [`CacheAwarePolicy::warmup_divert`]).
+    thin: Vec<u32>,
 }
 
 impl PoolTable {
@@ -1270,7 +1288,7 @@ impl PoolTable {
         // warming only because they are young are candidates only when the
         // fleet is not all young.
         let warming = if !thin.is_empty() {
-            thin
+            thin.clone()
         } else if young.len() < workers.len() {
             young
         } else {
@@ -1284,6 +1302,7 @@ impl PoolTable {
             position_of,
             fleet_level,
             warming,
+            thin,
         }
     }
 
@@ -1867,6 +1886,92 @@ impl CacheAwarePolicy {
         self.select_expected_wait(workers, &[idx], info)
     }
 
+    /// The thin worker's share of hits. On a replay where every request has
+    /// a holder (the Mooncake trace: a system prompt or a chat template in
+    /// front of everything) the miss path never runs, so a worker whose
+    /// index a resync emptied gets nothing from the slice and idles for good
+    /// (the churn runs c1 and c2, the soaks s6 and s7: one worker lost per
+    /// publisher restart, for half an hour). One hit in
+    /// `Warmup::divert_every` therefore goes to the least-loaded thin worker
+    /// although another holds its prefix, the recompute accepted: shallow
+    /// overlaps first (at most [`DIVERT_SHALLOW_SHARE`] of the request), any
+    /// hit once a window of `divert_every` hits passed without a shallow
+    /// one; never while the thin worker has anything in flight unless its
+    /// last diversion is older than [`DIVERT_WINDOW_MS`] (the stamp lives on
+    /// the worker, so it survives the table's rebuilds), so a hot fleet is
+    /// not disturbed; and only until its index crosses the thinness ratio of
+    /// the fleet's level. Equal loads draw uniformly like the slice. A fleet
+    /// with no thin worker returns before any clock read or counter: this
+    /// costs the steady state nothing. Protection and the liveness vetoes
+    /// apply through the routing state as everywhere; the pick is credited
+    /// through the expected-wait selector like the slice's.
+    fn warmup_divert(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        indexer: &KvIndex,
+        info: &SelectWorkerInfo,
+        overlap_share: f64,
+    ) -> Option<usize> {
+        if table.thin.is_empty() {
+            return None;
+        }
+        let warmup = liveness::warmup();
+        if warmup.divert_every == 0 || warmup.share <= 0.0 {
+            return None;
+        }
+        let shallow = overlap_share <= DIVERT_SHALLOW_SHARE;
+        if shallow {
+            self.divert_shallow_seen.store(true, Ordering::Relaxed);
+        }
+        let hits = self.divert_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        let shallow_seen = self.divert_shallow_seen.load(Ordering::Relaxed);
+        let due = (hits >= warmup.divert_every && (shallow || !shallow_seen))
+            || hits >= 2 * warmup.divert_every;
+        if !due {
+            return None;
+        }
+        let now = liveness::now_ms();
+        let mut pick: Option<(usize, usize)> = None;
+        let mut tied = 0u32;
+        let mut rng = rand::rng();
+        for &position in &table.thin {
+            let idx = position as usize;
+            let Some(worker) = workers.get(idx) else {
+                continue;
+            };
+            let state = worker.routing_state();
+            if !state.eligible() {
+                continue;
+            }
+            let indexed = table.id_at[idx].map_or(0, |id| indexer.worker_block_count(id));
+            if !warmup.is_thin(indexed, table.fleet_level) {
+                continue;
+            }
+            if state.load > 0 && now < worker.divert_until_ms() {
+                continue;
+            }
+            match pick {
+                Some((_, load)) if state.load > load => {}
+                Some((_, load)) if state.load == load => {
+                    tied += 1;
+                    if rng.random_range(0..=tied) == 0 {
+                        pick = Some((idx, state.load));
+                    }
+                }
+                _ => {
+                    pick = Some((idx, state.load));
+                    tied = 0;
+                }
+            }
+        }
+        let (idx, _) = pick?;
+        self.divert_hits.store(0, Ordering::Relaxed);
+        self.divert_shallow_seen.store(false, Ordering::Relaxed);
+        workers[idx].note_diverted(now + DIVERT_WINDOW_MS);
+        self.select_expected_wait(workers, &[idx], info)
+    }
+
     /// Resolve an affinity score group to one final worker. Safe affinity
     /// candidates retain priority; only when every tied holder trips the
     /// pressure gate do we scan the healthy fleet for non-gated spill targets.
@@ -2285,6 +2390,22 @@ impl CacheAwarePolicy {
                 );
                 return Some(idx);
             }
+        } else if let Some(idx) = self.warmup_divert(
+            workers,
+            &table,
+            indexer,
+            info,
+            best_overlap / request_blocks,
+        ) {
+            Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
+            debug!(
+                worker = workers[idx].url(),
+                branch = "warmup_divert",
+                overlap_blocks = best_overlap as u64,
+                request_blocks = content_hashes.len(),
+                "Cache hit diverted to a thin worker"
+            );
+            return Some(idx);
         }
         let had_overlap = !candidates.is_empty();
         let idx = self.resolve_selection(
@@ -5423,6 +5544,176 @@ mod tests {
             "the emptied worker got its slice of the thin-overlap requests: {picks:?}"
         );
         assert!(picks.contains(&0), "the holder kept the rest: {picks:?}");
+    }
+
+    /// Store `tokens` for `worker` as blocks of `block` tokens, with sequence
+    /// hashes from `seq_base` (distinct per call).
+    fn store_blocks(indexer: &KvIndex, worker: u32, tokens: &[u32], block: usize, seq_base: u64) {
+        let mut wb = WorkerBlocks::default();
+        let blocks: Vec<StoredBlock> = tokens
+            .chunks(block)
+            .enumerate()
+            .map(|(i, chunk)| StoredBlock {
+                seq_hash: SequenceHash(seq_base + i as u64),
+                content_hash: compute_content_hash(chunk),
+            })
+            .collect();
+        indexer
+            .apply_stored(worker, &blocks, None, &mut wb)
+            .unwrap();
+    }
+
+    /// A fleet for the diversion tests: the policy, its eight workers, the
+    /// index they share and each holder's head (its first 240 tokens, 60
+    /// blocks); a request made of a head and a four-block tail of its own is
+    /// a deep hit on that holder (60 of 64 blocks) that no other request
+    /// repeats.
+    struct HolderFleet {
+        policy: CacheAwarePolicy,
+        workers: Vec<Arc<dyn Worker>>,
+        indexer: Arc<KvIndex>,
+        heads: Vec<Vec<u32>>,
+    }
+
+    /// Eight workers; the first `holders` hold 1,100 blocks each of their own
+    /// 4,400-token sequence, the rest nothing.
+    fn fleet_with_holders(holders: usize) -> HolderFleet {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let workers = make_workers(&refs);
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 0, 0, 0, 0, 0]);
+        let indexer = Arc::new(KvIndex::positional(4));
+        let mut prefixes = Vec::new();
+        for (h, url) in urls.iter().enumerate() {
+            let id = indexer.intern_worker(url).unwrap();
+            if h >= holders {
+                continue;
+            }
+            let tokens: Vec<u32> = (0..4_400).map(|i| (h as u32 + 1) * 100_000 + i).collect();
+            store_blocks(&indexer, id, &tokens, 4, (h as u64 + 1) * 1_000_000);
+            prefixes.push(tokens[..240].to_vec());
+        }
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        HolderFleet {
+            policy,
+            workers,
+            indexer,
+            heads: prefixes,
+        }
+    }
+
+    #[test]
+    fn an_emptied_worker_gets_its_share_of_hits_until_it_refills() {
+        // The churn runs' case: every request is cached whole on one of seven
+        // holders (a deep hit, never a miss), the eighth worker's index was
+        // emptied by a resync. Affinity alone never sends it anything; the
+        // diversion hands it one hit in eight (no shallow hit ever comes, so
+        // the fallback at the window's end), and each diverted request lands
+        // in its index, until it crosses half the fleet's level (1,100 -> 550).
+        let HolderFleet {
+            policy,
+            workers,
+            indexer,
+            heads,
+        } = fleet_with_holders(7);
+        let emptied = indexer.worker_id("http://w7:8000").unwrap();
+        // A request: a holder's 60-block head and a four-block tail of its own.
+        let request = |i: usize| -> Vec<u32> {
+            let mut tokens = heads[i % 7].clone();
+            tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+            tokens
+        };
+        let mut decisions = 0usize;
+        let mut first = None;
+        let mut received = 0usize;
+        while decisions < 1_000 && indexer.worker_block_count(emptied) < 550 {
+            let tokens = request(decisions);
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            decisions += 1;
+            if idx == 7 {
+                received += 1;
+                first.get_or_insert(decisions);
+                // The request prefills on w7: its blocks join w7's index.
+                store_blocks(
+                    &indexer,
+                    emptied,
+                    &tokens,
+                    4,
+                    9_000_000 + decisions as u64 * 100,
+                );
+            }
+        }
+        assert!(
+            first.is_some_and(|first| first <= 8),
+            "the emptied worker is served within the first eight hits, was {first:?}"
+        );
+        assert!(
+            indexer.worker_block_count(emptied) >= 550,
+            "refilled to the ratio: {} blocks after {decisions} decisions",
+            indexer.worker_block_count(emptied)
+        );
+        assert!(
+            decisions <= 40 * 8 + 16,
+            "about forty requests of 64 blocks (seven heads of 60, then tails of 4) at one in eight: \
+             {decisions} decisions, {received} received"
+        );
+        // At the ratio the diversion stops: the hit counter runs on without a
+        // reset (w7 now holds the heads too and may win a tie as a holder,
+        // which is affinity, not a diversion).
+        let hits_before = policy.divert_hits.load(Ordering::Relaxed);
+        for i in 0..32 {
+            let tokens = request(decisions + i);
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            policy.divert_hits.load(Ordering::Relaxed),
+            hits_before + 32,
+            "no diversion once the worker is no longer thin"
+        );
+    }
+
+    #[test]
+    fn a_fleet_without_a_thin_worker_sees_no_diversion() {
+        let fleet = fleet_with_holders(8);
+        for i in 0..64 {
+            let holder = i % 8;
+            let idx = fleet
+                .policy
+                .select_worker(
+                    &fleet.workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&fleet.heads[holder]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                idx, holder,
+                "every hit stays with its holder (decision {i})"
+            );
+        }
     }
 
     #[test]

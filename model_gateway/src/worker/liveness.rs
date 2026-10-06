@@ -83,6 +83,11 @@ pub(crate) struct Warmup {
     pub share: f32,
     pub blocks: usize,
     pub thin_ratio: f32,
+    /// One hit in this many goes to a thin worker although another worker
+    /// holds its prefix (0 disables): on a replay where every request has a
+    /// holder the miss path never runs, and the slice alone would leave an
+    /// emptied worker idle for good (see `CacheAwarePolicy::warmup_divert`).
+    pub divert_every: u64,
 }
 
 impl Warmup {
@@ -127,6 +132,7 @@ const DEFAULT_WARMUP: Warmup = Warmup {
     share: 0.25,
     blocks: 1024,
     thin_ratio: 0.5,
+    divert_every: 8,
 };
 
 /// Set the warm-up slice from the gateway configuration; the first call wins.

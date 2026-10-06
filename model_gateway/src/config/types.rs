@@ -129,6 +129,15 @@ pub struct RouterConfig {
     /// empty). 0 keeps the age rule alone.
     #[serde(default = "default_worker_warmup_thin_ratio")]
     pub worker_warmup_thin_ratio: f32,
+    /// One cache hit in this many is diverted to a thin worker although
+    /// another worker holds its prefix, so an index emptied by a resync
+    /// refills on a workload where every request has a holder; shallow
+    /// overlaps first, never while the thin worker has a request in flight
+    /// (unless its last diversion is older than two seconds), until its
+    /// index crosses `worker_warmup_thin_ratio` of the fleet's level. 0
+    /// disables.
+    #[serde(default = "default_worker_warmup_divert_every")]
+    pub worker_warmup_divert_every: u64,
     /// How long a disaggregated (PD) dispatch waits for a slot in the decode
     /// engine's running window before shedding. Must stay well under the
     /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
@@ -489,6 +498,10 @@ fn default_worker_warmup_blocks() -> usize {
 
 fn default_worker_warmup_thin_ratio() -> f32 {
     0.5
+}
+
+fn default_worker_warmup_divert_every() -> u64 {
+    8
 }
 
 fn default_pd_admission_wait_secs() -> u64 {
@@ -1351,6 +1364,7 @@ impl Default for RouterConfig {
             worker_warmup_share: default_worker_warmup_share(),
             worker_warmup_blocks: default_worker_warmup_blocks(),
             worker_warmup_thin_ratio: default_worker_warmup_thin_ratio(),
+            worker_warmup_divert_every: default_worker_warmup_divert_every(),
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
             worker_overload_protection: default_worker_overload_protection(),

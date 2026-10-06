@@ -700,6 +700,7 @@ impl AppContextBuilder {
             share: config.worker_warmup_share,
             blocks: config.worker_warmup_blocks,
             thin_ratio: config.worker_warmup_thin_ratio,
+            divert_every: config.worker_warmup_divert_every,
         });
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
