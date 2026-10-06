@@ -246,7 +246,10 @@ runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
 and supervises both. What that wire does not carry is reported, not emulated:
 `FlushCache` and profiling answer UNIMPLEMENTED, ranked `top_logprobs` and
 prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
-implementation. Tuning: `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
+implementation, as do the RL control-plane extras (the `rl.*` advertisement,
+the live `weight_version` on generate responses, `is_paused`); the Rust server
+redacts credentials from `server_args` the same way. Tuning:
+`SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800, as for vLLM
 above), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS` (default 4).

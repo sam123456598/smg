@@ -12,6 +12,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer.tokenspeed import redact
 
 pytest.importorskip("smg_grpc_proto")
 servicer_mod = pytest.importorskip("smg_grpc_servicer.tokenspeed.servicer")
@@ -19,7 +20,13 @@ pb = servicer_mod.tokenspeed_scheduler_pb2
 TokenSpeedSchedulerServicer = servicer_mod.TokenSpeedSchedulerServicer
 
 
-def _servicer(*, advertise=True, paused=None, paused_sync=None, api_key="s3cret"):
+@pytest.fixture(autouse=True)
+def _no_dp_rank_pin(monkeypatch):
+    """GetServerInfo's dp-rank-pin probe needs a real engine; none of these do."""
+    monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
+
+
+def _servicer(*, advertise=True, paused=None, api_key="s3cret"):
     s = TokenSpeedSchedulerServicer.__new__(TokenSpeedSchedulerServicer)
     s.server_args = SimpleNamespace(
         model="m",
@@ -44,8 +51,6 @@ def _servicer(*, advertise=True, paused=None, paused_sync=None, api_key="s3cret"
             return paused
 
         llm.is_scheduler_paused = _is_paused
-    if paused_sync is not None:
-        llm.is_scheduler_paused = lambda: paused_sync
     s.async_llm = llm
     return s
 
@@ -55,22 +60,19 @@ def _server_info(s):
 
 
 class TestGetServerInfo:
-    def test_advertises_control_url_and_capabilities(self, monkeypatch):
-        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
+    def test_advertises_control_url_and_capabilities(self):
         info = _server_info(_servicer())
         assert info.server_args["rl.control_url"] == "http://10.0.0.5:40100"
         assert info.server_args["rl.pause_modes"] == "wait,abort,keep"
         assert info.server_args["rl.abort"] == "true"
 
-    def test_older_engine_without_advertisement_still_serves(self, monkeypatch):
-        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
+    def test_older_engine_without_advertisement_still_serves(self):
         info = _server_info(_servicer(advertise=False))
         assert "rl.control_url" not in info.server_args
         assert info.server_args["model"] == "m"
 
-    def test_failing_advertisement_degrades_to_a_label_free_worker(self, monkeypatch):
+    def test_failing_advertisement_degrades_to_a_label_free_worker(self):
         """A bug in the engine's advertisement must not take discovery down."""
-        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
         s = _servicer()
 
         def _boom():
@@ -81,13 +83,12 @@ class TestGetServerInfo:
         assert "rl.control_url" not in info.server_args
         assert info.server_args["model"] == "m"
 
-    def test_reports_live_pause_state_and_defaults_false(self, monkeypatch):
-        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
+    def test_reports_live_pause_state_and_defaults_false(self):
         assert _server_info(_servicer(paused=True)).is_paused is True
         assert _server_info(_servicer(paused=False)).is_paused is False
         assert _server_info(_servicer()).is_paused is False
 
-    def test_encode_workers_are_never_asked_for_pause_state(self, monkeypatch):
+    def test_encode_workers_are_never_asked_for_pause_state(self):
         """The EPD encode loop crashes on the pause query, so it is skipped there."""
         s = _servicer(paused=True)
         s.server_args.disaggregation_mode = "encode"
@@ -101,12 +102,7 @@ class TestGetServerInfo:
         assert _server_info(s).is_paused is False
         assert calls == [], "encode worker must not receive the scheduler query"
 
-    def test_reports_pause_state_from_a_synchronous_query(self, monkeypatch):
-        """``is_scheduler_paused`` is not pinned to be a coroutine function."""
-        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
-        assert _server_info(_servicer(paused_sync=True)).is_paused is True
-
-    def test_silent_scheduler_does_not_hang_discovery_or_lose_the_probe(self, monkeypatch):
+    def test_silent_scheduler_costs_the_field_not_the_probe(self, monkeypatch):
         """The engine's pause query has no timeout of its own; ours bounds it
         without cancelling it. TokenSpeed's queueing communicator resets its
         state only after a normal completion, so a cancelled query would wedge
@@ -114,8 +110,7 @@ class TestGetServerInfo:
         call waits on that same probe, and once the scheduler answers the true
         state comes through.
         """
-        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
-        monkeypatch.setattr(servicer_mod, "HEALTH_CHECK_TIMEOUT", 0.05)
+        monkeypatch.setattr(servicer_mod, "PAUSE_PROBE_TIMEOUT", 0.05)
         s = _servicer()
         starts: list[int] = []
         cancelled: list[int] = []
@@ -143,8 +138,12 @@ class TestGetServerInfo:
         assert cancelled == [], "the engine's query must never be cancelled"
         assert starts == [1], "later calls wait on the in-flight probe, not a new one"
 
-    def test_secrets_never_leave_the_engine(self, monkeypatch):
-        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
+    def test_pause_probe_deadline_sits_under_the_gateway_metadata_step(self):
+        # The gateway gives the whole GetServerInfo 10 s before it registers the
+        # worker without labels; the probe must leave room for the rest.
+        assert servicer_mod.PAUSE_PROBE_TIMEOUT <= 5
+
+    def test_secrets_never_leave_the_engine(self):
         info = _server_info(_servicer())
         assert "rl_control_api_key" not in info.server_args
         assert "hf_token" not in info.server_args
@@ -153,40 +152,31 @@ class TestGetServerInfo:
 
 
 def test_is_secret_key_targets_credentials_only():
-    is_secret = servicer_mod._is_secret_key
+    is_secret = redact.is_secret_key
     assert is_secret("rl_control_api_key") and is_secret("api_key") and is_secret("hf_token")
     assert is_secret("some_secret") and is_secret("db_password")
     assert not is_secret("max_total_tokens") and not is_secret("tokenizer")
     assert not is_secret("weight_version")
 
 
-def test_redaction_reaches_nested_configs():
-    """``dataclasses.asdict`` nests sub-configs; secrets inside them go too."""
-    redacted = servicer_mod._redact_secrets(
+def test_redaction_reaches_nested_configs_and_lists():
+    """Server args are redacted in their serialized form: sub-configs are dicts,
+    and a credential inside a nested dict or a list of them goes too."""
+    redacted = redact.redact_secrets(
         {
             "model": "m",
             "hf_token": "hf_abc",
             "kv_store": {"endpoint": "redis://cache", "password": "p", "ttl": 5},
+            "providers": [{"name": "p", "api_key": "k"}, "plain"],
             "nested": {"deeper": {"api_key": "k", "keep": 1}},
         }
     )
     assert redacted == {
         "model": "m",
         "kv_store": {"endpoint": "redis://cache", "ttl": 5},
+        "providers": [{"name": "p"}, "plain"],
         "nested": {"deeper": {"keep": 1}},
     }
-
-
-def test_redaction_reaches_lists_and_tuples():
-    """A credential inside a list of sub-configs is a credential too."""
-    redacted = servicer_mod._redact_secrets(
-        {
-            "providers": [{"name": "p", "api_key": "k"}, "plain"],
-            "pair": ({"password": "x", "port": 1}, 2),
-        }
-    )
-    assert redacted == {"providers": [{"name": "p"}, "plain"], "pair": ({"port": 1}, 2)}
-    assert isinstance(redacted["pair"], tuple)
 
 
 class TestGetModelInfo:
@@ -236,34 +226,3 @@ class TestGenerateStampsVersion:
         assert complete.complete.weight_version == "42"
         chunk = s._chunk_response("r", output, None, 0)
         assert chunk.chunk.weight_version == "42"
-
-
-class TestGenerateStaleStubGuard:
-    """A stale smg-grpc-proto wheel predates ``weight_version`` on these two
-    messages entirely; passing the kwarg would raise ``ValueError`` on every
-    response. The module-level ``_GENERATE_*_HAS_WEIGHT_VERSION`` flags gate
-    it out — force them off here (as they'd be on a stale wheel, regardless
-    of what the stub installed for this test run actually supports) and
-    confirm generation still succeeds with the field simply left unset.
-    """
-
-    def test_complete_and_chunk_survive_when_stub_lacks_the_field(self, monkeypatch):
-        monkeypatch.setattr(servicer_mod, "_GENERATE_CHUNK_HAS_WEIGHT_VERSION", False)
-        monkeypatch.setattr(servicer_mod, "_GENERATE_COMPLETE_HAS_WEIGHT_VERSION", False)
-        s = _servicer()
-        output = {
-            "output_ids": [1, 2],
-            "meta_info": {"finish_reason": {"type": "stop"}, "weight_version": "v7"},
-        }
-
-        # Must not raise even though meta_info carries a weight_version — the
-        # guard must omit the kwarg entirely, not merely pass None for it.
-        complete = s._complete_response("r", output, {"type": "stop"}, 0)
-        chunk = s._chunk_response("r", output, None, 0)
-
-        complete_fields = complete.complete.DESCRIPTOR.fields_by_name
-        if "weight_version" in complete_fields:
-            assert not complete.complete.HasField("weight_version")
-        chunk_fields = chunk.chunk.DESCRIPTOR.fields_by_name
-        if "weight_version" in chunk_fields:
-            assert not chunk.chunk.HasField("weight_version")

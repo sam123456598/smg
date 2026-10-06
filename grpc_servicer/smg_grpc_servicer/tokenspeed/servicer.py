@@ -14,13 +14,12 @@ import asyncio
 import dataclasses
 import functools
 import hashlib
-import inspect
 import json
 import logging
 import os
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -49,6 +48,7 @@ from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import convert_load_to_protobuf, running_window
+from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
 from ..pd_pairing import pairing_protocol_from_env
 
@@ -61,6 +61,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "20"))
+# GetServerInfo's pause query must stay well under the gateway's 10 s metadata
+# step: a silent scheduler costs the `is_paused` field, not the registration.
+PAUSE_PROBE_TIMEOUT = float(os.getenv("TOKENSPEED_PAUSE_PROBE_TIMEOUT", "2"))
 # Profile round-trips include trace serialization, which can take minutes.
 PROFILE_TIMEOUT = 600.0
 LOG_MM_TENSOR_DATA = os.getenv("TOKENSPEED_LOG_MM_TENSOR_DATA", "").lower() in (
@@ -119,19 +122,6 @@ def _engine_supports_dp_rank_pin() -> bool:
             "upgrade smg-grpc-proto."
         )
     return engine_has_field and stub_has_field
-
-
-# Whether the installed smg-grpc-proto stubs carry the ``weight_version``
-# field added to these two messages alongside the engine-reported weight
-# version work. A stale wheel predates the field entirely, and passing the
-# kwarg to the constructor would raise ``ValueError`` on every response —
-# checked once at import time, same shape as ``_engine_supports_dp_rank_pin``.
-_GENERATE_CHUNK_HAS_WEIGHT_VERSION = (
-    "weight_version" in tokenspeed_scheduler_pb2.GenerateStreamChunk.DESCRIPTOR.fields_by_name
-)
-_GENERATE_COMPLETE_HAS_WEIGHT_VERSION = (
-    "weight_version" in tokenspeed_scheduler_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
-)
 
 
 def _finish_reason_to_dict(reason: Any) -> dict | None:
@@ -614,9 +604,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 logger.warning(
                     "rl_advertisement failed; serving without rl.* labels", exc_info=True
                 )
-        server_args_dict = _redact_secrets(server_args_dict)
         server_args_struct = Struct()
-        server_args_struct.update(_make_json_serializable(server_args_dict))
+        server_args_struct.update(redact_secrets(_make_json_serializable(server_args_dict)))
 
         scheduler_info_struct = Struct()
         scheduler_info_struct.update(_make_json_serializable(dict(self.scheduler_info)))
@@ -647,40 +636,32 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             max_total_num_tokens=int(self.scheduler_info.get("max_total_num_tokens", 0)),
         )
 
-    # In-flight engine probes, kept across calls. TokenSpeed answers these
-    # through a queueing communicator that resets its result state only after
-    # a normal completion: cancelling the await mid-wait (a timeout here, or a
-    # gRPC client giving up) leaves that state set and wedges every later
-    # query. So a probe is never cancelled; a timed-out one keeps running and
-    # the next call waits on it instead of queueing another behind it.
+    # The in-flight pause probe, kept across calls. TokenSpeed answers the query
+    # through a queueing communicator that resets its result state only after a
+    # normal completion: cancelling the await mid-wait (our deadline, or a gRPC
+    # client giving up) leaves that state set and wedges every later query. So
+    # the probe is never cancelled; a timed-out one keeps running and the next
+    # call waits on it instead of queueing another behind it.
     _pause_probe: asyncio.Future | None = None
-    _load_probe: asyncio.Future | None = None
 
-    async def _bounded_probe(self, slot: str, awaitable: Any) -> Any:
+    async def _bounded_probe(self, slot: str, start: Callable[[], Awaitable[Any]]) -> Any:
         """Await an engine query with a deadline, without ever cancelling it."""
         probe = getattr(self, slot, None)
         if probe is None or probe.done():
-            probe = asyncio.ensure_future(awaitable)
+            probe = asyncio.ensure_future(start())
             # A late failure on an orphaned probe is reported by the caller that
             # was waiting then; retrieve it so asyncio does not log it as lost.
             probe.add_done_callback(lambda f: f.cancelled() or f.exception())
             setattr(self, slot, probe)
-        elif inspect.iscoroutine(awaitable):
-            awaitable.close()  # the in-flight probe answers this call too
-        return await asyncio.wait_for(asyncio.shield(probe), timeout=HEALTH_CHECK_TIMEOUT)
+        return await asyncio.wait_for(asyncio.shield(probe), timeout=PAUSE_PROBE_TIMEOUT)
 
     async def _is_paused(self) -> bool:
-        """Live scheduler pause state; False on engines without the query.
+        """Live scheduler pause state; False when the engine cannot be asked.
 
-        ``is_scheduler_paused`` is pre-existing on the engine and its
-        signature is not pinned by this branch, so accept it whether it
-        returns a bool directly or a coroutine.
-
-        An EPD encode worker never gets asked: its encode loop has no pause
-        controller and treats every scheduler message as a generate request,
-        so the query takes the whole scheduler down (seen as every EPD
-        multimodal test 503ing once the gateway probed server info). Encode
-        workers have nothing to pause; report not paused.
+        An EPD encode worker is never asked: its encode loop has no pause
+        controller, so the query would take its scheduler down. The deadline
+        is well under the gateway's 10 s metadata step, so a silent scheduler
+        costs this one field, not the worker's registration.
         """
         if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
             return False
@@ -688,10 +669,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         if not callable(query):
             return False
         try:
-            result = query()
-            if inspect.isawaitable(result):
-                result = await self._bounded_probe("_pause_probe", result)
-            return bool(result)
+            return bool(await self._bounded_probe("_pause_probe", query))
+        except TimeoutError:
+            logger.warning(
+                "is_scheduler_paused did not answer within %ss; reporting not paused",
+                PAUSE_PROBE_TIMEOUT,
+            )
+            return False
         except Exception:  # noqa: BLE001 — a failed probe must not break discovery
             logger.warning("is_scheduler_paused failed; reporting not paused", exc_info=True)
             return False
@@ -732,7 +716,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 ),
             )
         try:
-            load_outputs = await self._bounded_probe("_load_probe", self.async_llm.get_load())
+            load_outputs = await asyncio.wait_for(
+                self.async_llm.get_load(), timeout=HEALTH_CHECK_TIMEOUT
+            )
         except TimeoutError:
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
@@ -1618,20 +1604,18 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> tokenspeed_scheduler_pb2.GenerateResponse:
         meta = output.get("meta_info", {})
         token_ids = self._generated_output_ids(output, reason_dict, no_stop_trim=no_stop_trim)
-        chunk_kwargs: dict[str, Any] = dict(
-            token_ids=token_ids,
-            prompt_tokens=int(meta.get("prompt_tokens", 0)),
-            completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
-            cached_tokens=int(meta.get("cached_tokens", 0)),
-            output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
-            index=choice_index,
-        )
-        if _GENERATE_CHUNK_HAS_WEIGHT_VERSION:
-            # protobuf treats None as unset for an optional field.
-            chunk_kwargs["weight_version"] = _version_str(meta.get("weight_version"))
         return tokenspeed_scheduler_pb2.GenerateResponse(
             request_id=rid,
-            chunk=tokenspeed_scheduler_pb2.GenerateStreamChunk(**chunk_kwargs),
+            chunk=tokenspeed_scheduler_pb2.GenerateStreamChunk(
+                token_ids=token_ids,
+                prompt_tokens=int(meta.get("prompt_tokens", 0)),
+                completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
+                cached_tokens=int(meta.get("cached_tokens", 0)),
+                output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
+                index=choice_index,
+                # protobuf treats None as unset for an optional field.
+                weight_version=_version_str(meta.get("weight_version")),
+            ),
         )
 
     def _complete_response(
@@ -1660,24 +1644,22 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             elif isinstance(matched, str):
                 matched_kwargs["matched_stop_str"] = matched
 
-        complete_kwargs: dict[str, Any] = dict(
-            output_ids=token_ids,
-            finish_reason=finish_reason,
-            prompt_tokens=int(meta.get("prompt_tokens", 0)),
-            completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
-            cached_tokens=int(meta.get("cached_tokens", 0)),
-            spec_accepted_tokens=int(meta.get("spec_accepted_tokens", 0)),
-            spec_draft_tokens=int(meta.get("spec_draft_tokens", 0)),
-            output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
-            index=choice_index,
-            **matched_kwargs,
-        )
-        if _GENERATE_COMPLETE_HAS_WEIGHT_VERSION:
-            # protobuf treats None as unset for an optional field.
-            complete_kwargs["weight_version"] = _version_str(meta.get("weight_version"))
         return tokenspeed_scheduler_pb2.GenerateResponse(
             request_id=rid,
-            complete=tokenspeed_scheduler_pb2.GenerateComplete(**complete_kwargs),
+            complete=tokenspeed_scheduler_pb2.GenerateComplete(
+                output_ids=token_ids,
+                finish_reason=finish_reason,
+                prompt_tokens=int(meta.get("prompt_tokens", 0)),
+                completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
+                cached_tokens=int(meta.get("cached_tokens", 0)),
+                spec_accepted_tokens=int(meta.get("spec_accepted_tokens", 0)),
+                spec_draft_tokens=int(meta.get("spec_draft_tokens", 0)),
+                output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
+                index=choice_index,
+                # protobuf treats None as unset for an optional field.
+                weight_version=_version_str(meta.get("weight_version")),
+                **matched_kwargs,
+            ),
         )
 
     @staticmethod
@@ -1757,29 +1739,6 @@ def _abort_status_code(reason: dict) -> grpc.StatusCode:
     if status_code == 429:
         return grpc.StatusCode.RESOURCE_EXHAUSTED
     return grpc.StatusCode.INTERNAL
-
-
-_SECRET_FRAGMENTS = ("api_key", "secret", "password")
-
-
-def _is_secret_key(key: str) -> bool:
-    """Whether a server-args key names a credential that must not leave the engine."""
-    lowered = key.lower()
-    return any(fragment in lowered for fragment in _SECRET_FRAGMENTS) or lowered.endswith("_token")
-
-
-def _redact_secrets(args: Any) -> Any:
-    """Drop credential-looking keys at every level: ``dataclasses.asdict`` nests
-    sub-configs as dicts (and lists of them), and a secret two levels down is
-    still a secret. Lists and tuples keep their shape.
-    """
-    if isinstance(args, dict):
-        return {k: _redact_secrets(v) for k, v in args.items() if not _is_secret_key(str(k))}
-    if isinstance(args, list):
-        return [_redact_secrets(v) for v in args]
-    if isinstance(args, tuple):
-        return tuple(_redact_secrets(v) for v in args)
-    return args
 
 
 def _version_str(version: Any) -> str | None:
