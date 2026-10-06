@@ -65,7 +65,11 @@ Every decision is a metric: `smg_kv_event_batches_total{disposition}` (applied, 
 tail_overflow, snapshot), `smg_kv_event_gaps_total{outcome}` (replay_requested, unrecovered_kept,
 unrecovered_cleared), `smg_kv_event_missed_batches_total`, `smg_kv_event_resyncs_total{reason}`
 (out_of_range, data_loss, publisher_restart, gap_cleared, snapshot), `smg_kv_event_lag_seconds`
-(publisher stamp to apply), `smg_kv_event_degraded_ranks`, `smg_kv_event_tail_depth`.
+(publisher stamp to apply), `smg_kv_event_degraded_ranks`, `smg_kv_event_tail_depth`,
+`smg_kv_event_subscriptions_total` (streams connected, a reconnect counts again) and
+`smg_kv_index_blocks{worker}` (the blocks the index holds for the worker as it counts them, set
+where applied batches are counted, after a reset and on removal: the soak reads the index's size
+from the gateway instead of the mock's admin API).
 
 A gateway restart, or a gateway started after the engines warmed up, now learns a worker's
 resident blocks from the Rust relay whatever the age of the stream: the full history while the
@@ -94,31 +98,85 @@ liveness.rs`):
   health state machine: a slow worker that still streams tokens must not flap.
 - **Wedged.** Every response a worker streams counts as progress for it. Requests in flight, a
   reported waiting queue or a pile of in-flight requests (growing, or four deep), and no token for
-  the wedge threshold (`--worker-wedge-secs`, 3 s) veto the worker while its health keeps passing;
-  the next token clears it. A paused engine that still answers health and `GetLoads` is exactly
-  this case.
+  the wedge bound veto the worker while its health keeps passing; the next token clears it. A
+  paused engine that still answers health and `GetLoads` is exactly this case. Two false
+  positives shaped the rule: the policy lane saw all eight mock workers vetoed 3.5 s after
+  registration at their first requests (the no-progress clock had run from registration), and the
+  GPU lane saw it fire when a running batch was all in prefill and streamed nothing for 3 to 5 s.
+  The clock therefore starts when the worker's load counter leaves zero (the first dispatch of a
+  run of requests), never at registration or at the last token before an idle spell, and the
+  threshold is a bound: `--worker-wedge-secs` (3 s) or, if longer, the time the engine may still
+  need to prefill the prompts dispatched to it whose first token has not come back, over the
+  prefill rate observed on that worker (first tokens summed over windows of at least a second;
+  10k tokens/s until a rate has been seen), capped at 120 s or the configured threshold. The gRPC
+  dispatch books each request's prompt length on its stream and releases it at the first response
+  or when the stream is dropped; paths without a token count fall back to the configured
+  threshold. A worker that still answers polls is thus never vetoed before the first token of its
+  in-flight work is due, while a paused engine with chat-sized prompts in flight is vetoed at the
+  threshold as before.
 
 The veto is a routing flag next to the overload veto (`RoutingState::stalled`), visible as
 `stalled` in `GET /workers`, `smg_worker_stalled{worker,reason}` and
 `smg_worker_stall_transitions_total`. It never touches the health status.
 
 Measured on the mock fleet with health checks 10 s apart, so only the veto can act (times from the
-fault to the gateway reporting the worker out of routing, sampled every 100 ms):
+fault to the gateway reporting the worker out of routing, sampled every 100 ms; the 2026-10-05
+evening column is the eight-worker fleet on cores 72-143 with the gateway on 64-71, shared with two
+other lanes' runs, gateway from the integrated branch; hit/oracle is the engines' own
+`cached_tokens` over their prompt tokens before and after the fault):
 
-| Fault | Before | With the veto | Detected by |
-|---|---|---|---|
-| worker killed | 3.8 to 5.3 s (health) | 2.3 s | `stalled=unreachable` from the KV stream's reset |
-| worker unreachable (listener closed, connections reset) | 3.1 to 7.0 s | 2.1 to 2.2 s | same |
-| worker partitioned (blackhole) | 2.3 to 30 s | 2.0 to 2.5 s | keepalive failure on the KV stream |
-| worker restarted | 3.4 to 10.6 s | 2.6 s; stream resubscribed 0.2 s after it is back | same; health re-admits it at its next probe |
-| engine paused, health answering | never | 3.2 s, routable 0.4 s after resume | `stalled=wedged` |
+| Fault | Before | With the veto (first run) | 2026-10-05 evening | Detected by | Hit/oracle before -> after |
+|---|---|---|---|---|---|
+| worker killed | 3.8 to 5.3 s (health) | 2.3 s | 2.0 s | `stalled=unreachable` from the KV stream's reset | 91.9/94.3 -> 92.3/95.0 % |
+| worker unreachable (listener closed, connections reset) | 3.1 to 7.0 s | 2.1 to 2.2 s | 2.1 s, back 0.4 s after the listener returns | same | see the run's drill.log |
+| worker partitioned (blackhole) | 2.3 to 30 s | 2.0 to 2.5 s | 2.0 s, back 0.1 s after the link heals | keepalive failure on the KV stream | see the run's drill.log |
+| worker restarted | 3.4 to 10.6 s | 2.6 s; stream resubscribed 0.2 s after it is back | 2.1 s; re-admitted 0.0 s after its port answers, stream resubscribed at 0.2 s, first request 0.3 s into fresh traffic, restart resync at 0.4 s | same; re-admitted on the first contact, breaker closed, warm-up slice | 92.4/94.8 -> 88.2/90.0 % (the window spans the outage and the cold cache) |
+| engine paused, health answering | never | 3.2 s, routable 0.4 s after resume | 3.0 s, routable 0.0 s after resume | `stalled=wedged` | see the run's drill.log |
 
 The 2 s threshold counts from the last contact; the keepalive adds up to 2 s before a partition
 surfaces, the sweep up to 0.25 s, and the drill's own sampling 0.1 s.
 
+**Re-admission.** Every worker now carries the registry's connect signal, not only ZMQ workers:
+when a worker the health checker demoted answers a poll, a subscription or a request, the liveness
+tracker signals the health manager, which promotes it on the spot and reschedules its probe. Each
+contact also wakes the KV event subscriber out of its reconnect backoff (and out of a subscription
+call hanging on a port that accepts but does not serve yet, which gets a 2 s deadline), so the
+stream is back the moment the worker is heard from. A contact ends the subscriber's backoff no
+sooner than 100 ms and abandons a hanging subscription call only half a second after it, so the
+contacts of a healthy worker (every token it streams is one) never cut a live call short; every
+stream connected counts in `smg_kv_event_subscriptions_total`. The outage's connection failures
+also opened the circuit breaker, which held the returned worker out of routing for its 30 s
+timeout and reopened on one error from the stale channel (the restart drill saw a first request
+only 53.8 s after re-admission with the slice firing 63 times elsewhere): a worker whose
+unreachable veto clears, or that health promotes back to Ready, now returns with a closed
+breaker. Drill (2026-10-05 15:25, before the breaker fix): excluded in 2.2 s, re-admitted 0.8 s
+after its port answered, stream resubscribed at 1.0 s, but the first request reached it only
+53.8 s later; with the breaker reset (19:51): re-admitted 0.0 s after its port answered, stream
+resubscribed at 0.2 s, first request 0.3 s into the fresh trickle, the publisher restart recognised
+0.4 s after the port answered. The probe-gated path took 10.7 s.
+
+**Warm-up slice.** A returned worker has an empty cache, so cache-aware routing had no reason to
+send it anything; on the GB300 fleet a restarted worker served nothing for 59 s. Workers now
+record when they became routable (promotion to Ready, or a liveness veto cleared). For
+`--worker-warmup-secs` (60) after that, while the index holds fewer than `--worker-warmup-blocks`
+(1,024) blocks for the worker, one cache miss in `1 / --worker-warmup-share` (a quarter) goes to
+the least-loaded warming worker on the event-driven path, credited through the expected-wait
+selector like any pick. A miss here is no overlap or a thin one, at or below the tree-mode
+`cache_threshold` ratio: chat requests share their template's head with every holder, which is
+affinity in name only. Hits are never diverted; the branch counts as `warmup_slice` in
+`smg_cache_aware_policy_branch_total`. Growth is measured from the count first seen for the
+current admission, not from zero: a restarted engine's stale blocks stay indexed until its first
+batch reveals the restart, and an engine that gets no request sends no batch, so the stale count
+would end the warm-up meant to break that circle; the baseline drops to zero when the index is
+cleared underneath. Nothing is sliced when no worker is warming or every worker is (a young
+fleet). Drill (the fleet older than the warm-up window when the fault lands, as a production fleet
+is): with a trickle of unique prompts at 10 req/s after the restart, the returned worker served its
+first request 0.3 s into the trickle, on the first slice decision; the run made 20 slice decisions
+in all, and the returned worker applied 2,707 batches in the remaining 80 s.
+
 **Gateway restart.** Measured in phases with the fleet re-registered by the drill: `/health` up
 in 0.3 to 1.4 s, eight registrations accepted within 0.1 s of that, the first worker routable at
-0.6 to 1.9 s, the whole fleet at 0.7 to 2.2 s, whether the load generator is capped at 5 or 40
+0.6 to 1.9 s, the whole fleet at 0.7 to 2.2 s (0.7 s on the evening run), whether the load generator is capped at 5 or 40
 req/s per process or runs closed-loop. The 12 and 20 s restarts seen earlier were not reproducible once the fleet was
 measured on uncontended cores; the control plane is not the bottleneck at this scale. Two
 observations stand: nothing persists worker registrations across a restart, so an operator (or
@@ -141,16 +199,26 @@ use the mock engine's admin fault hooks (`crates/mock_worker/README.md`:
 EngineCore ranks with the Rust servicer (`crates/engine_servicer`, through the `smg` Python
 binding) in front of each and the gateway subscribing to KV events through the servicer's relay.
 Each drill prints `RESULT: PASS|FAIL|SKIP` with the measured numbers and appends to
-`~/smg-perf/results/chaos.tsv`.
+`~/smg-perf/results/chaos.tsv`; drill logs carry wall-clock stamps that line up with the gateway's
+and the relays' logs, and every metric sample a drill polls is traced to `.metric_trace` in its
+result directory. Timings are read from the gateway's counters (a resubscription from
+`smg_kv_event_subscriptions_total`), never from its log, which goes through a lossy non-blocking
+channel. The relay rules are written for a relay with history: a drop passes when the relay's
+`publisher_gaps` is at least 1 with `gap_batches_lost` 0, the gateway's unrecovered count is 0 and
+the worker's applied batches keep growing after the fault (the gateway sees no gap at all); a
+publisher restart passes when a resync is counted after the fault against a baseline taken before
+it is armed. The direct-path rules are unchanged.
 
-Hook drills, direct and through the relay (events lost, time to detection, detecting counter):
+Hook drills, direct and through the relay (events lost, time to detection, detecting counter;
+the relay column is the 2026-10-05 evening run with the relay's bounded history, the earlier
+history-less numbers in parentheses):
 
 | Drill | Direct gRPC mock | Through the Rust relay |
 |---|---|---|
-| 20 batches dropped | gap seen in 0.8 s (`gaps_total{replay_requested}`), recovered by replay, hit rate 88% to 91% | gap seen in 0.4 s, not recovered: the relay keeps no history, 41 to 87 batches settled as lost, rank degraded |
-| publisher restart (cache kept) | `resyncs_total{publisher_restart}` in 0.3 s, batches keep applying | the relay ends the stream with `DATA_LOSS` and the gateway rebuilds; counted in 0.0 s in one run, missed in two (the restart only shows when the worker publishes again) |
-| 1.5 s publish delay | mean apply lag 1.41 s over 269 batches | mean apply lag 1.44 to 1.51 s |
-| engine paused 8 s | `stalled=wedged` 3.2 s in | (direct only) |
+| 20 batches dropped | gap seen in 0.6 to 0.8 s (`gaps_total{replay_requested}`), recovered by replay (20 missed, replayed), 1,299 batches applied after the fault, hit/oracle 88 to 92 % | the relay sees the gap 0.4 s after it is armed (`publisher_gaps` 1) and refills it from the engine's replay socket (`gap_batches_recovered` 21, `gap_batches_lost` 0); the gateway sees no gap (`replay_requested` 0, unrecovered 0, missed 0) and applied 1,189 batches after the fault; hit/oracle 91.3/93.6 -> 92.6/95.0 % (without history: gap seen in 0.4 s, 41 to 87 batches settled as lost, rank degraded) |
+| publisher restart (cache kept) | `resyncs_total{publisher_restart}` in 0.2 to 0.3 s, batches keep applying | the relay reads the restart on the next batch (`publisher_restarts` 0 -> 1) and ends the stream with `DATA_LOSS`; `resyncs_total{data_loss}` counted 0.0 s after the fault was armed, 31 batches applied after it, nothing stale; hit/oracle 91.2/93.6 -> 92.5/94.8 % (without history: counted in 0.0 s in one run, missed in two) |
+| 1.5 s publish delay | mean apply lag 1.41 to 1.51 s over 269 to 429 batches | mean apply lag 1.48 s over 525 batches; hit/oracle 90.9/93.3 -> 92.4/94.9 % (without history: 1.44 to 1.51 s) |
+| engine paused 8 s | `stalled=wedged` 3.0 to 3.2 s in, routable 0.0 to 0.4 s after resume | (direct only) |
 
 ## Comparison with Dynamo (`lib/llm/src/kv_router/indexer/recovery/`)
 
