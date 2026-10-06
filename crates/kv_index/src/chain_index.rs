@@ -104,6 +104,14 @@ const TABLE_CLASSES: usize = 27;
 const MAX_WORDS: usize = 16;
 /// Partial holders a lookup can buffer per run: every worker at most.
 const MAX_PARTIAL: usize = MAX_WORDS * 64;
+/// Prefix holders a run carries before it is split at their median cutoff: a lookup reads every
+/// entry of a run it walks, so a hot chain held to a hundred different depths costs a hundred
+/// entries per lookup as one run and a few bitset words as a handful; a split here turns the
+/// holders at or past the median into whole holders of the prefix. Sixteen left the A2 pairs
+/// unchanged at one and two shards where thirty-two still cost 0.1 us at two. Splits for this reason are
+/// bounded by holders, not by requests, so they do not accumulate the way splits at every
+/// divergence did.
+const PARTIAL_CAP: usize = 16;
 
 thread_local! {
     /// The lookup's buffer for one run's partial-holder entries, per thread: filled and read
@@ -455,21 +463,6 @@ impl WordArena {
             .collect()
     }
 
-    /// Visit the live children of a table without allocating.
-    fn for_each_child(&self, table: u32, mut visit: impl FnMut(u32)) {
-        if table == NONE {
-            return;
-        }
-        let slots = self.table_slots(table);
-        let words = self.words(table + 2, 2 * slots);
-        for index in 0..slots {
-            let entry = words[2 * index + 1].load(Ordering::Acquire);
-            if entry != 0 && entry != TOMB {
-                visit(entry as u32);
-            }
-        }
-    }
-
     /// Write an entry into a free or tombstoned slot of a table that has room (writer side).
     fn table_put(&self, table: u32, head: u64, run: u32, generation: u32) {
         let slots = self.table_slots(table);
@@ -521,6 +514,31 @@ impl WordArena {
             self.table_put(grown, head, run, generation);
         }
         grown
+    }
+
+    /// A table holding `entries` (`(key, run, generation)`) with room for one more; `NONE` for
+    /// none.
+    fn table_from(&self, entries: &[(u64, u32, u32)]) -> u32 {
+        if entries.is_empty() {
+            return NONE;
+        }
+        let needed = entries.len() + 1;
+        let mut slots = MIN_TABLE_SLOTS;
+        while needed * 4 > slots * 3 {
+            slots *= 2;
+        }
+        let table = self.alloc_table(slots);
+        for &(key, run, generation) in entries {
+            self.table_put(table, key, run, generation);
+        }
+        table
+    }
+
+    /// Tombstoned slots of a table: entries taken out since it was built.
+    fn table_dead(&self, table: u32) -> usize {
+        let header = self.word(table).load(Ordering::Relaxed);
+        ((header >> 32) as usize)
+            .saturating_sub(self.word(table + 1).load(Ordering::Relaxed) as usize)
     }
 }
 
@@ -1113,14 +1131,27 @@ pub struct ChainIndexStats {
     /// Runs split because a store entered them under a parent the worker did not hold up to
     /// (a stale parent, or a worker re-entering a chain it had lost the head of).
     pub splits_by_mid_run_store: usize,
+    /// Runs split at the median cutoff of their prefix holders once more than `PARTIAL_CAP`
+    /// held a prefix of them (bounded by holders, never by requests).
+    pub splits_by_prefix_holders: usize,
     /// Runs unlinked from the tree since the index was created (their headers go back to the
     /// slab's free list).
     pub runs_died: usize,
+    /// Prefix-holder entries over the live runs (a lookup reads a run's entries when a holder it
+    /// follows is not a whole holder of the run), and the most one run carries.
+    pub partial_entries: usize,
+    pub max_partials: usize,
+    /// Child-table entries over the live runs, live and tombstoned.
+    pub child_entries: usize,
+    pub child_tombstones: usize,
 }
 
 /// Where a writer waited: the root, a leaf only this worker holds, or a run others hold too.
 #[derive(Clone, Copy)]
 enum LockKind {
+    /// Constructed by the lane-stats lock accounting; a divergence no longer splits a run, so
+    /// no split is charged to the root kind any more.
+    #[cfg_attr(not(feature = "lane-stats"), expect(dead_code))]
     Root = 0,
     Own = 1,
     Shared = 2,
@@ -1237,6 +1268,7 @@ pub struct ChainIndex {
     splits_branch: AtomicUsize,
     splits_hole: AtomicUsize,
     splits_mid_run: AtomicUsize,
+    splits_prefix_holders: AtomicUsize,
     runs_died: AtomicUsize,
     #[cfg(feature = "lane-stats")]
     counters: LaneCounters,
@@ -1272,8 +1304,9 @@ enum Plan {
     Skip(usize, usize),
     /// Continue in the child `(id, generation)` from its first block.
     Descend(u32, u32),
-    /// Open a new child for the blocks in hand, without the run's lock if the table has room.
-    Insert,
+    /// Open a new child for the blocks in hand at this offset of the run (its end, or a
+    /// divergence inside it), without the run's lock if the table has room.
+    InsertAt(usize),
     /// The run must change: take its lock and re-read it.
     Lock,
 }
@@ -1295,6 +1328,9 @@ enum InRun<'b> {
     Done,
     /// The blocks still to place start right after the run's last block.
     Continue(&'b [StoredBlock]),
+    /// The blocks still to place diverge from the run at this offset: they continue it from
+    /// there as a child.
+    ContinueAt(&'b [StoredBlock], usize),
     /// Carry on in this run (id, generation) from its first block.
     MoveTo(u32, u32),
 }
@@ -1374,6 +1410,7 @@ impl ChainIndex {
             splits_branch: AtomicUsize::new(0),
             splits_hole: AtomicUsize::new(0),
             splits_mid_run: AtomicUsize::new(0),
+            splits_prefix_holders: AtomicUsize::new(0),
             runs_died: AtomicUsize::new(0),
             #[cfg(feature = "lane-stats")]
             counters: LaneCounters::default(),
@@ -1592,6 +1629,38 @@ impl ChainIndex {
             .load(Ordering::Relaxed)
     }
 
+    /// The child-table key of a child continuing a run from `offset` with the content hash
+    /// `head`: a child may hang off any offset of its parent (a divergence inside a run does not
+    /// split the run), so the key carries the offset beside the hash. Never zero, which a table
+    /// slot reads as empty.
+    #[inline]
+    fn child_key(offset: usize, head: u64) -> u64 {
+        let mixed = head
+            ^ (offset as u64 + 1)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(23);
+        if mixed == 0 {
+            1
+        } else {
+            mixed
+        }
+    }
+
+    /// The content hash of a run's first block, read under its version (the run is not locked).
+    fn child_head(&self, run_id: u32) -> u64 {
+        let run = self.slab.run(run_id);
+        loop {
+            let (window, version) = run.snapshot();
+            let head = self
+                .arena
+                .word(window.block + window.base)
+                .load(Ordering::Relaxed);
+            if run.confirm(version) {
+                return head;
+            }
+        }
+    }
+
     /// Follow the forwarding records to where a block lives now, without a lock: `(place,
     /// generation of its run)`, or `None` when the block is not held any more (its run died, or
     /// it was forwarded to nowhere).
@@ -1633,11 +1702,12 @@ impl ChainIndex {
     /// inserter, growing the table under a version step that first drains inserters in flight.
     /// `Some` when another writer linked a child with this head meanwhile: the caller descends
     /// into that one instead.
-    fn link_child(&self, run: &Run, head: u64, child: u32) -> Option<(u32, u32)> {
+    fn link_child(&self, run: &Run, offset: usize, head: u64, child: u32) -> Option<(u32, u32)> {
         let generation = self.slab.run(child).generation();
+        let key = Self::child_key(offset, head);
         loop {
             let table = run.children.load(Ordering::Acquire);
-            match self.arena.table_claim(table, head, child, generation) {
+            match self.arena.table_claim(table, key, child, generation) {
                 Claim::Inserted => return None,
                 Claim::Exists(other, other_generation) => return Some((other, other_generation)),
                 Claim::Full | Claim::Changed => {}
@@ -1663,7 +1733,8 @@ impl ChainIndex {
         if table == NONE {
             return;
         }
-        if self.arena.table_take(table, child) == 0 {
+        let live = self.arena.table_take(table, child);
+        if live == 0 {
             run.begin_update();
             run.wait_inflight();
             if self.arena.word(table + 1).load(Ordering::Relaxed) == 0 {
@@ -1673,6 +1744,16 @@ impl ChainIndex {
             } else {
                 run.end_update();
             }
+        } else if self.arena.table_dead(table) > self.arena.table_slots(table) / 2 {
+            // Children come and go at every offset of a long-lived run (a decode tail per prompt
+            // end): a table more than half tombstones is rebuilt from its live entries, so a
+            // probe never walks the dead keys of a thousand finished requests.
+            run.begin_update();
+            run.wait_inflight();
+            let fresh = self.arena.table_from(&self.arena.table_entries(table));
+            run.children.store(fresh, Ordering::Relaxed);
+            run.end_update();
+            self.arena.free_table(table);
         }
     }
 
@@ -1681,7 +1762,14 @@ impl ChainIndex {
     /// across the claim so a split or table growth cannot move the table under the insert, and
     /// gives up with `Claim::Changed` if the run moved on since the plan (its end is elsewhere
     /// now). `Claim::Full` means the locked path must do it.
-    fn insert_child(&self, run_id: u32, child: u32, head: u64, planned: u64) -> Claim {
+    fn insert_child(
+        &self,
+        run_id: u32,
+        child: u32,
+        offset: usize,
+        head: u64,
+        planned: u64,
+    ) -> Claim {
         let run = self.slab.run(run_id);
         loop {
             run.inflight.fetch_add(1, Ordering::SeqCst);
@@ -1701,15 +1789,22 @@ impl ChainIndex {
                 run.inflight.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
-            // The child continues this run after its current last block.
+            if offset > len {
+                run.inflight.fetch_sub(1, Ordering::SeqCst);
+                return Claim::Changed;
+            }
+            // The child continues this run from `offset`: its end, or a divergence inside it.
             let new_run = self.slab.run(child);
             new_run
                 .start
-                .store((run.start() + len) as u32, Ordering::Relaxed);
+                .store((run.start() + offset) as u32, Ordering::Relaxed);
             new_run.parent.store(run_id, Ordering::Release);
-            let claim = self
-                .arena
-                .table_claim(table, head, child, new_run.generation());
+            let claim = self.arena.table_claim(
+                table,
+                Self::child_key(offset, head),
+                child,
+                new_run.generation(),
+            );
             run.inflight.fetch_sub(1, Ordering::SeqCst);
             return claim;
         }
@@ -1898,6 +1993,33 @@ impl ChainIndex {
     /// partial holders reaching past `at`; partial holders reaching `at` become full holders of
     /// the prefix. A suffix nobody would hold is not created when the run has no children: the
     /// forwarding record says those blocks are gone. No worker's holdings change in total.
+    /// Split the run (locked by the caller) at the median cutoff of its prefix holders when more
+    /// than `PARTIAL_CAP` of them hold a prefix of it: the holders at or past the median become
+    /// whole holders of the prefix, the rest keep their entries on one side or the other.
+    fn cap_prefix_holders(&self, run_id: u32, meta: &mut RunMeta) {
+        let run = self.slab.run(run_id);
+        let table = run.partials.load(Ordering::Relaxed);
+        if table == NONE || self.arena.partials_live(table) <= PARTIAL_CAP {
+            return;
+        }
+        let mut cutoffs: Vec<u32> = self
+            .arena
+            .partial_entries(table)
+            .iter()
+            .map(|&(_, cutoff)| cutoff)
+            .collect();
+        if cutoffs.len() <= PARTIAL_CAP {
+            return;
+        }
+        cutoffs.sort_unstable();
+        let at = cutoffs[cutoffs.len() / 2] as usize;
+        if at == 0 || at >= run.len() {
+            return;
+        }
+        self.splits_prefix_holders.fetch_add(1, Ordering::Relaxed);
+        self.split_locked(run_id, meta, at);
+    }
+
     fn split_locked(&self, run_id: u32, _meta: &mut RunMeta, at: usize) -> u32 {
         let run = self.slab.run(run_id);
         let coverage = self.slab.coverage(run_id);
@@ -1916,8 +2038,29 @@ impl ChainIndex {
             .map(|&(worker, cutoff)| (worker, cutoff - at as u32))
             .collect();
         let suffix_held = !coverage_is_empty(coverage) || !beyond.is_empty();
-        let suffix_id = if !suffix_held && children == NONE {
-            run.begin_update();
+        // Children hang off any offset of the run: those past `at` move to the suffix, keyed by
+        // their offset within it; the rest stay. Decided under the version step, after
+        // the inserts in flight have landed, so none is missed.
+        run.begin_update();
+        run.wait_inflight();
+        let start = run.start();
+        let mut kept: Vec<(u64, u32, u32)> = Vec::new();
+        let mut moved: Vec<(u64, u32, u32)> = Vec::new();
+        for (key, child, generation) in self.arena.table_entries(children) {
+            let child_offset = self.slab.run(child).start().saturating_sub(start);
+            // A child at `at` itself stays an end child of the prefix (a walk never descends
+            // from offset zero of a run, so the suffix must not carry one there).
+            if child_offset <= at {
+                kept.push((key, child, generation));
+            } else {
+                moved.push((
+                    Self::child_key(child_offset - at, self.child_head(child)),
+                    child,
+                    generation,
+                ));
+            }
+        }
+        let suffix_id = if !suffix_held && moved.is_empty() {
             run.len.store(at as u32, Ordering::Relaxed);
             run.end_update();
             GONE
@@ -1925,15 +2068,16 @@ impl ChainIndex {
             self.arena.array_retain(block);
             self.arena.array_retain(engine);
             let suffix_partials = self.arena.partials_from(&beyond);
+            let suffix_children = self.arena.table_from(&moved);
             let suffix_id = self.slab.alloc(
-                run.start() + at,
+                start + at,
                 run_id,
                 Window {
                     block,
                     base: base + at as u32,
                     engine,
                     len: (len - at) as u32,
-                    children,
+                    children: suffix_children,
                     partials: suffix_partials,
                     forwards: NONE,
                 },
@@ -1942,22 +2086,22 @@ impl ChainIndex {
             for (slot, word) in self.slab.coverage(suffix_id).iter().zip(coverage) {
                 slot.store(word.load(Ordering::Relaxed), Ordering::Relaxed);
             }
-            let table = self.arena.alloc_table(MIN_TABLE_SLOTS);
-            self.arena
-                .table_put(table, self.hash_at(run, at), suffix_id, suffix.generation());
-            run.begin_update();
-            // Children linked without the lock while we prepared: wait for them to land, then
-            // hand the whole table, and every child's parent pointer, to the suffix.
-            run.wait_inflight();
-            self.arena.for_each_child(children, |child| {
+            for &(_, child, _) in &moved {
                 self.slab
                     .run(child)
                     .parent
                     .store(suffix_id, Ordering::Release);
-            });
+            }
+            kept.push((
+                Self::child_key(at, self.hash_at(run, at)),
+                suffix_id,
+                suffix.generation(),
+            ));
+            let table = self.arena.table_from(&kept);
             run.len.store(at as u32, Ordering::Relaxed);
             run.children.store(table, Ordering::Relaxed);
             run.end_update();
+            self.arena.free_table(children);
             suffix_id
         };
         // The prefix is `[0, at)` now: a partial holder that reached it holds all of it. Done
@@ -2185,35 +2329,27 @@ impl ChainIndex {
                         .arena
                         .words(window.engine + window.base + offset as u32, len - offset);
                     let (matched, conflicts) = self.match_run(hashes, engines, remaining, false);
-                    let diverge = matched < len - offset && matched < remaining.len();
-                    if !diverge && offset + matched <= held {
+                    if matched > 0 && offset + matched <= held {
+                        // Blocks already held: step past them. A divergence after them is the
+                        // next round's business, at the offset where it starts.
                         Plan::Skip(matched, conflicts)
+                    } else if matched == 0 && offset > 0 {
+                        // The blocks in hand leave the run's content right here: they continue
+                        // it as a child hanging off this offset, found or opened without the
+                        // lock. The run itself does not change.
+                        self.plan_child(&window, offset, remaining[0].content_hash.0)
                     } else {
                         Plan::Lock
                     }
                 }
             } else {
-                match self
-                    .arena
-                    .table_find(window.children, remaining[0].content_hash.0)
-                {
-                    Some((child, generation)) => {
-                        // The child's header is the next line the walk reads: ask for it while
-                        // the version is confirmed.
-                        prefetch_hint::prefetch_read(std::ptr::from_ref(self.slab.run(child)));
-                        Plan::Descend(child, generation)
-                    }
-                    // A run with a child table takes a new branch without its lock; a leaf (the
-                    // worker's own to extend, or a shared one without a table yet) is locked.
-                    None if window.children != NONE => Plan::Insert,
-                    None => Plan::Lock,
-                }
+                self.plan_child(&window, len, remaining[0].content_hash.0)
             };
             if !run.confirm(version) {
                 continue;
             }
             match plan {
-                Plan::Insert => {
+                Plan::InsertAt(at) => {
                     let head = remaining[0].content_hash.0;
                     let contents: Vec<u64> = remaining
                         .iter()
@@ -2241,7 +2377,7 @@ impl ChainIndex {
                         },
                     );
                     set(self.slab.coverage(new_id), worker);
-                    match self.insert_child(run_id, new_id, head, version) {
+                    match self.insert_child(run_id, new_id, at, head, version) {
                         Claim::Inserted => {
                             #[cfg(feature = "lane-stats")]
                             self.counters.inserts.fetch_add(1, Ordering::Relaxed);
@@ -2314,10 +2450,24 @@ impl ChainIndex {
                         InRun::Done => return Walk::Done,
                         InRun::Continue(rest) => {
                             remaining = rest;
-                            self.store_at_end(
+                            let end = run.len();
+                            self.store_at(
                                 worker,
                                 run_id,
                                 &meta,
+                                end,
+                                remaining,
+                                blocks.len() - remaining.len(),
+                                pending,
+                            )
+                        }
+                        InRun::ContinueAt(rest, at) => {
+                            remaining = rest;
+                            self.store_at(
+                                worker,
+                                run_id,
+                                &meta,
+                                at,
                                 remaining,
                                 blocks.len() - remaining.len(),
                                 pending,
@@ -2426,8 +2576,29 @@ impl ChainIndex {
         Walk::Restart
     }
 
-    /// Match `remaining` against the run from `offset`: join or split the run as needed, record
-    /// the matched blocks, and say how to go on.
+    /// The plan where the blocks in hand leave the run's content, at its end or at a divergence
+    /// at `offset`: descend into the child that continues the run there, open one without the
+    /// lock when the run has a table, or lock a leaf (the worker's own to extend, or a shared one
+    /// without a table yet).
+    fn plan_child(&self, window: &Window, offset: usize, head: u64) -> Plan {
+        match self
+            .arena
+            .table_find(window.children, Self::child_key(offset, head))
+        {
+            Some((child, generation)) => {
+                // The child's header is the next line the walk reads: ask for it while the
+                // version is confirmed.
+                prefetch_hint::prefetch_read(std::ptr::from_ref(self.slab.run(child)));
+                Plan::Descend(child, generation)
+            }
+            None if window.children != NONE => Plan::InsertAt(offset),
+            None => Plan::Lock,
+        }
+    }
+
+    /// Match `remaining` against the run from `offset`: join the run as far as it matches, record
+    /// the matched blocks, and say how to go on (a divergence inside the run continues as a
+    /// child hanging off it; the run is never split for one).
     #[expect(clippy::too_many_arguments)]
     fn store_in_run<'b>(
         &self,
@@ -2461,11 +2632,9 @@ impl ChainIndex {
         let (matched, conflicts) = self.match_run(hashes, engines, remaining, true);
         let available = len - offset;
         let reach = offset + matched;
-        if matched < available && matched < remaining.len() {
-            // A divergence inside the run: both branches stay held, the run ends here.
-            self.count_split(LockKind::Root);
-            self.split_locked(run_id, meta, reach);
-        }
+        // A divergence inside the run leaves the run whole: the blocks from the divergence on
+        // continue it as a child hanging off `reach` (see `store_at`).
+        let diverges = matched < available && matched < remaining.len();
         let before = self.held_len(run_id);
         if reach > held {
             self.set_holding(run_id, worker, reach);
@@ -2480,19 +2649,28 @@ impl ChainIndex {
             conflicts,
         });
         if matched == remaining.len() {
+            // The store ends in this run: a safe point to cap its prefix holders (a split here
+            // moves nothing this store still has to place).
+            self.cap_prefix_holders(run_id, meta);
             return InRun::Done;
+        }
+        if diverges {
+            return InRun::ContinueAt(&remaining[matched..], reach);
         }
         InRun::Continue(&remaining[matched..])
     }
 
-    /// `remaining` starts right after the run's last block: descend into the child that continues
-    /// it, append to the worker's own leaf, or open a new run. Returns the child (id, generation)
-    /// to descend into.
-    fn store_at_end(
+    /// Place `remaining` after `offset` blocks of the run (locked by the caller): in the child
+    /// that already continues the run there, in place when the run is this worker's own leaf and
+    /// `offset` is its end, or in a new child linked at `offset`. `Some` names a child that
+    /// already existed, for the caller to carry on in.
+    #[expect(clippy::too_many_arguments)]
+    fn store_at(
         &self,
         worker: u32,
         run_id: u32,
         _meta: &RunMeta,
+        offset: usize,
         remaining: &[StoredBlock],
         block_start: usize,
         pending: &mut Vec<Placed>,
@@ -2501,16 +2679,24 @@ impl ChainIndex {
         let coverage = self.slab.coverage(run_id);
         let head = remaining[0].content_hash.0;
         let children = run.children.load(Ordering::Relaxed);
-        if let Some(found) = self.arena.table_find(children, head) {
+        if let Some(found) = self
+            .arena
+            .table_find(children, Self::child_key(offset, head))
+        {
             return Some(found);
         }
         let len = run.len();
+        debug_assert!(
+            offset <= len,
+            "a child hangs off the run: {offset} <= {len}"
+        );
         let contents: Vec<u64> = remaining
             .iter()
             .map(|stored| stored.content_hash.0)
             .collect();
         let engines: Vec<u64> = remaining.iter().map(|stored| stored.seq_hash.0).collect();
-        let own_leaf = run_id != ROOT
+        let own_leaf = offset == len
+            && run_id != ROOT
             && children == NONE
             && run.forwards.load(Ordering::Relaxed) == NONE
             && covered_only_by(coverage, worker);
@@ -2525,7 +2711,7 @@ impl ChainIndex {
                 .arena
                 .alloc_array(&engines, self.arena.array_capacity(block));
             let new_id = self.slab.alloc(
-                run.start() + len,
+                run.start() + offset,
                 run_id,
                 Window {
                     block,
@@ -2538,7 +2724,7 @@ impl ChainIndex {
                 },
             );
             set(self.slab.coverage(new_id), worker);
-            if let Some(existing) = self.link_child(run, head, new_id) {
+            if let Some(existing) = self.link_child(run, offset, head, new_id) {
                 let mut freed = Vec::new();
                 self.discard_run(new_id, worker, &mut freed);
                 self.recycle(&mut freed);
@@ -2723,6 +2909,8 @@ impl ChainIndex {
             self.settle_distinct(worker, before, run_id);
             held = low;
         }
+        // Every range is applied: cap the run's prefix holders (a tail eviction adds one).
+        self.cap_prefix_holders(run_id, meta);
     }
 
     /// Forget every block of `worker` (the engine cleared its cache); the map is emptied.
@@ -2825,7 +3013,9 @@ impl ChainIndex {
         let root = self.slab.run(ROOT);
         loop {
             let (window, version) = root.snapshot();
-            let found = self.arena.table_find(window.children, first);
+            let found = self
+                .arena
+                .table_find(window.children, Self::child_key(0, first));
             if root.confirm(version) {
                 return found;
             }
@@ -2883,10 +3073,12 @@ impl ChainIndex {
                 for (word, slot) in held[..words].iter_mut().zip(coverage) {
                     *word = slot.load(Ordering::Relaxed);
                 }
-                let next = if matched == len && position + matched < content_hashes.len() {
+                let next = if position + matched < content_hashes.len() {
+                    // The request goes on past what matched here: a child may continue the run
+                    // from this offset, at its end or at a divergence inside it.
                     self.arena.table_find(
                         window.children,
-                        hash_of(&content_hashes[position + matched]),
+                        Self::child_key(matched, hash_of(&content_hashes[position + matched])),
                     )
                 } else {
                     None
@@ -2898,37 +3090,50 @@ impl ChainIndex {
                 if matched == 0 {
                     break;
                 }
-                if position == 0 {
+                if position == 0 && early_exit {
                     alive = held;
                     for &entry in &partial[..partials] {
                         let worker = entry as u32;
                         alive[(worker / 64) as usize] |= 1u64 << (worker % 64);
                     }
-                    if early_exit {
-                        emit(&alive[..words], 1, &mut report);
-                        return walked;
-                    }
+                    emit(&alive[..words], 1, &mut report);
+                    return walked;
                 }
-                // A partial holder still alive ends here with the part of the run it holds.
+                // Prefix holders, in one pass: at the first run every entry is a holder, later
+                // only those still alive. One that holds the whole matched stretch of a run the
+                // request leaves inside goes on (a child hanging off the divergence may continue
+                // it); the rest end here with what they hold. A whole holder is never in the
+                // table, and a worker gaining its bit while its entry lingers counts as whole.
+                let mut through = [0u64; MAX_WORDS];
                 for &entry in &partial[..partials] {
                     let worker = entry as u32;
                     let (index, bit) = ((worker / 64) as usize, 1u64 << (worker % 64));
-                    if alive[index] & bit != 0 && held[index] & bit == 0 {
-                        let cutoff = (entry >> 32) as usize;
+                    if held[index] & bit != 0 || (position > 0 && alive[index] & bit == 0) {
+                        continue;
+                    }
+                    let cutoff = (entry >> 32) as usize;
+                    if matched < len && cutoff >= matched {
+                        through[index] |= bit;
+                    } else {
                         report(worker, (position + cutoff.min(matched)) as u32);
+                        // Reported here: not among the holders dropped below.
                         alive[index] &= !bit;
                     }
                 }
                 if position > 0 {
                     for (index, word) in alive[..words].iter_mut().enumerate() {
-                        let dropped = *word & !held[index];
+                        let dropped = *word & !held[index] & !through[index];
                         if dropped != 0 {
                             emit_word(index, dropped, position as u32, &mut report);
                         }
                     }
-                }
-                for (index, word) in alive[..words].iter_mut().enumerate() {
-                    *word &= held[index];
+                    for (index, word) in alive[..words].iter_mut().enumerate() {
+                        *word &= held[index] | through[index];
+                    }
+                } else {
+                    for (index, word) in alive[..words].iter_mut().enumerate() {
+                        *word = held[index] | through[index];
+                    }
                 }
                 if alive[..words].iter().all(|word| *word == 0) {
                     return walked;
@@ -2967,6 +3172,10 @@ impl ChainIndex {
             let hashes = self
                 .arena
                 .words(window.block + window.base, window.len as usize);
+            // The prefix hash after each count of the run's blocks: a child hangs off any offset
+            // and continues from the hash at its own.
+            let mut prefixes: Vec<Option<SequenceHash>> = Vec::with_capacity(hashes.len() + 1);
+            prefixes.push(prefix);
             for (offset, slot) in hashes.iter().enumerate() {
                 let content = ContentHash(slot.load(Ordering::Relaxed));
                 let next = match prefix {
@@ -2982,9 +3191,11 @@ impl ChainIndex {
                     }
                 }
                 prefix = Some(next);
+                prefixes.push(prefix);
             }
             for (_, child, _) in self.arena.table_entries(window.children) {
-                stack.push((child, prefix));
+                let child_offset = self.slab.run(child).start().saturating_sub(start);
+                stack.push((child, prefixes[child_offset.min(prefixes.len() - 1)]));
             }
         }
         out
@@ -3075,6 +3286,7 @@ impl ChainIndex {
             splits_by_branch: self.splits_branch.load(Ordering::Relaxed),
             splits_by_hole: self.splits_hole.load(Ordering::Relaxed),
             splits_by_mid_run_store: self.splits_mid_run.load(Ordering::Relaxed),
+            splits_by_prefix_holders: self.splits_prefix_holders.load(Ordering::Relaxed),
             runs_died: self.runs_died.load(Ordering::Relaxed),
             ..ChainIndexStats::default()
         };
@@ -3085,6 +3297,15 @@ impl ChainIndex {
             }
             stats.runs_live += 1;
             stats.blocks_live += run.len();
+            let (window, _) = run.snapshot();
+            let partials = self.arena.partial_entries(window.partials).len();
+            stats.partial_entries += partials;
+            stats.max_partials = stats.max_partials.max(partials);
+            if window.children != NONE {
+                let live = self.arena.table_live(window.children);
+                stats.child_entries += live;
+                stats.child_tombstones += self.arena.table_dead(window.children);
+            }
         }
         stats
     }
@@ -3538,7 +3759,7 @@ mod tests {
     }
 
     #[test]
-    fn a_staircase_of_prefix_holders_is_one_run() {
+    fn a_staircase_of_prefix_holders_is_a_few_runs() {
         let index = ChainIndex::with_max_workers(128);
         let held: Vec<ContentHash> = (0..64).map(|p| content(3, p)).collect();
         let blocks = blocks_of(&held);
@@ -3557,16 +3778,20 @@ mod tests {
                 .apply_stored(step as u32, &blocks[..=step], None)
                 .expect("ref");
         }
-        assert_eq!(
-            index.stats().runs_live,
-            1,
-            "64 prefixes of one chain share one run"
+        // A divergence never splits, but more than `PARTIAL_CAP` prefix holders on one run do,
+        // at their median cutoff: 64 prefixes of one chain end up in a few runs with the longer
+        // holders whole on the prefixes, never in one run per holder.
+        let runs = index.stats().runs_live;
+        assert!(
+            (2..=2 * 64 / PARTIAL_CAP).contains(&runs),
+            "64 prefixes of one chain under the prefix-holder cap of {PARTIAL_CAP}: {runs} runs"
         );
+        assert!(index.stats().splits_by_prefix_holders >= 1);
         let expected: Vec<(u32, u32)> = (0..64u32).map(|w| (w, w + 1)).collect();
         assert_eq!(scores(&index, &held), expected);
         assert_eq!(index.debug_blocks(), reference.blocks());
         let walked = index.score_into(&held, |c| c.0, false, |_, _| {});
-        assert_eq!(walked, 1);
+        assert_eq!(walked, runs, "the walk visits each run of the chain once");
         let mut early: Vec<(u32, u32)> =
             index.find_matches(&held, true).scores.into_iter().collect();
         early.sort_unstable();
@@ -3575,7 +3800,7 @@ mod tests {
         index.apply_removed(63, &[blocks[40].seq_hash], &mut maps[63]);
         reference.apply_removed(63, &[blocks[40].seq_hash]);
         assert_eq!(scores(&index, &held)[63], (63, 40));
-        assert_eq!(index.stats().runs_live, 2);
+        assert!(index.stats().runs_live >= runs);
         assert_eq!(index.debug_blocks(), reference.blocks());
     }
 
@@ -3941,19 +4166,17 @@ mod tests {
     fn a_child_insert_planned_before_a_split_gives_up() {
         let index = ChainIndex::with_max_workers(8);
         let w = index.intern_worker("w").expect("id");
-        let v = index.intern_worker("v").expect("id");
-        let (mut mw, mut mv) = (ChainBlockMap::default(), ChainBlockMap::default());
+        let mut mw = ChainBlockMap::default();
         let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index.apply_stored(w, &blocks, None, &mut mw).expect("w");
         let parent = mw.get(blocks[9].seq_hash).expect("mapped").run;
         let (_, planned) = index.slab.run(parent).snapshot();
-        // Another lane diverges inside the run: it is split at 5, its end moves.
-        let mut fork: Vec<ContentHash> = held[..5].to_vec();
-        fork.extend((0..3).map(|p| content(2, p)));
-        index
-            .apply_stored(v, &blocks_of(&fork), None, &mut mv)
-            .expect("v");
+        // A divergence inside the run no longer moves its end (a fork hangs off its offset), and
+        // neither does a tail eviction (the cutoff drops, the array stays for regrowth); a hole
+        // does: w drops blocks 3 and 4, and the run is cut at 5.
+        let hole: Vec<SequenceHash> = blocks[3..5].iter().map(|block| block.seq_hash).collect();
+        index.apply_removed(w, &hole, &mut mw);
         assert_eq!(index.slab.run(parent).len(), 5);
         // The child prepared for blocks after the old end must not be linked after the new one.
         let contents = [content(3, 0).0, content(3, 1).0];
@@ -3976,13 +4199,14 @@ mod tests {
         );
         set(index.slab.coverage(child), w);
         assert!(matches!(
-            index.insert_child(parent, child, contents[0], planned),
+            index.insert_child(parent, child, 10, contents[0], planned),
             Claim::Changed
         ));
         let mut freed = Vec::new();
         index.discard_run(child, w, &mut freed);
         index.recycle(&mut freed);
-        // The real path restarts from the parent block and lands the blocks after block 9.
+        // The real path restarts from the parent block and lands the blocks after block 9, in
+        // the suffix the hole split off; the lookup still stops at the hole.
         let mut longer = held.clone();
         longer.extend([content(3, 0), content(3, 1)]);
         let longer_blocks = blocks_of(&longer);
@@ -3991,14 +4215,12 @@ mod tests {
             .expect("extend");
         let mut reference = ReferenceIndexer::new();
         reference.apply_stored(w, &blocks, None).expect("ref w");
-        reference
-            .apply_stored(v, &blocks_of(&fork), None)
-            .expect("ref v");
+        reference.apply_removed(w, &hole);
         reference
             .apply_stored(w, &longer_blocks[10..], Some(blocks[9].seq_hash))
             .expect("ref extend");
         assert_eq!(index.debug_blocks(), reference.blocks());
-        assert_eq!(scores(&index, &longer), vec![(w, 12), (v, 5)]);
+        assert_eq!(scores(&index, &longer), vec![(w, 3)]);
     }
 
     /// Interning and releasing worker slots from many threads at once: an intern holds a name-map

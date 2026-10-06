@@ -319,7 +319,12 @@ impl ShardedChainIndex {
             total.splits_by_branch += stats.splits_by_branch;
             total.splits_by_hole += stats.splits_by_hole;
             total.splits_by_mid_run_store += stats.splits_by_mid_run_store;
+            total.splits_by_prefix_holders += stats.splits_by_prefix_holders;
             total.runs_died += stats.runs_died;
+            total.partial_entries += stats.partial_entries;
+            total.max_partials = total.max_partials.max(stats.max_partials);
+            total.child_entries += stats.child_entries;
+            total.child_tombstones += stats.child_tombstones;
         }
         total
     }

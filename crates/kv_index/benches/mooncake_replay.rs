@@ -524,14 +524,18 @@ impl ReplayBackend for Chain {
         let mut out = format!("shards = {}", self.inner.shards());
         for (shard, stats) in self.inner.shard_stats().iter().enumerate() {
             out.push_str(&format!(
-                "\n  shard {shard}: distinct blocks {} runs live {} blocks in live runs {} arena bytes {} (chunks {}, free-listed {}) slab bytes {}",
+                "\n  shard {shard}: distinct blocks {} runs live {} blocks in live runs {} arena bytes {} (chunks {}, free-listed {}) slab bytes {} partial entries {} (max {} per run) child entries {} (tombstones {})",
                 self.inner.shard(shard).entry_count(),
                 stats.runs_live,
                 stats.blocks_live,
                 stats.arena_bytes,
                 stats.arena_chunk_bytes,
                 stats.arena_free_bytes,
-                stats.slab_bytes
+                stats.slab_bytes,
+                stats.partial_entries,
+                stats.max_partials,
+                stats.child_entries,
+                stats.child_tombstones
             ));
         }
         let total = self.inner.stats();

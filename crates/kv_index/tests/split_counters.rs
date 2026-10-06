@@ -1,6 +1,6 @@
-//! The split counters in the stats name the cause of every split: a chain diverging inside a
-//! run, a removal leaving a hole, a store entering a run under a parent the worker did not hold
-//! up to. The churn harness reads them to attribute fragmentation; this keeps them honest.
+//! The split counters in the stats name the cause of every split: a removal leaving a hole, a
+//! store entering a run under a parent the worker did not hold up to; a chain diverging inside a
+//! run no longer splits it (the tail hangs off the offset as a child) and counts nothing. The churn harness reads them to attribute fragmentation; this keeps them honest.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use kv_index::{
@@ -42,7 +42,8 @@ fn splits_are_counted_by_cause() {
         (0, 0, 0)
     );
 
-    // A chain sharing the first 50 blocks diverges inside a's run: one branch split.
+    // A chain sharing the first 50 blocks diverges inside a's run: the run stays whole and b's
+    // tail hangs off offset 50 as a child, so no split is counted and two runs are live.
     let shared: Vec<ContentHash> = chain_a[..50]
         .iter()
         .map(|block| block.content_hash)
@@ -50,16 +51,19 @@ fn splits_are_counted_by_cause() {
     let chain_b = chain(2, &shared, 100);
     index.apply_stored(b, &chain_b, None, &mut mb).unwrap();
     let stats = index.stats();
-    assert_eq!(stats.splits_by_branch, 1, "a divergence inside a run");
+    assert_eq!(
+        stats.splits_by_branch, 0,
+        "a divergence inside a run splits nothing"
+    );
     assert_eq!(stats.splits_by_hole, 0);
-    assert_eq!(stats.runs_live, 3);
+    assert_eq!(stats.runs_live, 2);
 
     // a drops blocks 20..30 and keeps the rest: a hole, so the tail becomes its own run.
     let hole: Vec<_> = chain_a[20..30].iter().map(|block| block.seq_hash).collect();
     index.apply_removed(a, &hole, &mut ma);
     let stats = index.stats();
     assert_eq!(stats.splits_by_hole, 1, "a removal that leaves a hole");
-    assert_eq!(stats.splits_by_branch, 1);
+    assert_eq!(stats.splits_by_branch, 0);
 
     // Deaths: when every holder of a run is gone, the run is unlinked and counted.
     let died_before = index.stats().runs_died;

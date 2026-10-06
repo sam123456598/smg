@@ -60,9 +60,9 @@ fn churn_with_decode_tails_and_restarts_is_exact() {
             .check_exact(&index, &reference, 1000)
             .unwrap_or_else(|why| panic!("shards {shards}, at the end: {why}"));
         let stats = index.stats();
-        assert!(
-            stats.splits_by_branch > 0,
-            "the decode tails did branch inside runs"
+        assert_eq!(
+            stats.splits_by_branch, 0,
+            "a divergence inside a run hangs a child off it and splits nothing"
         );
         assert!(churn.restarts > 0, "workers restarted");
         assert!(index.current_size() > 0);
@@ -70,11 +70,10 @@ fn churn_with_decode_tails_and_restarts_is_exact() {
 }
 
 /// Runs live stay within a small multiple of the content's shape: one run per chain and per
-/// divergence point, plus the live private decode tails, each a run of its own. Until a
-/// divergence inside a run stops splitting it, every prompt end leaves a boundary behind and the
-/// count runs away with the requests.
+/// divergence point, plus the live private decode tails, each a run of its own. Before a
+/// divergence inside a run stopped splitting it, every prompt end left a boundary behind and the
+/// count ran away with the requests; this keeps that from coming back.
 #[test]
-#[ignore = "passes once a divergence inside a run attaches a child instead of splitting the run"]
 fn runs_live_stay_within_the_content_shape() {
     let index = ShardedChainIndex::new(1, 64);
     let mut churn = Churn::new(config(11), &index);
