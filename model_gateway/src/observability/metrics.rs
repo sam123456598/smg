@@ -366,6 +366,12 @@ pub(crate) fn init_metrics() {
         "KV event batches by worker and disposition (applied, stale, tail_overflow, snapshot)"
     );
     describe_counter!(
+        "smg_engine_load_polls_total",
+        "Load-monitor tick decisions by worker and mode: poll (no pushed load record on file), \
+         fallback (pushed records older than the tick interval), skipped_fresh_push (the \
+         worker's KV-event stream pushed its load within the interval; no GetLoads RPC)"
+    );
+    describe_counter!(
         "smg_kv_event_gaps_total",
         "KV event sequence gaps by worker and outcome (replay_requested, \
          unrecovered_kept, unrecovered_cleared)"
@@ -1706,6 +1712,16 @@ impl Metrics {
     }
 
     /// Count a KV event batch by what the subscriber did with it.
+    /// One load-monitor tick decision for a worker (see `PollMode`).
+    pub fn record_engine_load_poll(worker_url: &str, mode: &'static str) {
+        counter!(
+            "smg_engine_load_polls_total",
+            "worker" => intern_string(worker_url),
+            "mode" => mode
+        )
+        .increment(1);
+    }
+
     pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
         counter!(
             "smg_kv_event_batches_total",
@@ -2159,6 +2175,22 @@ impl Metrics {
     }
 }
 
+/// Metrics helpers for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    /// Run `f` under a thread-local Prometheus recorder and return the
+    /// rendered `/metrics` text — the same scrape output the :29000 endpoint
+    /// serves in production.
+    pub(crate) fn render_with_recorder(f: impl FnOnce()) -> String {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
@@ -2166,17 +2198,7 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
-    use super::*;
-
-    /// Run `f` under a thread-local Prometheus recorder and return the
-    /// rendered `/metrics` text — the same scrape output the :29000 endpoint
-    /// serves in production.
-    fn render_with_recorder(f: impl FnOnce()) -> String {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, f);
-        handle.render()
-    }
+    use super::{test_support::render_with_recorder, *};
 
     #[test]
     fn tokenizer_activity_registers_both_layers_on_scrape() {

@@ -62,6 +62,59 @@ message EngineLoad {
   // Monotonic per stream: the subscriber can order records.
   uint64 sample = 8;
   bool load_only = 9;
+  // The engine's telemetry beyond the routing core, filled by each servicer
+  // with what its engine reports and left unset otherwise (absent is
+  // distinct from zero): what the gateway's smg_engine_* gauges and GET
+  // /loads show under pushes exactly as under a GetLoads poll. Sent on the
+  // heartbeat cadence (load_only batches and a stream's first record), not
+  // on every event batch; no routing input reads these fields.
+  optional double cache_hit_rate = 10;
+  optional int32 num_used_tokens = 11;
+  optional int32 max_total_num_tokens = 12;
+  optional EngineMemory memory = 13;
+  optional EngineQueues queues = 14;
+  optional EngineSpeculative speculative = 15;
+  optional EngineLora lora = 16;
+  optional EngineDisaggregation disaggregation = 17;
+}
+
+// The sections below mirror the SGLang scheduler's GetLoads messages field
+// for field (TokenSpeed reports memory and queues in the same shape; vLLM
+// reports none), so a servicer copies them through.
+message EngineMemory {
+  double weight_gb = 1;
+  double kv_cache_gb = 2;
+  double graph_gb = 3;
+  int32 token_capacity = 4;
+}
+
+message EngineQueues {
+  int32 waiting = 1;
+  int32 grammar = 2;
+  int32 paused = 3;
+  int32 retracted = 4;
+}
+
+message EngineSpeculative {
+  double accept_length = 1;
+  double accept_rate = 2;
+}
+
+message EngineLora {
+  int32 slots_used = 1;
+  int32 slots_total = 2;
+  double utilization = 3;
+}
+
+message EngineDisaggregation {
+  string mode = 1;  // "prefill", "decode", or "null"
+  int32 prefill_prealloc_queue_reqs = 2;
+  int32 prefill_inflight_queue_reqs = 3;
+  int32 decode_prealloc_queue_reqs = 4;
+  int32 decode_transfer_queue_reqs = 5;
+  int32 decode_retracted_queue_reqs = 6;
+  double kv_transfer_speed_gb_s = 7;
+  double kv_transfer_latency_ms = 8;
 }
 
 // One chunk of a state snapshot. A relay that keeps a bounded history serves a

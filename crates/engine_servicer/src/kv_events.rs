@@ -77,8 +77,12 @@
 //! `load_only`, goes out when the record changed (checked every
 //! `load_tick`, 100 ms) and as a heartbeat after `heartbeat_interval` (1 s)
 //! of silence, backing off to `heartbeat_backoff` (5 s) once the engine has
-//! been idle for two heartbeats. The gateway feeds the record where its
-//! `GetLoads` poll goes and admits nothing from a `load_only` batch.
+//! been idle for two heartbeats. The record's routing core rides every
+//! batch; the engine's telemetry (cache hit rate, token counts, SGLang's
+//! sections) rides the heartbeats and the stream's first record. The
+//! gateway feeds the record where its `GetLoads` poll goes, admits nothing
+//! from a `load_only` batch, and does not poll a worker while its records
+//! arrive: `GetLoads` is the fallback.
 //!
 //! `SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor` turns on the relay's
 //! engine-hash verification ([`crate::engine_hash`]); mismatches are counted,
@@ -210,31 +214,6 @@ pub trait LoadSource: Send + Sync {
     /// is known (the engine is not up yet). `sample` and `load_only` are the
     /// relay's to set.
     fn load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
-}
-
-/// An [`EngineLoad`](common::EngineLoad) from the fields a `GetLoads` rank
-/// entry carries; `waiting_uncached_tokens` is `None` when the servicer
-/// cannot tell (the proto keeps that distinct from 0).
-pub fn engine_load(
-    running: i32,
-    waiting: i32,
-    waiting_uncached_tokens: Option<i32>,
-    token_usage: f64,
-    gen_throughput: f64,
-    max_running_requests: i32,
-) -> common::EngineLoad {
-    let unsigned = |value: i32| u32::try_from(value).unwrap_or(0);
-    common::EngineLoad {
-        running_requests: unsigned(running),
-        waiting_requests: unsigned(waiting),
-        waiting_uncached_tokens: waiting_uncached_tokens.map(unsigned),
-        token_usage,
-        gen_throughput,
-        max_running_requests: unsigned(max_running_requests),
-        age_ms: 0,
-        sample: 0,
-        load_only: false,
-    }
 }
 
 /// Whether a record moved enough from `last` to be worth a `load_only`
@@ -834,7 +813,12 @@ impl Subscriber {
         self.sample += 1;
         record.sample = self.sample;
         record.load_only = load_only;
-        self.last_record = Some(record);
+        // The telemetry rides the heartbeats and the stream's first record;
+        // an event batch, one per scheduler step, carries the core only.
+        if !load_only && self.sample > 1 {
+            smg_grpc_client::engine_load::core_only(&mut record);
+        }
+        self.last_record = Some(record.clone());
         Some(record)
     }
 
@@ -842,6 +826,10 @@ impl Subscriber {
     /// or when the stream has been silent for the heartbeat interval (the
     /// backoff interval after two unchanged heartbeats); `None` otherwise.
     fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
+        // Nothing sent yet, nothing to repeat: a heartbeat numbered 0 before
+        // the publisher's first batch would make a gateway that predates
+        // the field take that batch for a duplicate.
+        let sequence_number = self.last_sent?;
         let current = self.source.as_ref()?.load(self.last_rank)?;
         let changed = self
             .last_record
@@ -864,7 +852,7 @@ impl Subscriber {
             self.idle_heartbeats.saturating_add(1)
         };
         Some(common::KvEventBatch {
-            sequence_number: self.last_sent.unwrap_or(0),
+            sequence_number,
             timestamp: unix_seconds(),
             events: Vec::new(),
             dp_rank: rank,
@@ -1777,6 +1765,9 @@ mod tests {
                     token_usage: 0.25,
                     gen_throughput: 1_200.0,
                     max_running_requests: 64,
+                    cache_hit_rate: Some(0.5),
+                    num_used_tokens: Some(1_024),
+                    max_total_num_tokens: Some(4_096),
                     ..Default::default()
                 }),
                 asked: AtomicU64::new(0),
@@ -1793,7 +1784,12 @@ mod tests {
     impl LoadSource for StubLoads {
         fn load(&self, _dp_rank: Option<i32>) -> Option<common::EngineLoad> {
             self.asked.fetch_add(1, Ordering::Relaxed);
-            Some(*self.record.lock().unwrap_or_else(PoisonError::into_inner))
+            Some(
+                self.record
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            )
         }
     }
 
@@ -1804,6 +1800,17 @@ mod tests {
         tick: Duration,
         heartbeat: Duration,
         backoff: Duration,
+    ) -> Lab {
+        start_lab_with_loads_at(loads, tick, heartbeat, backoff, true).await
+    }
+
+    /// [`start_lab_with_loads`], with or without the publisher's first batch.
+    async fn start_lab_with_loads_at(
+        loads: Arc<StubLoads>,
+        tick: Duration,
+        heartbeat: Duration,
+        backoff: Duration,
+        prime: bool,
     ) -> Lab {
         let mut publisher = PubSocket::new();
         let endpoint = publisher
@@ -1829,7 +1836,9 @@ mod tests {
             router: None,
             relay,
         };
-        lab.prime().await;
+        if prime {
+            lab.prime().await;
+        }
         lab
     }
 
@@ -1868,7 +1877,14 @@ mod tests {
             ),
             (3, 1, Some(4_096), 1, false)
         );
-        assert_eq!(record_of(&read(&mut stream).await).sample, 2);
+        // The first record carries the telemetry; the next event batch's
+        // record is the core only.
+        assert_eq!(record.cache_hit_rate, Some(0.5));
+        assert_eq!(record.max_total_num_tokens, Some(4_096));
+        let second = read(&mut stream).await;
+        assert_eq!(record_of(&second).sample, 2);
+        assert_eq!(record_of(&second).cache_hit_rate, None);
+        assert_eq!(record_of(&second).max_total_num_tokens, None);
         lab.publish(2, &batch2).await;
         let live = read(&mut stream).await;
         assert_eq!((live.sequence_number, record_of(&live).sample), (2, 3));
@@ -1916,6 +1932,8 @@ mod tests {
         assert!(load_only_marker(&change), "{change:?}");
         assert_eq!((change.sequence_number, change.events.len()), (0, 0));
         assert_eq!((record.running_requests, record.waiting_requests), (5, 2));
+        // A heartbeat carries the telemetry.
+        assert_eq!(record.cache_hit_rate, Some(0.5));
         assert!(
             started.elapsed() < Duration::from_millis(150),
             "the change took {:?}",
@@ -3168,5 +3186,38 @@ mod tests {
             "the check is off unless the environment asks"
         );
         assert_eq!(wire.window_only_stores, 0);
+    }
+
+    /// Before the stream has sent a batch there is no sequence a heartbeat
+    /// could repeat, so a quiet publisher at the start gets none: a gateway
+    /// that predates the load field would take the publisher's first batch
+    /// for a duplicate of a heartbeat numbered 0. The first real batch
+    /// opens the heartbeats.
+    #[tokio::test]
+    async fn no_heartbeat_goes_out_before_the_streams_first_batch() {
+        let loads = StubLoads::new(2, 0);
+        let mut lab = start_lab_with_loads_at(
+            Arc::clone(&loads),
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(100),
+            false,
+        )
+        .await;
+        let mut stream = lab.subscribe(0).expect("live from the start");
+        loads.set(5, 1);
+        assert!(
+            timeout(Duration::from_millis(300), stream.next())
+                .await
+                .is_err(),
+            "no batch may precede the publisher's first"
+        );
+        lab.prime().await;
+        let first = read(&mut stream).await;
+        assert_eq!(first.sequence_number, 0);
+        assert!(!load_only_marker(&first));
+        let beat = read(&mut stream).await;
+        assert!(load_only_marker(&beat));
+        assert_eq!(beat.sequence_number, 0);
     }
 }

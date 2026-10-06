@@ -128,15 +128,9 @@ impl crate::kv_events::LoadSource for LoadFromState {
         let state = self.0.upgrade()?;
         let response = info::loads(&state, dp_rank).ok()?;
         let load = response.loads.first()?;
-        // The engine reports no queued token-work on this wire yet.
-        Some(crate::kv_events::engine_load(
-            load.num_running_reqs,
-            load.num_waiting_reqs,
-            None,
-            load.token_usage,
-            load.gen_throughput,
-            load.max_running_requests,
-        ))
+        // The engine reports no queued token-work on this wire yet: the
+        // record's `waiting_uncached_tokens` stays unset.
+        Some(smg_grpc_client::common_proto::EngineLoad::from(load))
     }
 }
 

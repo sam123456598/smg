@@ -3309,7 +3309,7 @@ mod tests {
             ..Default::default()
         };
         let mut only = batch(7, None, vec![]);
-        only.load = Some(record);
+        only.load = Some(record.clone());
         assert!(KvEventMonitor::is_load_only(&only));
         let mut carrying = batch(8, None, vec![stored(None, &[1])]);
         carrying.load = Some(EngineLoad {

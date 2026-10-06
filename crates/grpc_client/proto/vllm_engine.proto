@@ -29,7 +29,9 @@ service VllmEngine {
   // Get server information
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 
-  // Get scheduler load metrics
+  // Get scheduler load metrics. The gateway's fallback: a servicer that
+  // pushes its load on the KV-event stream (KvEventBatch.load) is not polled
+  // while those records flow.
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
 
   // Get tokenizer artifacts for remote construction

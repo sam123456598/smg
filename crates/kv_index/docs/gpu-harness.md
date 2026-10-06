@@ -223,8 +223,11 @@ healthy: wait for the `Tokenizer '<model>' ... registered` log line before loadi
   strictly one after the other (wait for `the servicer is SERVING`); different GPUs can start in parallel.
 - Do not edit a shell script while a run of it is still executing: bash reads the file incrementally and the running
   instance picks up the shifted bytes (a series driver died with a syntax error after its last run). Copy, then edit.
-- The gateway polls `GetLoads` every `--load-monitor-interval` seconds (10 by default); the `smg_engine_*` gauges and the
-  expected-wait inputs are that stale. A per-second series must read the servicer directly (`fleet_series.py` does).
+- The gateway polls `GetLoads` every `--load-monitor-interval` seconds (10 by default) only for a worker whose KV-event
+  stream pushed no load record within that interval; a servicer that pushes (every batch, and heartbeats while quiet)
+  feeds the `smg_engine_*` gauges and the expected-wait inputs per scheduler step and is not polled (the poll is the
+  fallback; `smg_engine_load_polls_total{mode}` says which a worker gets). A per-second series of the servicer's own view
+  can still read it directly (`fleet_series.py` does).
 - The e69487f8 relay serves a cursor-0 subscriber the engine's whole state only while its history still starts at
   sequence 0 (10,000 batches / 256 MiB by default, two or three replays' worth); after that a fresh gateway on warm
   engines learns nothing the engines already hold and routes on `event_miss` (99 % of selections in the branch census

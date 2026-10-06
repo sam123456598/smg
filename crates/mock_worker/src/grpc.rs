@@ -399,6 +399,12 @@ fn load_record(
         age_ms: 0,
         sample,
         load_only: false,
+        // What both reports carry beyond the core (the mock has no
+        // memory, queue, speculative, LoRA or disaggregation sections).
+        cache_hit_rate: Some(snapshot.cache_hit_rate),
+        num_used_tokens: Some(snapshot.num_used_tokens),
+        max_total_num_tokens: Some(snapshot.max_total_num_tokens),
+        ..Default::default()
     }
 }
 
@@ -436,6 +442,10 @@ struct LoadRecords {
     sample: u64,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the item is matched and moved out at once; boxing it would allocate per batch"
+)]
 enum Waited {
     Item(Option<Result<common::KvEventBatch, Status>>),
     Tick,
@@ -447,7 +457,11 @@ impl LoadRecords {
         let snapshot = self.engine.load().as_reported_by(self.like);
         let mut record = load_record(&snapshot, self.like, self.sample);
         record.load_only = load_only;
-        self.last_record = Some(record);
+        // As the Rust relay: telemetry on heartbeats and the first record.
+        if !load_only && self.sample > 1 {
+            smg_grpc_client::engine_load::core_only(&mut record);
+        }
+        self.last_record = Some(record.clone());
         record
     }
 

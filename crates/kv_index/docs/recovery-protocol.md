@@ -551,7 +551,13 @@ need load pushing. Open choices for the policy lane: the field set (the five abo
 backoff, whether a record on a snapshot chunk is wanted (it is the servicer's current load, which is
 fine, but the chunk is not a scheduler step), and whether `GetLoads` stays as the probe for the
 first report and for gauges. The poll stays as the fallback for workers whose servicer predates the
-field.
+field. Built: the gateway's load monitor polls a worker only when no pushing rank of it delivered a
+record within the tick interval (by receipt, not by the record's `sampled_at`), so a servicer that
+pushes is never asked for `GetLoads` while its heartbeats flow and is polled within one interval
+after they stop; `smg_engine_load_polls_total{mode="poll"|"fallback"|"skipped_fresh_push"}` counts
+the decision per worker, and the pushed record carries the engines' telemetry (cache hit rate,
+used and total tokens, memory, queues, speculative, LoRA and disaggregation sections, on the
+heartbeat cadence) so the `smg_engine_*` gauges read the same under pushes as under a poll.
 
 ### 5. Servicer-side changes that need no proto change
 

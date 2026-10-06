@@ -197,7 +197,9 @@ pub struct RouterConfig {
     pub kv_index: KvIndexKind,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
     /// load-aware routing policy is active. Successful routing-owned polls are
-    /// always re-exported without an additional Engine RPC.
+    /// always re-exported without an additional Engine RPC. A worker whose
+    /// KV-event stream pushes its load feeds the gauges from those records
+    /// and is not polled while they flow; the poll is its fallback.
     #[serde(default)]
     pub engine_metrics: bool,
     /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).

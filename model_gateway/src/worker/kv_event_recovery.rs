@@ -357,6 +357,30 @@ mod tests {
         assert_eq!(rank.cursor(), Cursor::Live(6));
     }
 
+    /// A servicer that pushes load records sends `load_only` heartbeats
+    /// with no events and the last sequence it sent. A gateway that predates
+    /// the field (prost drops it) sees a repeat of its cursor: a late
+    /// duplicate, dropped. It is never a restart (that needs a clear, a
+    /// fresh connection below the cursor, a count back at 0 or 1, or a
+    /// sequence a window below) and never a gap, however many arrive.
+    #[test]
+    fn a_repeat_of_the_cursor_is_stale_never_a_restart_or_a_gap() {
+        let mut rank = RankState::default();
+        for seq in 0..=7 {
+            assert_eq!(rank.admit(seq, false), Admission::Apply);
+        }
+        for _ in 0..50 {
+            assert_eq!(rank.admit(7, false), Admission::Stale);
+        }
+        assert_eq!(rank.cursor(), Cursor::Live(7));
+        assert!(rank.replay_pending().is_none());
+        assert_eq!(rank.admit(8, false), Admission::Apply);
+        // After a reconnect too: a repeat of the cursor is not "below" it.
+        rank.reconnected();
+        assert_eq!(rank.admit(8, false), Admission::Stale);
+        assert_eq!(rank.admit(9, false), Admission::Apply);
+    }
+
     #[test]
     fn a_gap_asks_for_one_replay_then_resumes_when_the_server_fills_it() {
         let mut rank = RankState::default();

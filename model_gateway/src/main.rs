@@ -661,6 +661,9 @@ struct CliArgs {
 
     /// Force GetLoads polling for smg_engine_* Prometheus gauges even without
     /// a load-aware routing policy. Routing-owned polls are always re-exported.
+    /// A worker whose KV-event stream pushes its load feeds the gauges from
+    /// those records and is not polled while they flow (GetLoads is the
+    /// fallback).
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
 

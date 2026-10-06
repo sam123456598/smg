@@ -198,14 +198,10 @@ impl crate::kv_events::LoadSource for LoadFromState {
         // The queued token-work is this servicer's estimate for the first
         // rank (see `info::loads`); the other ranks do not report it.
         let estimated = response.loads.first().map(|first| first.dp_rank) == Some(load.dp_rank);
-        Some(crate::kv_events::engine_load(
-            load.num_running_reqs,
-            load.num_waiting_reqs,
-            estimated.then_some(load.num_waiting_uncached_tokens),
-            load.token_usage,
-            load.gen_throughput,
-            load.max_running_requests,
-        ))
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.waiting_uncached_tokens =
+            estimated.then(|| u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        Some(record)
     }
 }
 

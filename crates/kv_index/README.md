@@ -201,7 +201,8 @@ alias of `chain`); `--kv-indexer-ttl-secs`, `--kv-indexer-max-entries` (position
 `--worker-overload-waiting-requests` (8), `--worker-overload-token-usage` (0.8),
 `--worker-overload-shed` (off); `--selection-policy` (`cache-aware-default`,
 `cache-aware-balanced`), `--selection-policy-params`, `--selection-accounting-ttl-ms` (0);
-`--load-monitor-interval` (10).
+`--load-monitor-interval` (10; a `GetLoads` poll goes only to a worker whose KV-event stream pushed no load
+record within the interval, the poll being the fallback for servicers that do not push).
 
 Servicers: `SMG_KV_EVENT_HISTORY_BATCHES` (10,000), `SMG_KV_EVENT_HISTORY_BYTES` (256 MiB),
 `SMG_KV_EVENT_RELAY_START` (`lazy` to subscribe at the first gateway),
