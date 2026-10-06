@@ -12,11 +12,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Write,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
+        Arc, Mutex,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use kv_index::{
@@ -244,6 +246,30 @@ fn scores(index: &ShardedRunIndex, query: &[ContentHash], early_exit: bool) -> B
         .collect()
 }
 
+const READERS: usize = 4;
+/// The run normally ends within seconds; past this the watchdog reports every thread's progress
+/// to the process's stderr and aborts, so a wedged run fails instead of holding a gate.
+const DEADLINE: Duration = Duration::from_secs(300);
+const PHASE_LANES: u8 = 0;
+const PHASE_READERS: u8 = 1;
+const PHASE_DONE: u8 = 2;
+
+/// Write straight to the process's stderr: the test harness holds the test thread's printed
+/// output back until the test ends (its capture sits under the print macros, not under a raw
+/// write), and a report that precedes an abort must come out before it.
+fn shout(message: &str) {
+    let line = format!("{message}\n");
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_else(|| "a non-string panic payload".to_string())
+}
+
 #[test]
 fn concurrent_lanes_and_readers_end_in_the_reference_state() {
     let lanes = 16usize;
@@ -261,14 +287,50 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
     // other lane writes the other index and every lookup merges both.
     let index = ShardedRunIndex::new(shards, 64);
     let clock = AtomicU64::new(0);
-    let stop = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
     let logs: Mutex<Vec<Logged>> = Mutex::new(Vec::new());
-    let reader_lookups = AtomicU64::new(0);
+    let reader_lookups = Arc::new(AtomicU64::new(0));
+    // What the watchdog reports if the run overstays its deadline: steps done per lane, rounds
+    // done per reader and the phase the run is in.
+    let lane_steps: Arc<Vec<AtomicU32>> = Arc::new((0..lanes).map(|_| AtomicU32::new(0)).collect());
+    let reader_rounds: Arc<Vec<AtomicU64>> =
+        Arc::new((0..READERS).map(|_| AtomicU64::new(0)).collect());
+    let phase = Arc::new(AtomicU8::new(PHASE_LANES));
+    let watchdog = {
+        let (lane_steps, reader_rounds, phase) = (
+            Arc::clone(&lane_steps),
+            Arc::clone(&reader_rounds),
+            Arc::clone(&phase),
+        );
+        thread::spawn(move || {
+            let deadline = Instant::now() + DEADLINE;
+            while phase.load(Ordering::Relaxed) != PHASE_DONE {
+                if Instant::now() >= deadline {
+                    let lane_steps: Vec<u32> = lane_steps
+                        .iter()
+                        .map(|s| s.load(Ordering::Relaxed))
+                        .collect();
+                    let reader_rounds: Vec<u64> = reader_rounds
+                        .iter()
+                        .map(|r| r.load(Ordering::Relaxed))
+                        .collect();
+                    shout(&format!(
+                        "concurrency harness: {} s deadline exceeded in phase {} (0 lanes running, 1 lanes joined and readers stopping); steps per lane {lane_steps:?} of {steps}; rounds per reader {reader_rounds:?}; aborting",
+                        DEADLINE.as_secs(),
+                        phase.load(Ordering::Relaxed)
+                    ));
+                    std::process::abort();
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
 
     thread::scope(|scope| {
         let mut lane_threads = Vec::with_capacity(lanes);
         for lane in 0..lanes {
-            let (index, pool, clock, logs) = (&index, &pool, &clock, &logs);
+            let (index, pool, clock, logs, lane_steps) =
+                (&index, &pool, &clock, &logs, &lane_steps);
             let seed = rng.next();
             lane_threads.push(scope.spawn(move || {
                 let worker = index
@@ -288,14 +350,17 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
                 };
                 for _ in 0..steps {
                     state.step();
+                    lane_steps[lane].fetch_add(1, Ordering::Relaxed);
                 }
                 logs.lock().unwrap().extend(state.log);
             }));
         }
-        for reader in 0..4usize {
-            let (index, pool, stop, reader_lookups) = (&index, &pool, &stop, &reader_lookups);
+        let mut reader_threads = Vec::with_capacity(READERS);
+        for reader in 0..READERS {
+            let (index, pool, stop, reader_lookups, reader_rounds) =
+                (&index, &pool, &stop, &reader_lookups, &reader_rounds);
             let seed = rng.next() ^ reader as u64;
-            scope.spawn(move || {
+            reader_threads.push(scope.spawn(move || {
                 let mut rng = Rng::new(seed);
                 while !stop.load(Ordering::Relaxed) {
                     let chain = &pool[rng.below(pool.len())];
@@ -316,18 +381,44 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
                     let early = scores(index, &query, true);
                     assert!(early.values().all(|&score| score == 1));
                     reader_lookups.fetch_add(1, Ordering::Relaxed);
+                    reader_rounds[reader].fetch_add(1, Ordering::Relaxed);
                 }
-            });
+            }));
         }
-        // Lanes are finite; the readers stop once every lane has returned. The log length is
-        // not a completion signal: a removal that finds nothing held logs nothing and the
-        // two-turn store logs twice, so a run whose count ended short of `lanes * steps` waited
-        // here forever with the readers spinning.
-        for lane in lane_threads {
-            lane.join().expect("a lane panicked");
+        // Termination is unconditional. The lanes are finite and joined first; a panic among
+        // them is kept rather than raised here, because raising it would leave the readers
+        // running under a scope that waits for them (a lane's failed assertion then showed as
+        // a hang, its message held back by the test harness's output capture). The readers are
+        // told to stop and joined, and only then is the first panic re-raised. The log length
+        // is not a completion signal: a removal that finds nothing held logs nothing and the
+        // two-turn store logs twice.
+        let mut first_panic = None;
+        for (lane, handle) in lane_threads.into_iter().enumerate() {
+            if let Err(payload) = handle.join() {
+                shout(&format!(
+                    "concurrency harness: lane {lane} panicked: {}",
+                    panic_text(payload.as_ref())
+                ));
+                first_panic.get_or_insert(payload);
+            }
         }
+        phase.store(PHASE_READERS, Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
+        for (reader, handle) in reader_threads.into_iter().enumerate() {
+            if let Err(payload) = handle.join() {
+                shout(&format!(
+                    "concurrency harness: reader {reader} panicked: {}",
+                    panic_text(payload.as_ref())
+                ));
+                first_panic.get_or_insert(payload);
+            }
+        }
+        phase.store(PHASE_DONE, Ordering::Relaxed);
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
     });
+    watchdog.join().expect("the watchdog thread returned");
 
     let mut logs = logs.into_inner().unwrap();
     logs.sort_by_key(|entry| entry.seq);
