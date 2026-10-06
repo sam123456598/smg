@@ -344,6 +344,146 @@ impl Harness {
         self.events += 1;
     }
 
+    /// Store `blocks` after `parent` exactly as given, on both indexers; the outcomes must agree.
+    /// Returns whether the store was accepted.
+    fn store_blocks(
+        &mut self,
+        worker: u32,
+        blocks: &[StoredBlock],
+        parent: Option<SequenceHash>,
+    ) -> bool {
+        let map = self.maps.get_mut(&worker).expect("worker map");
+        let produced = self.production.apply_stored(worker, blocks, parent, map);
+        let referenced = self.reference.apply_stored(worker, blocks, parent);
+        assert_eq!(
+            produced.is_ok(),
+            referenced.is_ok(),
+            "store outcome differs after {} events: production {produced:?}, reference {referenced:?}",
+            self.events
+        );
+        self.events += 1;
+        if produced.is_ok() {
+            self.stored_blocks += blocks.len();
+        }
+        produced.is_ok()
+    }
+
+    /// The engine stores a tail after a parent it names regardless of whether the index still
+    /// holds it (removed, or never stored on this worker): both indexers reject it the same way,
+    /// and the gateway's fallback then files the tail without a parent, at position 0 under the
+    /// tail's own hashes.
+    fn store_tail_under_named_parent(&mut self) {
+        let Some(index) = self.pick_held() else {
+            return;
+        };
+        let worker = if self.rng.chance(1, 4) {
+            self.random_worker()
+        } else {
+            self.held[index].worker
+        };
+        let contents = self.held[index].contents.clone();
+        if contents.len() < 2 {
+            return;
+        }
+        let blocks = blocks_of(&contents);
+        let cut = self.rng.range(1, blocks.len() - 1);
+        let parent = Some(blocks[cut - 1].seq_hash);
+        if !self.store_blocks(worker, &blocks[cut..], parent) && self.rng.chance(3, 4) {
+            self.store_blocks(worker, &blocks[cut..], None);
+        }
+    }
+
+    /// The engine announces a held chain whole, from the root: blocks it filed elsewhere (a
+    /// parentless tail) move back to their positions, blocks already in place stay.
+    fn restore_whole_chain(&mut self) {
+        let Some(index) = self.pick_held() else {
+            return;
+        };
+        let worker = self.held[index].worker;
+        let contents = self.held[index].contents.clone();
+        let blocks = blocks_of(&contents);
+        self.store_blocks(worker, &blocks, None);
+    }
+
+    /// A second or third physical copy of a block the engine already reported: the same store
+    /// again, one block or a run of blocks, under its real parent.
+    fn store_again(&mut self) {
+        let Some(index) = self.pick_held() else {
+            return;
+        };
+        let worker = self.held[index].worker;
+        let contents = self.held[index].contents.clone();
+        let blocks = blocks_of(&contents);
+        let from = self.rng.below(blocks.len());
+        let to = (from + self.rng.range(1, 4)).min(blocks.len());
+        let parent = (from > 0).then(|| blocks[from - 1].seq_hash);
+        self.store_blocks(worker, &blocks[from..to], parent);
+    }
+
+    /// A twin: the same content under the same parent, named by another engine hash (an engine
+    /// whose hash carries more than the chain, or a feed read against the wrong tokens). The
+    /// index files it onto the position it holds and counts the conflict; the reference keeps
+    /// one block per engine hash. `salt` keeps a twin's names distinct per round.
+    fn store_twins(&mut self, salt: u64) -> Vec<SequenceHash> {
+        let Some(index) = self.pick_held() else {
+            return Vec::new();
+        };
+        let worker = self.held[index].worker;
+        let contents = self.held[index].contents.clone();
+        let blocks = blocks_of(&contents);
+        let from = self.rng.below(blocks.len());
+        let to = (from + self.rng.range(1, 6)).min(blocks.len());
+        let twins: Vec<StoredBlock> = blocks[from..to]
+            .iter()
+            .map(|b| StoredBlock {
+                seq_hash: SequenceHash(b.seq_hash.0 ^ salt.rotate_left(17) ^ 0x7777_0000_0000_0001),
+                content_hash: b.content_hash,
+            })
+            .collect();
+        let parent = (from > 0).then(|| blocks[from - 1].seq_hash);
+        if self.store_blocks(worker, &twins, parent) {
+            twins.iter().map(|b| b.seq_hash).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// One step of the wild corpus: the replayed corpus's events plus stores under parents the
+    /// index may not hold, whole-chain re-announcements, repeated stores and, with `twins`,
+    /// twin names; `twin_names` collects twin names for later removal by name.
+    fn step_wild(&mut self, twins: bool, twin_names: &mut Vec<(u32, SequenceHash)>) {
+        let roll = self.rng.below(1000);
+        match roll {
+            0..=599 => self.step(),
+            600..=729 => self.store_tail_under_named_parent(),
+            730..=809 => self.restore_whole_chain(),
+            810..=889 => self.store_again(),
+            890..=949 => {
+                if twins {
+                    let salt = self.rng.next();
+                    let worker = self.held.last().map_or(0, |h| h.worker);
+                    let names = self.store_twins(salt);
+                    twin_names.extend(names.into_iter().map(|n| (worker, n)));
+                } else {
+                    self.remove_middle();
+                }
+            }
+            950..=979 => {
+                // Remove a twin by its own name, or the original name under a twin.
+                if !twin_names.is_empty() && self.rng.chance(1, 2) {
+                    let at = self.rng.below(twin_names.len());
+                    let (worker, name) = twin_names.swap_remove(at);
+                    if self.maps.contains_key(&worker) {
+                        self.remove(worker, &[name]);
+                    }
+                } else {
+                    self.remove_tail();
+                }
+            }
+            _ => self.clear_worker(),
+        }
+    }
+
     fn step(&mut self) {
         let roll = self.rng.below(1000);
         match roll {
@@ -732,4 +872,115 @@ fn holes_heal_independently() {
     agree(&production, &reference, &held);
     assert_eq!(reference.find_matches(&held).get(&worker), Some(&24));
     assert_eq!(production.debug_blocks(), reference.blocks());
+}
+
+/// The production index against the reference after every few events of a wild corpus: stores
+/// under parents the worker no longer holds (and the gateway's parentless fallback after the
+/// rejection), whole chains announced again from the root, repeated stores of held blocks,
+/// tails, holes, clears and worker churn, from several seeds. The full state is compared every
+/// 16 events, the lookups every 64, the counters at the end. Scale with
+/// `KV_INDEX_WILD_EVENTS` (default 3000 per seed) and `KV_INDEX_WILD_SEEDS` (default 6).
+#[test]
+fn wild_event_sequences_match_the_reference_at_every_step() {
+    let events = env_or("KV_INDEX_WILD_EVENTS", 3000) as usize;
+    let seeds = env_or("KV_INDEX_WILD_SEEDS", 6);
+    let base = env_or("KV_INDEX_EXACTNESS_SEED", 20261006);
+    for seed in 0..seeds {
+        let mut harness = Harness::new(base.wrapping_add(seed.wrapping_mul(0x9e37)), 6);
+        let mut mismatches = Mismatches::default();
+        let mut twin_names = Vec::new();
+        let label = format!("wild seed {seed}");
+        while harness.events < events {
+            let before = harness.events;
+            harness.step_wild(false, &mut twin_names);
+            if harness.events == before {
+                continue;
+            }
+            if harness.events.is_multiple_of(16) {
+                let produced = harness.production.debug_blocks();
+                let expected = harness.reference.blocks();
+                assert!(
+                    produced == expected,
+                    "{label}: state differs after {} events: {} reference blocks, {} production blocks; missing e.g. {:?}; phantom e.g. {:?}",
+                    harness.events,
+                    expected.len(),
+                    produced.len(),
+                    expected.difference(&produced).take(4).collect::<Vec<_>>(),
+                    produced.difference(&expected).take(4).collect::<Vec<_>>()
+                );
+            }
+            if harness.events.is_multiple_of(64) {
+                harness.lookups(&mut mismatches);
+            }
+        }
+        harness.lookups(&mut mismatches);
+        assert_exact(&harness, &mismatches, &label);
+        assert_eq!(
+            harness.production.stats().engine_conflicts,
+            0,
+            "{label}: no twins in this corpus"
+        );
+    }
+}
+
+/// The same corpus with twins (one position named by two engine hashes): the index files a
+/// twin onto the position it holds and counts the conflict, so it holds at most what the
+/// reference holds and scores no worker higher than the reference does; removals by either
+/// name, stores under either name and the cut-and-join they lead to must never panic.
+#[test]
+fn twins_never_panic_and_never_overstate_the_reference() {
+    let events = env_or("KV_INDEX_WILD_EVENTS", 3000) as usize;
+    let seeds = env_or("KV_INDEX_WILD_SEEDS", 6);
+    let base = env_or("KV_INDEX_EXACTNESS_SEED", 20261006);
+    for seed in 0..seeds {
+        let mut harness = Harness::new(base.wrapping_add(seed.wrapping_mul(0x51f1)), 6);
+        let mut twin_names = Vec::new();
+        let label = format!("twins seed {seed}");
+        while harness.events < events {
+            let before = harness.events;
+            harness.step_wild(true, &mut twin_names);
+            if harness.events == before {
+                continue;
+            }
+            if harness.events.is_multiple_of(16) {
+                let produced = harness.production.debug_blocks();
+                let expected = harness.reference.blocks();
+                let phantom: Vec<_> = produced.difference(&expected).take(4).collect();
+                assert!(
+                    phantom.is_empty(),
+                    "{label}: production holds blocks the reference does not after {} events: {phantom:?}",
+                    harness.events
+                );
+                for (&worker, map) in &harness.maps {
+                    assert!(
+                        harness.production.worker_block_count(worker) <= map.len(),
+                        "{label}: worker {worker} credited beyond its lane map after {} events",
+                        harness.events
+                    );
+                }
+            }
+            if harness.events.is_multiple_of(64) {
+                for _ in 0..4 {
+                    let Some(index) = harness.pick_held() else {
+                        break;
+                    };
+                    let query = harness.held[index].contents.clone();
+                    let produced = harness.production_scores(&query);
+                    let expected = harness.reference.find_matches(&query);
+                    for (worker, score) in &produced {
+                        assert!(
+                            expected.get(worker).is_some_and(|e| e >= score),
+                            "{label}: worker {worker} scores {score} in production against {:?} in the reference after {} events",
+                            expected.get(worker),
+                            harness.events
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            harness.production.stats().engine_conflicts > 0,
+            "{label}: the corpus produced no twin"
+        );
+    }
 }

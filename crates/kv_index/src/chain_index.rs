@@ -49,6 +49,16 @@
 //! a store that fails it (`landing_mismatches`) is placed by its content, block by block. A
 //! worker whose engine names the same content by other hashes (`engine_conflicts` in the stats)
 //! is matched by content too; its own hashes key its lane map, so nothing else changes for it.
+//! The index therefore assumes one engine hash per worker per (parent, content) position. A
+//! second name for a position the worker holds (a twin) is filed onto that position and
+//! counted, not stored twice: the worker still scores the position, but once the first name is
+//! removed the position goes with it while the second name is still in the lane map, and a
+//! store under that name cuts the run at the parent and goes on after it (`store_in_run`). The
+//! reference indexer keeps a position until its last name goes, so under twins the index holds
+//! at most what the reference holds and never scores a worker above it (the exactness suite's
+//! twins test); the normalizer guarantees one name per position for vLLM, whose hash is the
+//! chain hash, so the count stays zero in the gateway, and a reading of sliding-window events
+//! against the wrong tokens is what produced thousands of them in an offline capture.
 //! A lane-map slot carries its key: a probe is settled in the map itself, with no read into the
 //! index per block (key-less 8-byte slots checked through the index cost 30-40% of lane CPU).
 //!
