@@ -3,8 +3,8 @@
 //! an index populated to 128 workers, for the positional indexer and the chain
 //! index (`--kv-index`).
 //!
-//! The index is fed through the KV event monitor's own apply path: the
-//! recorded vLLM stream under `crates/engine_servicer/tests/fixtures/captured`
+//! The index is fed through the KV event monitor's own apply path: the mock
+//! engine's vLLM-shaped stream (`mock_streams`, the exactness tests' generator)
 //! into every worker, then a synthetic fleet state shaped like Mooncake
 //! conversation traffic (sessions of 8 to 512 blocks, most starting with one of
 //! a few shared chat-template prefixes, each session resident on one to four
@@ -33,20 +33,13 @@
 use std::{
     fs,
     hint::black_box,
-    io::Read,
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use criterion::Criterion;
-use engine_servicer::kv_wire::{Normalizer, WireBatch};
-use engine_zmq_client::codec::TrailingTolerant;
-use flate2::read::GzDecoder;
 use kv_index::{compute_content_hash, compute_request_content_hashes, request_prefix_hashes};
 use openai_protocol::worker::HealthCheckConfig;
-use serde::Deserialize;
 use smg::{
     config::KvIndexKind,
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
@@ -58,6 +51,15 @@ use smg::{
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
+
+/// The exactness tests' stream generator, by path: the mock engine's streams
+/// through the relay's decoder and normalizer.
+#[path = "../src/worker/kv_index_backend/mock_streams.rs"]
+#[expect(
+    dead_code,
+    reason = "the bench takes the payloads; the exactness tests the checkpoints and prompts too"
+)]
+mod mock_streams;
 
 const BLOCK: usize = 16;
 /// Workers whose model id is empty route under this key.
@@ -190,39 +192,10 @@ impl Sessions {
     }
 }
 
-#[derive(Deserialize)]
-struct CaptureLine {
-    payload_b64: String,
-}
-
-/// The recorded vLLM stream as the relay forwards it.
-fn recorded_batches() -> Vec<KvEventBatch> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-        "../crates/engine_servicer/tests/fixtures/captured/vllm/qwen3-0.6b-vllm0.31-capture.jsonl.gz",
-    );
-    let Ok(file) = fs::File::open(&path) else {
-        eprintln!(
-            "no recorded capture at {}; synthetic fleet only",
-            path.display()
-        );
-        return Vec::new();
-    };
-    let mut text = String::new();
-    GzDecoder::new(file).read_to_string(&mut text).unwrap();
-    let mut normalizer = Normalizer::new();
-    let mut event_id = 0;
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-        .map(|(seq, line)| {
-            let line: CaptureLine = serde_json::from_str(line).unwrap();
-            let bytes = BASE64.decode(line.payload_b64).unwrap();
-            let batch = rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&bytes)
-                .unwrap()
-                .0;
-            normalizer.normalize_batch(batch, seq as u64, &mut event_id)
-        })
-        .collect()
+/// The engine stream every worker starts from: the mock engine's vLLM-shaped
+/// run, as the relay forwards it.
+fn engine_batches() -> Vec<KvEventBatch> {
+    mock_streams::Stream::generate(mock_streams::Shape::Vllm, 1, 320).normalized()
 }
 
 fn rss_mb() -> f64 {
@@ -256,7 +229,7 @@ fn setup(kind: KvIndexKind, worker_count: usize, blocks_per_worker: usize) -> Se
     // One seed for both backends: the same fleet, the same requests.
     let mut rng = Rng(1);
     let sessions = Sessions::generate(&mut rng, worker_count * 48);
-    let recorded = recorded_batches();
+    let engine_stream = engine_batches();
 
     let index = Arc::new(KvIndex::new(kind, 64));
     let workers: Vec<Arc<dyn Worker>> = (0..worker_count)
@@ -273,7 +246,7 @@ fn setup(kind: KvIndexKind, worker_count: usize, blocks_per_worker: usize) -> Se
         })
         .collect();
     // Every session lives on one to four workers; each worker is filled to
-    // its budget from the sessions assigned to it, the recorded stream first.
+    // its budget from the sessions assigned to it, the engine stream first.
     let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); worker_count];
     for (s, _) in sessions.chains.iter().enumerate() {
         let holders = 1 + rng.below(4);
@@ -284,7 +257,7 @@ fn setup(kind: KvIndexKind, worker_count: usize, blocks_per_worker: usize) -> Se
     let mut memberships = 0usize;
     for (w, worker) in workers.iter().enumerate() {
         let mut feed = IndexFeed::new(&index, worker.url()).unwrap();
-        for batch in &recorded {
+        for batch in &engine_stream {
             feed.apply(&index, batch);
         }
         let mut budget = blocks_per_worker;

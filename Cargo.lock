@@ -7578,7 +7578,6 @@ dependencies = [
  "engine-servicer",
  "engine-zmq-adapter",
  "engine-zmq-client",
- "flate2",
  "futures",
  "futures-util",
  "http",

@@ -1138,10 +1138,10 @@ async fn execute_sequential_pd(
     // on the decode read).
     //
     // A decode worker started with `--language-model-only` (the production
-    // vLLM P/D shape — Dynamo pairs the same way) has no vision encoder and
+    // vLLM P/D shape) has no vision encoder and
     // an encoder-cache budget of 0, so even the identity payload fails to
     // schedule there. Its model info reports supports_vision=false; for such
-    // a worker the decode leg is stripped down to the Dynamo contract: the
+    // a worker the decode leg is stripped down to what such an engine takes: the
     // prefill-expanded input_ids, the KV handoff, and the per-image content
     // hashes that the servicer folds into cache_salt so different images
     // cannot alias in the decode prefix cache.

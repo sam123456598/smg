@@ -1539,7 +1539,7 @@ impl ProtoGenerateRequest {
     /// every multimodal payload beyond the content hashes goes: pixels,
     /// placeholders, grid tensors and media references. The decode engine
     /// then sees a pure-text TokensPrompt and never touches its (zero-budget)
-    /// encoder cache, mirroring the Dynamo P/D contract; the kept hashes ride
+    /// encoder cache, as the language-model-only P/D contract requires; the kept hashes ride
     /// into `cache_salt` servicer-side so different images cannot alias in
     /// the decode prefix cache. Non-vLLM backends have no language-model-only
     /// mode, so they take the pixel-stripping clone.

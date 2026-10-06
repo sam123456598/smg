@@ -188,12 +188,10 @@ wasmtime-wasi = { workspace = true }
 lru = { workspace = true }
 wat = "1.252"
 zip = "8.6"
-# The KV-index exactness tests replay the recorded engine streams under
-# crates/engine_servicer/tests/fixtures/captured through the relay's decoder
-# and normalizer into the gateway's index backends.
+# The KV-index exactness tests and the decision bench run the mock engine's
+# streams through the relay's decoder and normalizer into the gateway's index.
 engine-servicer.workspace = true
 rmp-serde.workspace = true
-flate2 = "1"
 
 [[bench]]
 name = "wasm_middleware_latency"

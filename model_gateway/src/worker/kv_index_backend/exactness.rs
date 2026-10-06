@@ -1,46 +1,42 @@
-//! Exactness of the gateway's index backends (`docs/kv-router-leap.md`,
+//! Exactness of the gateway's index backends (`crates/kv_index/docs/kv-router-leap.md`,
 //! guardrails 1 to 3): the positional indexer and the chain index, fed through
 //! the monitor's own apply path, must answer every lookup exactly as the
 //! reference indexer does, after every batch, and hold exactly the same blocks.
 //!
-//! Two corpora. The recorded engine streams under
-//! `crates/engine_servicer/tests/fixtures/captured` (vLLM, SGLang, SGLang with
-//! two data-parallel ranks, SGLang HiCache with host copies) go through the
-//! relay's decoder and normalizer, then through `KvEventMonitor::apply_event`,
-//! so what reaches the index is what reaches it in production. A seeded
-//! synthetic corpus then does what the captures do too little of: holes
-//! (evictions in the middle or at the head of a chain the engine keeps using),
-//! heals (the missing block stored again after its parent), divergent
-//! siblings sharing a prefix, duplicate physical copies, host-tier copies,
-//! clears and worker removals, over several workers at once.
+//! Two corpora. Engine streams generated in-process by the mock engine
+//! (`mock_streams`: a vLLM-shaped run with a restart, an SGLang-shaped run,
+//! two data-parallel ranks merged by receive order, and a run with a host
+//! tier) leave the engine on its publisher wire and go through the relay's
+//! decoder and normalizer, then through `KvEventMonitor::apply_event`, so
+//! what reaches the index is what reaches it in production; at every
+//! checkpoint the backends must also predict for every prompt the hit the
+//! engine itself holds. A seeded synthetic corpus then does what an engine's
+//! own stream does too little of: holes (evictions in the middle or at the
+//! head of a chain the engine keeps using), heals (the missing block stored
+//! again after its parent), divergent siblings sharing a prefix, duplicate
+//! physical copies, host-tier copies, clears and worker removals, over
+//! several workers at once.
 //!
 //! The request set replayed against the indexes is built from the chains the
 //! events describe: every chain in full, its first half, a copy with the middle
 //! block replaced, one with the last block replaced, one extended by a block
 //! nobody stored, and a request nobody stored at all.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use engine_servicer::kv_wire::{Normalizer, WireBatch};
-use engine_zmq_client::codec::TrailingTolerant;
-use flate2::read::GzDecoder;
 use kv_index::{
     compute_content_hash, compute_request_content_hashes, request_prefix_hashes, ContentHash,
     SequenceHash,
 };
-use serde::Deserialize;
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent,
     KvCacheTier, KvEventBatch,
 };
 
-use super::KvIndex;
+use super::{
+    mock_streams::{self, Shape, Stream},
+    KvIndex,
+};
 use crate::worker::kv_event_monitor::{KvEventMonitor, WorkerIndexState};
 
 // ---------------------------------------------------------------------------
@@ -181,6 +177,37 @@ impl Trio {
             );
         }
     }
+
+    /// Every backend predicts for every prompt the hit the engine holds: the
+    /// prompt's leading blocks the worker has, by the engine's own count at
+    /// the checkpoint. Returns the prompts checked.
+    fn agree(
+        &mut self,
+        worker: &str,
+        prompts: &BTreeSet<Vec<u32>>,
+        held: &HashSet<u64>,
+        label: &str,
+    ) -> usize {
+        for prompt in prompts {
+            let want = Stream::prefix_match(held, prompt) as u32;
+            let hashes = compute_request_content_hashes(prompt, mock_streams::BLOCK);
+            for backend in &self.backends {
+                let got = backend
+                    .scores(&hashes, false)
+                    .get(worker)
+                    .copied()
+                    .unwrap_or(0);
+                assert_eq!(
+                    got,
+                    want,
+                    "{label}: {} predicts {got} cached blocks of a prompt the engine holds {want} of",
+                    backend.index.name()
+                );
+            }
+            self.lookups += self.backends.len();
+        }
+        prompts.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,61 +251,12 @@ fn query_set(chains: &BTreeSet<Vec<ContentHash>>) -> Vec<Vec<ContentHash>> {
 }
 
 // ---------------------------------------------------------------------------
-// Recorded engine streams
+// Engine streams
 // ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct CaptureLine {
-    recv_ts: f64,
-    payload_b64: String,
-}
-
-fn captures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/engine_servicer/tests/fixtures/captured")
-}
-
-/// The publisher payloads of one capture file, in file order, with receive
-/// times.
-fn load_capture(path: &Path) -> Vec<(f64, WireBatch)> {
-    let file = fs::File::open(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    let mut text = String::new();
-    GzDecoder::new(file)
-        .read_to_string(&mut text)
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let line: CaptureLine = serde_json::from_str(line).expect("a capture line");
-            let bytes = BASE64.decode(line.payload_b64).expect("base64 payload");
-            let batch = rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&bytes)
-                .expect("a msgpack KVEventBatch")
-                .0;
-            (line.recv_ts, batch)
-        })
-        .collect()
-}
-
-/// A capture's streams merged by receive time and normalized as the relay
-/// would forward them: one worker, batches carrying their rank.
-fn normalized_capture(files: &[&str]) -> Vec<KvEventBatch> {
-    let dir = captures_dir();
-    let mut lines: Vec<(f64, WireBatch)> = files
-        .iter()
-        .flat_map(|file| load_capture(&dir.join(file)))
-        .collect();
-    lines.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut normalizer = Normalizer::new();
-    let mut event_id = 0;
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(seq, (_, batch))| normalizer.normalize_batch(batch, seq as u64, &mut event_id))
-        .collect()
-}
 
 /// Chains the stores of a stream describe, as a request would hash them:
 /// each store's blocks appended to the chain of its parent block. Only plain
-/// (unsalted, non-LoRA) stores, which is all the captures carry.
+/// (unsalted, non-LoRA) stores, which is all the engine's stores carry.
 #[derive(Default)]
 struct Chains {
     /// Engine hash of a block -> the token chain from the root through it.
@@ -295,7 +273,7 @@ impl Chains {
             };
             assert!(
                 stored.lora_name.is_none() && stored.cache_salt.is_none(),
-                "the captures carry no namespace"
+                "the engine's stores carry no namespace"
             );
             let mut chain = stored
                 .parent_block_hash
@@ -316,59 +294,271 @@ impl Chains {
     }
 }
 
-fn replay_capture(label: &str, files: &[&str]) -> usize {
-    let batches = normalized_capture(files);
-    assert!(!batches.is_empty(), "{label}: nothing decoded");
+/// What a stream carried, by its normalized batches: each shape's claims are
+/// checked against these counts.
+#[derive(Debug, Default)]
+struct Carried {
+    stored: usize,
+    removed: usize,
+    cleared: usize,
+    /// The ranks that stored blocks.
+    ranks: BTreeSet<Option<i32>>,
+    /// Stores of a block its rank already held: second physical copies.
+    second_copies: usize,
+    /// Device removals that left a copy on the same rank: the block stays.
+    pinned_by_copy: usize,
+    /// Stores of a block another rank held at the time.
+    shared_across_ranks: usize,
+    host_stored: usize,
+    host_removed: usize,
+    /// Device removals of a block the host still held: the block stays.
+    pinned_by_host: usize,
+    /// Host removals of a block no device copy was left of: the block goes.
+    last_copy: usize,
+}
+
+/// The copies a stream has announced so far: per rank and block on the
+/// device, and the blocks on the host.
+#[derive(Default)]
+struct Copies {
+    device: HashMap<Option<i32>, HashMap<i64, u32>>,
+    host: HashSet<i64>,
+}
+
+impl Copies {
+    fn on_device(&self, hash: i64) -> bool {
+        self.device.values().any(|held| held.contains_key(&hash))
+    }
+}
+
+impl Carried {
+    fn count(batches: &[KvEventBatch]) -> Self {
+        let mut carried = Self::default();
+        let mut copies = Copies::default();
+        for batch in batches {
+            for event in &batch.events {
+                match &event.data {
+                    Some(kv_cache_event::Data::Stored(stored)) => {
+                        carried.note_stored(&mut copies, batch.dp_rank, stored);
+                    }
+                    Some(kv_cache_event::Data::Removed(removed)) => {
+                        carried.note_removed(&mut copies, batch.dp_rank, removed);
+                    }
+                    Some(kv_cache_event::Data::Cleared(_)) => {
+                        carried.cleared += 1;
+                        copies = Copies::default();
+                    }
+                    None => {}
+                }
+            }
+        }
+        carried
+    }
+
+    fn note_stored(&mut self, copies: &mut Copies, rank: Option<i32>, stored: &KvBlocksStored) {
+        let hashes = stored.blocks.iter().map(|block| block.block_hash);
+        if is_host(stored.tier) {
+            self.host_stored += 1;
+            copies.host.extend(hashes);
+            return;
+        }
+        self.stored += 1;
+        self.ranks.insert(rank);
+        for hash in hashes {
+            if copies
+                .device
+                .iter()
+                .any(|(other, held)| *other != rank && held.contains_key(&hash))
+            {
+                self.shared_across_ranks += 1;
+            }
+            let count = copies
+                .device
+                .entry(rank)
+                .or_default()
+                .entry(hash)
+                .or_insert(0);
+            if *count > 0 {
+                self.second_copies += 1;
+            }
+            *count += 1;
+        }
+    }
+
+    fn note_removed(&mut self, copies: &mut Copies, rank: Option<i32>, removed: &KvBlocksRemoved) {
+        if is_host(removed.tier) {
+            self.host_removed += 1;
+            for hash in &removed.block_hashes {
+                copies.host.remove(hash);
+                if !copies.on_device(*hash) {
+                    self.last_copy += 1;
+                }
+            }
+            return;
+        }
+        self.removed += 1;
+        let held = copies.device.entry(rank).or_default();
+        for hash in &removed.block_hashes {
+            if let Some(count) = held.get_mut(hash) {
+                *count -= 1;
+                if *count > 0 {
+                    self.pinned_by_copy += 1;
+                } else {
+                    held.remove(hash);
+                }
+            }
+            if copies.host.contains(hash) {
+                self.pinned_by_host += 1;
+            }
+        }
+    }
+}
+
+fn is_host(tier: Option<i32>) -> bool {
+    tier == Some(KvCacheTier::Host as i32)
+}
+
+/// What a replayed stream established.
+struct Replayed {
+    carried: Carried,
+    /// Ranks that published payloads.
+    publishers: usize,
+    checkpoints: usize,
+    lookups: usize,
+    agreements: usize,
+}
+
+impl Replayed {
+    /// Enough of the stream was checked: the engine was caught up at enough
+    /// checkpoints, and every one compared the whole query set and every
+    /// prompt.
+    fn assert_coverage(&self) {
+        assert!(
+            self.checkpoints >= 16,
+            "{} checkpoints with the engine caught up",
+            self.checkpoints
+        );
+        assert!(self.lookups > 100_000, "{} lookups compared", self.lookups);
+        assert!(
+            self.agreements > 5_000,
+            "{} hits predicted",
+            self.agreements
+        );
+    }
+}
+
+/// One engine stream through the monitor into every backend. At every
+/// checkpoint the backends answer the query set as the reference does, hold
+/// its blocks, and predict for every prompt the hit the engine holds.
+fn replay_stream(shape: Shape, seed: u64, requests: usize) -> Replayed {
+    let stream = Stream::generate(shape, seed, requests);
+    let batches = stream.normalized();
+    let label = shape.name();
+    assert_eq!(
+        batches.len(),
+        stream.payloads.len(),
+        "{label}: every payload decodes"
+    );
     let worker = format!("grpc://{label}");
     let mut trio = Trio::new();
     trio.add_worker(&worker);
+    let prompts: BTreeSet<Vec<u32>> = stream.prompts.iter().cloned().collect();
     let mut chains = Chains::default();
+    let mut checkpoints = stream.checkpoints.iter().peekable();
+    let mut agreements = 0;
     for (index, batch) in batches.iter().enumerate() {
         chains.note(batch);
         trio.apply(&worker, batch);
-        trio.check(&query_set(&chains.seen), &format!("{label} batch {index}"));
+        while let Some(checkpoint) = checkpoints.next_if(|checkpoint| checkpoint.after == index + 1)
+        {
+            let at = format!("{label} batch {index}");
+            trio.check(&query_set(&chains.seen), &at);
+            agreements += trio.agree(&worker, &prompts, &checkpoint.held, &at);
+        }
     }
     assert!(
-        trio.backends[0].index.current_size() > 0 || label.contains("hicache"),
-        "{label}: the stream left nothing indexed"
+        checkpoints.next().is_none(),
+        "{label}: a checkpoint past the stream"
     );
-    trio.lookups
+    let publishers: BTreeSet<usize> = stream.payloads.iter().map(|payload| payload.rank).collect();
+    Replayed {
+        carried: Carried::count(&batches),
+        publishers: publishers.len(),
+        checkpoints: stream.checkpoints.len(),
+        lookups: trio.lookups,
+        agreements,
+    }
 }
 
 #[test]
-fn vllm_capture_scores_identically_on_every_backend() {
-    let lookups = replay_capture("vllm", &["vllm/qwen3-0.6b-vllm0.31-capture.jsonl.gz"]);
-    assert!(lookups > 10_000, "{lookups} lookups compared");
+fn vllm_stream_scores_as_the_reference_and_predicts_the_engine_hit() {
+    let replayed = replay_stream(Shape::Vllm, 1, 320);
+    let carried = &replayed.carried;
+    assert!(
+        carried.stored >= 500 && carried.removed >= 300,
+        "{carried:?}"
+    );
+    assert_eq!(carried.cleared, 1, "the restart's clear: {carried:?}");
+    assert!(
+        carried.second_copies >= 100 && carried.pinned_by_copy >= 30,
+        "second physical copies and the removals they survived: {carried:?}"
+    );
+    assert_eq!(replayed.publishers, 1);
+    replayed.assert_coverage();
 }
 
 #[test]
-fn sglang_capture_scores_identically_on_every_backend() {
-    let lookups = replay_capture(
-        "sglang",
-        &["sglang/qwen3-0.6b-sglang0.5.21-capture.jsonl.gz"],
+fn sglang_stream_scores_as_the_reference_and_predicts_the_engine_hit() {
+    let replayed = replay_stream(Shape::Sglang, 2, 320);
+    let carried = &replayed.carried;
+    assert!(
+        carried.stored >= 500 && carried.removed >= 300,
+        "{carried:?}"
     );
-    assert!(lookups > 10_000, "{lookups} lookups compared");
+    assert_eq!(carried.cleared, 0, "{carried:?}");
+    assert_eq!(replayed.publishers, 1);
+    replayed.assert_coverage();
 }
 
 #[test]
-fn sglang_two_rank_capture_scores_identically_on_every_backend() {
-    let lookups = replay_capture(
-        "sglang-dp2",
-        &[
-            "sglang-dp2/qwen3-0.6b-sglang0.5.21-dp2-rank0-capture.jsonl.gz",
-            "sglang-dp2/qwen3-0.6b-sglang0.5.21-dp2-rank1-capture.jsonl.gz",
-        ],
+fn two_rank_stream_scores_as_the_reference_and_predicts_the_engine_hit() {
+    let replayed = replay_stream(Shape::TwoRank, 3, 400);
+    let carried = &replayed.carried;
+    assert_eq!(
+        carried.ranks,
+        BTreeSet::from([Some(0), Some(1)]),
+        "{carried:?}"
     );
-    assert!(lookups > 1_000, "{lookups} lookups compared");
+    assert!(
+        carried.shared_across_ranks >= 200,
+        "blocks held by both ranks: {carried:?}"
+    );
+    assert!(
+        carried.stored >= 500 && carried.removed >= 300,
+        "{carried:?}"
+    );
+    assert_eq!(replayed.publishers, 2, "both ranks published");
+    replayed.assert_coverage();
 }
 
 #[test]
-fn sglang_hicache_capture_scores_identically_on_every_backend() {
-    let lookups = replay_capture(
-        "sglang-hicache",
-        &["sglang-hicache/qwen3-0.6b-sglang0.5.21-hicache-capture.jsonl.gz"],
+fn host_tier_stream_scores_as_the_reference_and_predicts_the_engine_hit() {
+    let replayed = replay_stream(Shape::HostTier, 4, 320);
+    let carried = &replayed.carried;
+    assert!(
+        carried.host_stored >= 1000 && carried.host_removed >= 1000,
+        "{carried:?}"
     );
-    assert!(lookups > 1_000, "{lookups} lookups compared");
+    assert!(
+        carried.pinned_by_host >= 1000,
+        "device removals the host copy survived: {carried:?}"
+    );
+    assert!(
+        carried.last_copy >= 1000,
+        "host removals that took the last copy: {carried:?}"
+    );
+    assert_eq!(replayed.publishers, 1);
+    replayed.assert_coverage();
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +1090,67 @@ fn a_hash_stored_again_at_its_true_position_after_a_fallback() {
             "{name}: a fresh worker holds nothing"
         );
         assert_eq!(backend.counts()["grpc://w9:9000"], 0, "{name}");
+    }
+}
+
+/// A second physical copy of a block arrives inside a longer store under the
+/// same parent (its first blocks second copies, the rest first copies), as
+/// vLLM publishes one; a removal takes one copy. The block stays, and a
+/// lookup through it still hits, until its last copy goes.
+#[test]
+fn a_second_copy_inside_a_longer_store_pins_the_block_until_its_last_removal() {
+    let mut trio = Trio::new();
+    let worker = "grpc://w0:9000";
+    trio.add_worker(worker);
+    let token_blocks = Corpus::new(9, 1).fresh_blocks(7);
+    let blocks = chain_of(&token_blocks);
+    let contents: Vec<ContentHash> = token_blocks
+        .iter()
+        .map(|tokens| compute_content_hash(tokens))
+        .collect();
+    // The preamble b0..b3; b4 b5 under b3; then b4 b5 b6 under b3: second
+    // copies of b4 and b5 and the first copy of b6.
+    trio.apply(worker, &batch(vec![stored(None, &blocks[..4], None)]));
+    trio.apply(
+        worker,
+        &batch(vec![stored(Some(blocks[3].hash), &blocks[4..6], None)]),
+    );
+    trio.apply(
+        worker,
+        &batch(vec![stored(Some(blocks[3].hash), &blocks[4..7], None)]),
+    );
+    let queries = [contents[..6].to_vec(), contents.clone()];
+    trio.check(&queries, "two copies");
+    // One copy each of b5 and b4 goes, tail first: the chain still hits
+    // through b6.
+    trio.apply(
+        worker,
+        &batch(vec![removed(vec![blocks[5].hash, blocks[4].hash], None)]),
+    );
+    trio.check(&queries, "one copy left");
+    for backend in &trio.backends {
+        let name = backend.index.name();
+        assert_eq!(
+            backend.scores(&contents, false).get(worker),
+            Some(&7),
+            "{name}: the whole chain hits with one copy of b4 and b5 left"
+        );
+        assert_eq!(backend.counts()[worker], 7, "{name}");
+    }
+    // The last copies go: the chain is cut at b4; b6 stays, unreachable.
+    trio.apply(
+        worker,
+        &batch(vec![removed(vec![blocks[5].hash, blocks[4].hash], None)]),
+    );
+    trio.check(&queries, "no copy left");
+    for backend in &trio.backends {
+        let name = backend.index.name();
+        assert_eq!(
+            backend.scores(&contents, false).get(worker),
+            Some(&4),
+            "{name}: the chain is cut at b4"
+        );
+        assert_eq!(backend.counts()[worker], 5, "{name}: the preamble and b6");
     }
 }
 
