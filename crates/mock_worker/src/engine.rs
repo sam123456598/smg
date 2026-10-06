@@ -1251,6 +1251,18 @@ impl BlockPool {
         }
     }
 
+    /// Drop the references a finished (or preempted) request holds, tail
+    /// block first, so the head of its prefix carries the newest LRU stamp
+    /// and outlives its tail. vLLM's `free()` appends a request's blocks to
+    /// the free queue in reverse order for the same reason: a later repeat of
+    /// the prefix still finds its first blocks, and the chain behind a lost
+    /// head would be unhittable anyway.
+    fn unref_request(&mut self, held: &[u64]) {
+        for h in held.iter().rev() {
+            self.unref(*h);
+        }
+    }
+
     /// Evict the least recently idle cached block; returns its hash.
     fn evict_lru(&mut self) -> Option<u64> {
         let &(t, h) = self.free_lru.iter().next()?;
@@ -1817,9 +1829,7 @@ impl SchedulerState {
     /// were private and simply free.
     fn release(&mut self, r: &RunningReq, p: &EngineParams) {
         if p.prefix_cache {
-            for h in &r.held {
-                self.pool.unref(*h);
-            }
+            self.pool.unref_request(&r.held);
         } else {
             self.pool.release_anonymous(r.held.len() as u64);
         }
@@ -2713,6 +2723,27 @@ mod tests {
         assert_eq!(stored[0].blocks.len(), 1, "only the third block is new");
         let second_key = Engine::block_keys(&(0..8).collect::<Vec<_>>(), 4)[1];
         assert_eq!(stored[0].parent_block_hash, Some(second_key as i64));
+    }
+
+    #[test]
+    fn a_finished_request_frees_its_blocks_tail_first() {
+        // Request A held blocks 1-4; request B shared the prefix 1-2 and added 5.
+        let mut pool = BlockPool {
+            allocated: 5,
+            ..Default::default()
+        };
+        for h in 1..=4u64 {
+            assert!(pool.register(h));
+        }
+        pool.hit(1);
+        pool.hit(2);
+        assert!(pool.register(5));
+        pool.unref_request(&[1, 2, 3, 4]);
+        pool.unref_request(&[1, 2, 5]);
+        // Tails go first, the shared prefix head last: 4, 3 (A's tail), then
+        // 5 (B's tail), then 2, then 1.
+        let order: Vec<u64> = std::iter::from_fn(|| pool.evict_lru()).collect();
+        assert_eq!(order, vec![4, 3, 5, 2, 1]);
     }
 
     #[test]
