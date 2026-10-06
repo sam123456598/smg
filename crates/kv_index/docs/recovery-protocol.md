@@ -267,7 +267,15 @@ failed round trip and exposes them as metrics.
   metrics endpoint): `relayed`, `undecodable_batches`, `served_from_history`, `served_snapshots`,
   `out_of_range`, `publisher_gaps`, `gap_batches_recovered`, `gap_batches_lost`,
   `publisher_restarts`, `subscribers_lagged`; a served snapshot logs one info line with the cut,
-  the block and entry counts and the microseconds the lock was held. Read them next to the
+  the block and entry counts and the microseconds the lock was held. Cost of the record, measured
+  by `crates/engine_servicer/benches/kv_relay_apply.rs` (release build, Grace host, cores shared
+  with other builds, 8 ranks x 676k live blocks, batches of a 64-block chain of 1,024 tokens):
+  resident set 906 MiB for the history (10,000 batches) and the normalizer's own per-hash record
+  (176 B per live block) and 1,328 MiB more for the live-block record (257 B per live block);
+  the publisher task's per-batch path (msgpack decode, normalize, history push) 70 us per batch
+  storing one chain and evicting one (918k blocks/s on one core), 181 us with the record
+  (354k blocks/s); a real relay behind a ZMQ publisher absorbed 36k batches/s (2.3M blocks/s)
+  of 64-block stores with no gap. Read the counters next to the
   gateway's `smg_kv_event_gaps_total{outcome}` and `smg_kv_event_resyncs_total{reason}`: a drop
   drill should show `publisher_gaps` and `gap_batches_recovered` on the relay and
   `replay_requested` with no `unrecovered` outcome on the gateway; a restart drill

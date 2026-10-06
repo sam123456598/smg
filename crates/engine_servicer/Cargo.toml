@@ -36,6 +36,7 @@ zeromq.workspace = true
 
 [dev-dependencies]
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # The captured engine streams (`tests/fixtures/captured`) are gzipped JSON
 # lines of base64 publisher payloads.
 base64 = "0.22"
@@ -44,6 +45,10 @@ flate2 = "1"
 kv-index.workspace = true
 portpicker = "0.1"
 tempfile = "3"
+
+[[bench]]
+name = "kv_relay_apply"
+harness = false
 
 [lints]
 workspace = true

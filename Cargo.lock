@@ -2217,6 +2217,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "criterion",
  "engine-zmq-adapter",
  "engine-zmq-client",
  "flate2",
