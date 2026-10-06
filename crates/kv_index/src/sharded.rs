@@ -281,6 +281,25 @@ impl ShardedRunIndex {
             .count()
     }
 
+    /// Mergeable adjacent pairs and the blocks their children hold, summed over the shards (see
+    /// [`RunIndex::debug_mergeable`]).
+    #[doc(hidden)]
+    pub fn debug_mergeable(&self) -> (usize, usize) {
+        self.shards
+            .iter()
+            .map(RunIndex::debug_mergeable)
+            .fold((0, 0), |(p, b), (q, c)| (p + q, b + c))
+    }
+
+    /// As [`RunIndex::debug_mergeable_by_rule`], summed over the shards.
+    #[doc(hidden)]
+    pub fn debug_mergeable_by_rule(&self) -> (usize, usize, usize) {
+        self.shards
+            .iter()
+            .map(RunIndex::debug_mergeable_by_rule)
+            .fold((0, 0, 0), |(s, g, b), (x, y, z)| (s + x, g + y, b + z))
+    }
+
     /// Shape and memory counters summed over the shards.
     pub fn stats(&self) -> RunIndexStats {
         let mut total = RunIndexStats::default();
@@ -297,6 +316,10 @@ impl ShardedRunIndex {
             total.engine_conflicts += stats.engine_conflicts;
             total.landing_mismatches += stats.landing_mismatches;
             total.moved_hashes += stats.moved_hashes;
+            total.splits_by_branch += stats.splits_by_branch;
+            total.splits_by_hole += stats.splits_by_hole;
+            total.splits_by_mid_run_store += stats.splits_by_mid_run_store;
+            total.runs_died += stats.runs_died;
         }
         total
     }

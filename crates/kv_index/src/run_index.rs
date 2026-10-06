@@ -1105,6 +1105,17 @@ pub struct RunIndexStats {
     /// a different position, as after a store without its parent); the old membership is
     /// released so a hash is held at one place per worker.
     pub moved_hashes: usize,
+    /// Runs split because a stored chain diverged inside them: content structure, bounded by
+    /// the distinct branch points of what the engines hold.
+    pub splits_by_branch: usize,
+    /// Runs split because a removal left a worker holding blocks on both sides of a hole.
+    pub splits_by_hole: usize,
+    /// Runs split because a store entered them under a parent the worker did not hold up to
+    /// (a stale parent, or a worker re-entering a chain it had lost the head of).
+    pub splits_by_mid_run_store: usize,
+    /// Runs unlinked from the tree since the index was created (their headers go back to the
+    /// slab's free list).
+    pub runs_died: usize,
 }
 
 /// Where a writer waited: the root, a leaf only this worker holds, or a run others hold too.
@@ -1149,9 +1160,6 @@ struct LaneCounters {
     contended: [CachePadded<AtomicU64>; 3],
     wait_ns: [CachePadded<AtomicU64>; 3],
     restarts: CachePadded<AtomicU64>,
-    splits_divergence: CachePadded<AtomicU64>,
-    splits_hole: CachePadded<AtomicU64>,
-    splits_stale_parent: CachePadded<AtomicU64>,
     inserts: CachePadded<AtomicU64>,
     stores: CachePadded<AtomicU64>,
     store_blocks: CachePadded<AtomicU64>,
@@ -1224,6 +1232,12 @@ pub struct RunIndex {
     landing_mismatches: AtomicUsize,
     /// Blocks a store moved to another place for their worker (the old membership released).
     moved_hashes: AtomicUsize,
+    /// Splits by cause and runs unlinked, always counted (one relaxed increment per split or
+    /// death): the fragmentation figures a churn harness and the gateway's gauges read.
+    splits_branch: AtomicUsize,
+    splits_hole: AtomicUsize,
+    splits_mid_run: AtomicUsize,
+    runs_died: AtomicUsize,
     #[cfg(feature = "lane-stats")]
     counters: LaneCounters,
 }
@@ -1357,6 +1371,10 @@ impl RunIndex {
             engine_conflicts: AtomicUsize::new(0),
             landing_mismatches: AtomicUsize::new(0),
             moved_hashes: AtomicUsize::new(0),
+            splits_branch: AtomicUsize::new(0),
+            splits_hole: AtomicUsize::new(0),
+            splits_mid_run: AtomicUsize::new(0),
+            runs_died: AtomicUsize::new(0),
             #[cfg(feature = "lane-stats")]
             counters: LaneCounters::default(),
         }
@@ -1378,9 +1396,9 @@ impl RunIndex {
                 contended: load(&self.counters.contended),
                 wait_ns: load(&self.counters.wait_ns),
                 restarts: self.counters.restarts.load(Ordering::Relaxed),
-                splits_divergence: self.counters.splits_divergence.load(Ordering::Relaxed),
-                splits_hole: self.counters.splits_hole.load(Ordering::Relaxed),
-                splits_stale_parent: self.counters.splits_stale_parent.load(Ordering::Relaxed),
+                splits_divergence: self.splits_branch.load(Ordering::Relaxed) as u64,
+                splits_hole: self.splits_hole.load(Ordering::Relaxed) as u64,
+                splits_stale_parent: self.splits_mid_run.load(Ordering::Relaxed) as u64,
                 inserts: self.counters.inserts.load(Ordering::Relaxed),
                 stores: self.counters.stores.load(Ordering::Relaxed),
                 store_blocks: self.counters.store_blocks.load(Ordering::Relaxed),
@@ -1392,8 +1410,12 @@ impl RunIndex {
         }
         #[cfg(not(feature = "lane-stats"))]
         {
-            let _ = self;
-            LaneStats::default()
+            LaneStats {
+                splits_divergence: self.splits_branch.load(Ordering::Relaxed) as u64,
+                splits_hole: self.splits_hole.load(Ordering::Relaxed) as u64,
+                splits_stale_parent: self.splits_mid_run.load(Ordering::Relaxed) as u64,
+                ..LaneStats::default()
+            }
         }
     }
 
@@ -1436,21 +1458,16 @@ impl RunIndex {
         }
     }
 
+    /// Count a split by its cause: a divergence inside the run (`Root`), a hole a removal left
+    /// (`Own`), or a store under a parent the worker did not hold up to (`Shared`).
     #[inline]
     fn count_split(&self, cause: LockKind) {
-        #[cfg(feature = "lane-stats")]
-        {
-            let counter = match cause {
-                LockKind::Root => &self.counters.splits_divergence,
-                LockKind::Own => &self.counters.splits_hole,
-                LockKind::Shared => &self.counters.splits_stale_parent,
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-        #[cfg(not(feature = "lane-stats"))]
-        {
-            let _ = (self, cause);
-        }
+        let counter = match cause {
+            LockKind::Root => &self.splits_branch,
+            LockKind::Own => &self.splits_hole,
+            LockKind::Shared => &self.splits_mid_run,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Intern a worker name; the same name maps to the same id until the worker is removed.
@@ -1727,6 +1744,7 @@ impl RunIndex {
         self.arena.free_partials(partials);
         self.arena.free_table(forwards);
         meta.dead = true;
+        self.runs_died.fetch_add(1, Ordering::Relaxed);
         freed.push(run_id);
     }
 
@@ -2972,6 +2990,74 @@ impl RunIndex {
         out
     }
 
+    /// Adjacent runs a compaction could fold: a run with exactly one child whose coverage equals
+    /// its own and that has no prefix holders of its own (a prefix holder of the child that is
+    /// not a whole holder of the parent holds a suffix, which one run could not express).
+    /// Returns the pairs and the blocks the children hold. A diagnostic walk, not consistent
+    /// under concurrent writes.
+    #[doc(hidden)]
+    pub fn debug_mergeable(&self) -> (usize, usize) {
+        let (strict, _, blocks) = self.debug_mergeable_by_rule();
+        (strict, blocks)
+    }
+
+    /// As [`debug_mergeable`](Self::debug_mergeable), but also counting the pairs a generalised
+    /// merge could fold: the child's whole holders a subset of the parent's and every prefix
+    /// holder of the child a whole holder of the parent (the parent's extra holders would become
+    /// prefix holders of the merged run). Returns `(strict pairs, generalised pairs, blocks of the
+    /// generalised pairs' children)`.
+    #[doc(hidden)]
+    pub fn debug_mergeable_by_rule(&self) -> (usize, usize, usize) {
+        let (mut strict, mut general, mut blocks) = (0usize, 0usize, 0usize);
+        let mut stack: Vec<u32> = Vec::new();
+        let (root, _) = self.slab.run(ROOT).snapshot();
+        for (_, child, _) in self.arena.table_entries(root.children) {
+            stack.push(child);
+        }
+        while let Some(run_id) = stack.pop() {
+            let (window, _) = self.slab.run(run_id).snapshot();
+            let children: Vec<u32> = self
+                .arena
+                .table_entries(window.children)
+                .into_iter()
+                .map(|(_, child, _)| child)
+                .collect();
+            if let [only] = children[..] {
+                let (child_window, _) = self.slab.run(only).snapshot();
+                let parent_words: Vec<u64> = self
+                    .slab
+                    .coverage(run_id)
+                    .iter()
+                    .map(|w| w.load(Ordering::Relaxed))
+                    .collect();
+                let child_words: Vec<u64> = self
+                    .slab
+                    .coverage(only)
+                    .iter()
+                    .map(|w| w.load(Ordering::Relaxed))
+                    .collect();
+                let same_coverage = parent_words == child_words;
+                let subset = parent_words
+                    .iter()
+                    .zip(&child_words)
+                    .all(|(p, c)| c & !p == 0);
+                let child_partials = self.arena.partial_entries(child_window.partials);
+                let partials_held = child_partials
+                    .iter()
+                    .all(|&(worker, _)| has(self.slab.coverage(run_id), worker));
+                if same_coverage && child_partials.is_empty() {
+                    strict += 1;
+                }
+                if subset && partials_held {
+                    general += 1;
+                    blocks += child_window.len as usize;
+                }
+            }
+            stack.extend(children);
+        }
+        (strict, general, blocks)
+    }
+
     /// Shape and memory counters.
     pub fn stats(&self) -> RunIndexStats {
         let allocated = self.slab.allocated();
@@ -2986,6 +3072,10 @@ impl RunIndex {
             engine_conflicts: self.engine_conflicts.load(Ordering::Relaxed),
             landing_mismatches: self.landing_mismatches.load(Ordering::Relaxed),
             moved_hashes: self.moved_hashes.load(Ordering::Relaxed),
+            splits_by_branch: self.splits_branch.load(Ordering::Relaxed),
+            splits_by_hole: self.splits_hole.load(Ordering::Relaxed),
+            splits_by_mid_run_store: self.splits_mid_run.load(Ordering::Relaxed),
+            runs_died: self.runs_died.load(Ordering::Relaxed),
             ..RunIndexStats::default()
         };
         for id in 1..allocated as u32 {

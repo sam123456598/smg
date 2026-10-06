@@ -55,5 +55,9 @@ harness = false
 name = "mooncake_replay"
 harness = false
 
+[[bench]]
+name = "churn"
+harness = false
+
 [lints]
 workspace = true

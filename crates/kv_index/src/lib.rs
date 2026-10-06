@@ -11,6 +11,9 @@
 //! - Concurrent access via DashMap and RwLock
 //! - Efficient prefix matching with match counts
 
+/// Churn generator shared by the churn bench and the gate test; not a public API.
+#[doc(hidden)]
+pub mod churn;
 mod common;
 mod event_tree;
 mod lane_map;
