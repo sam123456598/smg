@@ -72,10 +72,10 @@ refuses to start when `--smg` names a non-loopback host while
 `--master-address` is still loopback. Ranks come from each worker's `tp_size`: the trainer
 takes rank 0 and engine *k* takes `rank_offset_k .. rank_offset_k + tp_k - 1`,
 so `world_size = 1 + sum(tp)`. Discovery reads `tp_size` from the engine's
-server args and falls back to TokenSpeed's own spelling, `attn_tp_size`, so an
-engine launched with either reports a width. An engine launched with neither —
-TokenSpeed leaves `attn_tp_size` unset unless asked — reports `tp_size: null`,
-and the script then assumes 1 and says so on stderr; `--tp-size` overrides it.
+server args (TokenSpeed's own spelling, `attn_tp_size`, is folded into it).
+The newest TokenSpeed builds nest their parallelism under `mapping.*`, which
+discovery does not read yet, so such an engine reports `tp_size: null`; the
+script then assumes 1 and says so on stderr, and `--tp-size` overrides it.
 `init_weights_update_group` is a
 per-worker call, because each worker gets a different `rank_offset`; the
 broadcast is a fan-out, because the body is identical. `--chunk` (default 64) parameters ride
