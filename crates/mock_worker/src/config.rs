@@ -265,6 +265,11 @@ impl Config {
             {
                 cfg.engine.kv_capacity_tokens = tokens;
             }
+            // The decode fit was measured against the calibration's pool: a
+            // smaller pool from the flags changes room, not step time.
+            if c.kv_capacity_tokens.is_some() {
+                cfg.engine.decode_reference_tokens = c.kv_capacity_tokens;
+            }
             if !overhead_given {
                 cfg.engine.request_overhead_ms = c.request_overhead_ms;
             }

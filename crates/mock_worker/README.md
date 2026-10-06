@@ -124,7 +124,10 @@ over KV utilisation); capacity is `kv_capacity_tokens` or
 event of a stream. Unknown keys are ignored, and `--block-size`,
 `--kv-tokens`/`--kv-blocks` and `--request-overhead-ms` given explicitly win
 over the file (the GB300 restricted-pool fleet is `--kv-blocks 12000
---block-size 16`). The defaults stay AISimulate's uncalibrated baseline.
+--block-size 16`); the decode fit's utilisation is still read against the
+file's `kv_capacity_tokens`, so a smaller pool changes how much fits, not
+how long a decode step takes. The defaults stay AISimulate's uncalibrated
+baseline.
 
 Agreement with hardware is the caller's problem: AISimulate's published
 agreement for these polynomials (mean absolute percentage error 48.5% on TTFT,

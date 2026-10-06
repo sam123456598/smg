@@ -391,6 +391,12 @@ pub struct EngineParams {
     pub max_running: usize,
     /// KV cache capacity in tokens (`num_blocks × block_size`).
     pub kv_capacity_tokens: u64,
+    /// The KV capacity the decode cost was calibrated against. When set, a
+    /// decode step's utilisation is the decoding context over this reference,
+    /// not over the configured pool, so shrinking the pool (`--kv-blocks`)
+    /// changes how much fits, not how long a step takes: the engine's step
+    /// time depends on the tokens it attends to, not on the pool size.
+    pub decode_reference_tokens: Option<u64>,
     /// Cache block (page) size in tokens.
     pub block_size: u32,
     /// Whether prefix caching + KV-event emission are enabled.
@@ -424,6 +430,7 @@ impl Default for EngineParams {
             max_batched_tokens: 8192,
             max_running: 256,
             kv_capacity_tokens: 524_288,
+            decode_reference_tokens: None,
             block_size: 16,
             prefix_cache: true,
             prefill_first: false,
@@ -1711,9 +1718,11 @@ impl SchedulerState {
 
         // ---- 5. Timing + bookkeeping ----
         let prefill_ms = p.timing.prefill_pass_ms(prefill_tokens, largest_chunk);
-        let decode_ms = p
-            .timing
-            .decode_ms(num_decode, decode_ctx, p.kv_capacity_tokens);
+        let decode_ms = p.timing.decode_ms(
+            num_decode,
+            decode_ctx,
+            p.decode_reference_tokens.unwrap_or(p.kv_capacity_tokens),
+        );
         let mut secs = (prefill_ms + decode_ms) / 1000.0;
         if secs <= 0.0 && !self.is_idle() {
             secs = 0.001; // never busy-spin while work remains
@@ -2318,6 +2327,38 @@ mod tests {
             many > one,
             "decode pass should be slower with a bigger batch: one={one:?} many={many:?}"
         );
+    }
+
+    #[test]
+    fn a_calibrated_decode_reference_keeps_step_time_when_the_pool_shrinks() {
+        // The same 2048-token decoder: against a 4096-token pool the step
+        // reads u = 0.5; with the pool cut to 2560 tokens but the decode
+        // calibrated at 4096, the step must cost the same as before (the
+        // pool changed room, not the engine's speed); without the reference
+        // the smaller pool would read u = 0.8 and decode slower.
+        let full = EngineParams {
+            kv_capacity_tokens: 4096,
+            block_size: 16,
+            ..Default::default()
+        };
+        let small_pinned = EngineParams {
+            kv_capacity_tokens: 2560,
+            decode_reference_tokens: Some(4096),
+            ..full.clone()
+        };
+        let small_unpinned = EngineParams {
+            decode_reference_tokens: None,
+            ..small_pinned.clone()
+        };
+        let step_time = |p: &EngineParams| {
+            let mut st = SchedulerState::new();
+            let (r, _rx) = req("big", vec![1; 2048], 8);
+            st.enqueue(r, p);
+            st.step(p);
+            st.step(p).duration
+        };
+        assert_eq!(step_time(&full), step_time(&small_pinned));
+        assert!(step_time(&small_unpinned) > step_time(&full));
     }
 
     #[test]
