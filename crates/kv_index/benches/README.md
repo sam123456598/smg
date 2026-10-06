@@ -326,8 +326,26 @@ hour later (`competitor-head/newpoints-*`), read 99.0/98.6/98.3% against 97.9/96
 and 99.5/98.2/99.4% against 99.4/99.4/98.8% at 924.0M, indistinguishable within trial noise and
 both below the points' own series medians, so the two heads are one system at this protocol's
 resolution and the row to cite for either is the 20-trial series above (kept up 13 of 20 and 16
-of 22, the shortfalls being the editor server). The two systems' same-binary ratio with local
-memory is 1,383.8M against 924.0M = 1.50x at p99 3-4 against 10 us.
+of 22, the shortfalls being the editor server).
+
+The run index re-measured in the same conditions (06:52-07:28 on 2026-10-06, competitor layout,
+the same harness build as the local-memory rows, kv-index `9f9c7c04`; the editor server closed,
+the soaks running from 07:00; `bisect-dynrun-quiet[-localmem]`, `protocol/dynrun-sustained-quiet[-localmem]`):
+
+| Memory | Keeps up at | Fails at (trials) | Series at the kept-up point: achieved median [95% CI] (M) | Per lane core (M) | Kept up | Lookup p50 / p99 (us) | Control |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `--interleave=all` | 1,067.0M (300 ms) | 1,163.6M (98.7%, 99.4%, 93.4%); 1,509M and 2,134M generator-invalid | 1,063.6 [1,063.3, 1,063.9] | 18.0 | 19 of 20 (0 discarded) | 1.3 [1.2, 1.3] / 3.7 [3.4, 4.0] | 1,063.4 [1,062.8, 1,063.6], 19 of 20 |
+| local | 1,383.8M (231 ms) | 1,509.0M (99.5%, 98.6%, 98.8%) | 1,379.3 [1,377.1, 1,380.0] | 23.4 | 16 of 20 (5 discarded) | 1.3 [1.3, 1.3] / 3.6 [3.6, 3.6] | 1,379.0 [1,377.2, 1,380.0], 18 of 21 |
+
+Equal cores, one binary build, 20 trials on both sides, the same night: under Dynamo's published
+method the run index sustains 1,063.6M against the competitor's 739.1M (1.44x; 18.0 against
+12.5M per lane core) at lookup p99 3.7 against 13.8 us; under local memory 1,379.3M against
+918.1M (1.50x; 23.4 against 15.6M per lane core) at p99 3.6 against 9.9 us. Both of the run
+index's points are the same as measured earlier under load (1,061.7M at 300 ms, 1,383.8M), so its
+numbers did not move with the host while the competitor's did. The interleaved bracket ends on a
+point the generator cannot issue (150 ms and 212 ms windows invalid in Dynamo's harness), so
+1,067M is "keeps up at the highest offered rate this harness issues on schedule with one query
+issuer", not the index's ceiling.
 
 ## Scaled layout: equal backend cores and same-binary rows
 
@@ -643,6 +661,51 @@ rescued brackets) and every trial's foreign processes and their cores are in the
   drain and costs 3-12% of achieved; its issue lag p99 is 15-35 ms against 4-25 ms unsharded. Whether
   that tail is foreign preemption of mostly idle lanes or the shard path (lookups walk both shards;
   p50 1.8 against 1.2-1.5 us) is for the clean window.
+
+### T7, second window (host daemons present): issuer-built payloads
+
+The 05:00-07:00 window on 2026-10-06 had the editor server closed and no builds, but host daemons
+and other users' jobs sat above half a core in most samples (dotsync2 at about one core, the bpf
+usage tracer, polkitd, mcdaemon, chef-client, a cf_manager service, certreq); the half-core rule
+replaced every trial of the first pass, so from 05:07 those names were recorded as background for
+the window and the rule kept for everything else, and every row is labelled as such. Layout as in
+the first window with two cores per socket left free (lanes 10-71 and 72-133, 124 pinned lanes,
+issuers 0-3,136-139 and 4-7,140-143). The index's owners had found between the windows that the
+two-socket doubling of lane CPU was the harness's mirrored payload path, not the index: under
+`--mirror-dynamo-costs true` every event's owned payload is built before the trial by the main
+thread in one glibc arena and freed by the lane, so 124 lanes on two sockets contend on that
+arena; the replayer gained `--payload-home main|issuer` (issuer: each pinned event issuer builds
+its own dispatch's payloads on its socket, lanes free into that issuer's arena). Dynamo's harness
+builds its owned events on the main thread with the system allocator (`prepare_open_loop_trial`),
+so `main` mirrors their method and `issuer` removes a harness cost both systems would pay; rows
+with `issuer` carry that caveat. Lane binary: leap/indexer-run `d89d2702` (the pushed head's
+kv_index plus `22a87cb5`, `16304c24`, `d89d2702`); row (a) on the `ce53d732` binary of the first
+window.
+
+| Row | Keeps up at | Per lane core (M) | Fails at (trials) | Series at the kept-up point (M), kept up | Lookup p50 / p99 (us) | Lane CPU per event block, socket 0 / 1 (ns) |
+| --- | --- | --- | --- | --- | --- | --- |
+| (e3) one socket, lanes 10-71, `--shards 1 --lane-memory local --payload-home issuer`, no numactl | 1,234.0M | 19.9 (62) | 1,345.8M (99.6%, 99.6%, 70.8%) | 1,229.8 [1,224.6, 1,230.0], 15 of 20 | 0.9 / 6 | 47 |
+| (a3) two sockets, `--shards 2 --lane-memory local --payload-home issuer`, interleave | 745.5M | 6.0 (124) | 813.7M (92.1%, 99.2%, 95.0%) | 720.4 [697.1, 734.8], 7 of 25 | 1.8 / 10 | 55 / 56 |
+| (a) two sockets, `--shards 2 --lane-memory local`, payloads from the main thread, `ce53d732` | 700.0M | 5.6 (124) | 750.5M (99.0%, 94.5%, 99.6%) | 681.1 [660.7, 696.6], 10 of 23 | 1.8 / 11 | 74 / 94 |
+| (c3) two sockets, `--shards 1 --payload-home issuer`, interleave | no point verified at 400M or 300M | | | | | |
+| (d) two sockets, `--shards 1 --lane-memory local`, interleave | 300.0M | 2.4 (124) | 324.8M (97.7%, 99.5%, 96.5%) | 297.1 [295.0, 298.7], 11 of 21 | 1.2 / 8 | 79 / 79 |
+
+Reading. With issuer-built payloads one socket sustains 1,234M on 62 lanes (47 ns of lane CPU per
+event block) where the mirrored-main single socket read 951M in the first window; the two-socket
+sharded index then pays the single-socket cost per block on both sockets (55 / 56 ns against 74 /
+94 with main-thread payloads) but sustains 745.5M, 0.6x one socket: its trials are bimodal, 11 of
+31 subject trials keep up at 99.1-99.8% with drains of 0-4 ms and the rest fall to 77-98% with
+drains of 9-127 ms at the same lane CPU, i.e. single lanes stalled off-CPU, and the index's owners
+read a socket-wide shift of socket 1's lane cost that varies by trial (66-84 ns in 26 of 30 trials,
+54 in the others) rather than particular lanes sharing cores with daemons. The duplicated-content
+share of the two shards is 2.3% (1,566,806 summed distinct blocks over 1,532,076), arena 53.0 MB
+against 47.7 MB. Which cores the host's daemons favour, from the window's 300+ samples
+(`foreign-cores.py`): the bpf usage tracer is pinned to core 103, falcon_proxy to 129, strobelight
+to 45, smc_proxy to 52; the floating ones (the editor's native server, polkitd, dotsync2, below,
+fetch_krl) concentrate on socket 1's lane cores 121-128, 138-139 and 87. The sampler now records
+every thread's core per flagged process and each socket's mean frequency before and after every
+trial (`t7-table.py --trials <row>` joins them per trial), and the next two-socket row is the
+index's owners' stealing lanes, since freeing cores does not remove a socket-wide shift.
 
 ## Plugging in a new index
 
