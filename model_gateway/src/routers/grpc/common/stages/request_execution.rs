@@ -633,6 +633,7 @@ async fn execute_single(
         proto_request.set_data_parallel_rank(rank as i32);
     }
 
+    let prompt_tokens = u64::try_from(proto_request.prompt_len()).unwrap_or(u64::MAX);
     let result = client.generate(proto_request).await;
     workers.record_outcome(result.cb_status_code());
 
@@ -644,9 +645,10 @@ async fn execute_single(
             "start_generation_failed",
         )
     })?;
-    // Every response on this stream is progress for the worker (liveness).
+    // Every response on this stream is progress for the worker (liveness),
+    // and its prompt is pending prefill there until the first one.
     let stream = match workers.single() {
-        Some(worker) => stream.tracked(Arc::clone(worker)),
+        Some(worker) => stream.tracked(Arc::clone(worker), prompt_tokens),
         None => stream,
     };
 

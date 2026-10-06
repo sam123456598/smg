@@ -639,6 +639,24 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         indexed
     }
 
+    /// A request of `tokens` prompt tokens was dispatched: work the engine
+    /// still has to prefill before its first token (see
+    /// [`Self::prefill_backlog`]).
+    fn note_prefill_started(&self, _tokens: u64) {}
+
+    /// The request's first token came back (`prefilled`), or its stream ended
+    /// or was dropped before one (`!prefilled`): its prompt is no longer
+    /// pending prefill.
+    fn note_prefill_ended(&self, _tokens: u64, _prefilled: bool) {}
+
+    /// How long the engine may still need before the first token of its
+    /// in-flight work is due: the prompt tokens dispatched and not yet
+    /// answered, over the prefill rate observed on this worker (a cold prior
+    /// until one is). Zero for a worker that does not track it.
+    fn prefill_backlog(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
     /// reads status, load, processed and the overload veto together so the hot
     /// path takes one `ArcSwap` guard per backing cell per worker instead of one
@@ -1331,7 +1349,30 @@ pub struct WorkerRuntime {
     /// blocks the index held for the worker then (see [`Self::warmup_growth`]).
     warmup_base_admitted_ms: AtomicU64,
     warmup_base_blocks: AtomicUsize,
+    /// When the current run of in-flight requests began (the load counter
+    /// left zero), in [`super::liveness::now_ms`] milliseconds; zero while
+    /// idle. The no-progress clock of the wedged rule starts here, not at
+    /// registration or the last token before an idle spell.
+    busy_since_ms: AtomicU64,
+    /// Prompt tokens dispatched whose first token has not come back.
+    prefill_tokens_pending: AtomicU64,
+    /// Observed aggregate prefill rate, tokens per second; zero until a
+    /// window of first tokens has been seen (see [`Self::observe_prefill_at`]).
+    prefill_rate_tps: AtomicU64,
+    prefill_window_start_ms: AtomicU64,
+    prefill_window_tokens: AtomicU64,
 }
+
+/// Prefill rate assumed for a worker that has not shown one yet: slow enough
+/// that a cold engine handed a burst of long prompts is not called wedged
+/// before it can have answered (10k tokens/s is a small model on a modest
+/// GPU; a GB300 prefills 8B weights at ~90k).
+const COLD_PREFILL_TOKENS_PER_SEC: u64 = 10_000;
+
+/// First tokens are summed over windows at least this long before they make
+/// a rate sample, so the sample is the engine's aggregate throughput and not
+/// one request's time to first token (which includes its wait in the batch).
+const PREFILL_WINDOW_MS: u64 = 1_000;
 
 impl WorkerRuntime {
     pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
@@ -1356,6 +1397,11 @@ impl WorkerRuntime {
             admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
             warmup_base_admitted_ms: AtomicU64::new(u64::MAX),
             warmup_base_blocks: AtomicUsize::new(0),
+            busy_since_ms: AtomicU64::new(0),
+            prefill_tokens_pending: AtomicU64::new(0),
+            prefill_rate_tps: AtomicU64::new(0),
+            prefill_window_start_ms: AtomicU64::new(0),
+            prefill_window_tokens: AtomicU64::new(0),
         }
     }
 
@@ -1438,8 +1484,86 @@ impl WorkerRuntime {
         Self::age_of(self.last_contact_ms.load(Ordering::Relaxed))
     }
 
+    /// Time without a token or completion, counted from the later of the last
+    /// one and the start of the current run of in-flight requests: a worker
+    /// that was idle (or just registered) has nothing to show progress on
+    /// until something is dispatched to it.
     pub fn token_progress_age(&self) -> Duration {
-        Self::age_of(self.last_token_ms.load(Ordering::Relaxed))
+        Self::age_of(self.progress_reference_ms())
+    }
+
+    /// The stamp [`Self::token_progress_age`] counts from.
+    pub fn progress_reference_ms(&self) -> u64 {
+        self.last_token_ms
+            .load(Ordering::Relaxed)
+            .max(self.busy_since_ms.load(Ordering::Relaxed))
+    }
+
+    // ── Prefill backlog (the wedged rule's bound) ───────────────────
+
+    pub fn note_prefill_started(&self, tokens: u64) {
+        self.prefill_tokens_pending
+            .fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    pub fn note_prefill_ended(&self, tokens: u64, prefilled: bool) {
+        let _ = self.prefill_tokens_pending.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |pending| Some(pending.saturating_sub(tokens)),
+        );
+        if prefilled && tokens > 0 {
+            self.observe_prefill_at(tokens, super::liveness::now_ms().max(1));
+        }
+    }
+
+    /// Fold `tokens` prefilled at `now_ms` into the observed rate: first
+    /// tokens are summed over windows of at least [`PREFILL_WINDOW_MS`] and
+    /// each closed window halves into the running estimate. Racing callers
+    /// may lose a few tokens of a window; the estimate is a bound, not a book.
+    pub fn observe_prefill_at(&self, tokens: u64, now_ms: u64) {
+        let start = self.prefill_window_start_ms.load(Ordering::Relaxed);
+        if start == 0 {
+            self.prefill_window_start_ms
+                .store(now_ms, Ordering::Relaxed);
+            self.prefill_window_tokens.store(tokens, Ordering::Relaxed);
+            return;
+        }
+        let total = self
+            .prefill_window_tokens
+            .fetch_add(tokens, Ordering::Relaxed)
+            + tokens;
+        let span_ms = now_ms.saturating_sub(start);
+        if span_ms < PREFILL_WINDOW_MS {
+            return;
+        }
+        let sample = total.saturating_mul(1000) / span_ms;
+        let rate = self.prefill_rate_tps.load(Ordering::Relaxed);
+        let next = if rate == 0 {
+            sample
+        } else {
+            rate.midpoint(sample)
+        };
+        self.prefill_rate_tps.store(next.max(1), Ordering::Relaxed);
+        self.prefill_window_start_ms
+            .store(now_ms, Ordering::Relaxed);
+        self.prefill_window_tokens.store(0, Ordering::Relaxed);
+    }
+
+    pub fn prefill_rate_tps(&self) -> u64 {
+        self.prefill_rate_tps.load(Ordering::Relaxed)
+    }
+
+    pub fn prefill_backlog(&self) -> Duration {
+        let pending = self.prefill_tokens_pending.load(Ordering::Relaxed);
+        if pending == 0 {
+            return Duration::ZERO;
+        }
+        let rate = match self.prefill_rate_tps.load(Ordering::Relaxed) {
+            0 => COLD_PREFILL_TOKENS_PER_SEC,
+            rate => rate,
+        };
+        Duration::from_millis(pending.saturating_mul(1000) / rate)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -1509,25 +1633,48 @@ impl WorkerRuntime {
     }
 
     pub fn increment_load(&self) {
-        self.load_counter.fetch_add(1, Ordering::Relaxed);
+        if self.load_counter.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.note_busy_started();
+        }
     }
 
     pub fn try_increment_load(&self, max: usize) -> bool {
-        self.load_counter
+        match self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1).filter(|next| *next <= max)
-            })
-            .is_ok()
+            }) {
+            Ok(0) => {
+                self.note_busy_started();
+                true
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// The load counter left zero: the wedged rule's clock starts now.
+    fn note_busy_started(&self) {
+        self.busy_since_ms
+            .store(super::liveness::now_ms().max(1), Ordering::Relaxed);
     }
 
     /// Saturating decrement. Returns `true` if the counter was decremented,
     /// `false` if it was already zero — callers can log when that happens.
     pub fn try_decrement_load(&self) -> bool {
-        self.load_counter
+        match self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
-            })
-            .is_ok()
+            }) {
+            Ok(1) => {
+                // Idle again: nothing in flight to wait for.
+                self.busy_since_ms.store(0, Ordering::Relaxed);
+                true
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        }
     }
 
     // ── PD admission claims ─────────────────────────────────────────
@@ -2084,6 +2231,18 @@ impl Worker for BasicWorker {
 
     fn warmup_growth(&self, indexed: usize) -> usize {
         self.runtime.load().warmup_growth(indexed)
+    }
+
+    fn note_prefill_started(&self, tokens: u64) {
+        self.runtime.load().note_prefill_started(tokens);
+    }
+
+    fn note_prefill_ended(&self, tokens: u64, prefilled: bool) {
+        self.runtime.load().note_prefill_ended(tokens, prefilled);
+    }
+
+    fn prefill_backlog(&self) -> Duration {
+        self.runtime.load().prefill_backlog()
     }
 
     fn is_available(&self) -> bool {
@@ -4018,6 +4177,49 @@ mod tests {
         worker.set_completion_sink(None);
         drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None));
         assert_eq!(spy.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn progress_is_counted_from_the_first_dispatch_not_registration() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let registered = runtime.progress_reference_ms();
+        thread::sleep(Duration::from_millis(15));
+        runtime.increment_load();
+        assert!(
+            runtime.progress_reference_ms() > registered,
+            "the clock starts at the dispatch, not at registration"
+        );
+        assert!(runtime.token_progress_age() < Duration::from_millis(10));
+        assert!(runtime.try_decrement_load());
+        assert_eq!(
+            runtime.progress_reference_ms(),
+            registered,
+            "idle again: back to the last token"
+        );
+        assert!(runtime.try_increment_load(4));
+        assert!(runtime.progress_reference_ms() > registered);
+    }
+
+    #[test]
+    fn prefill_backlog_follows_pending_tokens_and_the_observed_rate() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+        // 128 prompts of 1,152 tokens on a worker that has shown no rate yet:
+        // the cold prior, 10k tokens/s, gives the engine 14.7 s.
+        runtime.note_prefill_started(128 * 1_152);
+        assert_eq!(runtime.prefill_backlog(), Duration::from_millis(14_745));
+        // Their first tokens come back within 1.5 s: an observed rate of
+        // ~98k tokens/s replaces the prior, and nothing is pending.
+        runtime.observe_prefill_at(64 * 1_152, 1_000);
+        runtime.observe_prefill_at(64 * 1_152, 2_500);
+        runtime.note_prefill_ended(128 * 1_152, false);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+        assert_eq!(runtime.prefill_rate_tps(), 98_304);
+        runtime.note_prefill_started(1_000_000);
+        assert_eq!(runtime.prefill_backlog(), Duration::from_millis(10_172));
+        // A dropped stream releases its tokens without a rate sample.
+        runtime.note_prefill_ended(2_000_000, false);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
     }
 
     #[test]

@@ -15,9 +15,13 @@
 //!   pass; a failed probe is left to the health state machine, because probe
 //!   timeouts on a slow but streaming worker are not unreachability.
 //! - **wedged**: the worker still answers polls but has produced no token or
-//!   completion for the wedge threshold while it holds in-flight requests and
+//!   completion for the wedge bound while it holds in-flight requests and
 //!   its waiting queue grows. Progress clears it. A paused engine that keeps
-//!   answering health looks exactly like this.
+//!   answering health looks exactly like this. The clock starts at the first
+//!   dispatch of a run of requests, never at registration, and the bound is
+//!   the configured threshold or, if longer, the time the engine may still
+//!   need to prefill what is in flight ([`Worker::prefill_backlog`]): a batch
+//!   that is all in prefill streams nothing and is not wedged.
 //!
 //! Neither veto touches the worker's health status: the health checker keeps
 //! its own state machine, and the veto is simply gone once the worker talks.
@@ -43,6 +47,20 @@ pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 /// are a wedged engine even when nothing new arrives (a saturated client
 /// stops adding to the pile); fewer could be a long prefill.
 const WEDGE_PILE: usize = 4;
+
+/// The prefill-aware wedge bound never exceeds this (unless the configured
+/// threshold itself does): a leak in the prefill books must not blind the
+/// rule for good.
+const WEDGE_BOUND_CAP: Duration = Duration::from_secs(120);
+
+/// The wedge bound for `worker` now: the configured threshold, or the time
+/// the engine may still need before the first token of its in-flight prompts
+/// is due, whichever is longer.
+pub(crate) fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
+    wedge
+        .max(worker.prefill_backlog())
+        .min(wedge.max(WEDGE_BOUND_CAP))
+}
 
 static THRESHOLDS: OnceLock<(Duration, Duration)> = OnceLock::new();
 static WARMUP: OnceLock<Warmup> = OnceLock::new();
@@ -177,8 +195,13 @@ pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
         return;
     }
     // The gateway's own view of a wedged engine: requests pile up on it and
-    // none has produced a token for the wedge threshold. Needs no poll.
-    if wedged_by_pile(load, previous_load, worker.token_progress_age(), wedge) {
+    // none has produced a token for the wedge bound. Needs no poll.
+    if wedged_by_pile(
+        load,
+        previous_load,
+        worker.token_progress_age(),
+        wedge_bound(worker, wedge),
+    ) {
         set(
             worker,
             Some(StallReason::Wedged),
@@ -215,7 +238,7 @@ pub(crate) fn on_load_report(worker: &Arc<dyn Worker>, waiting: i64) {
                 waiting,
                 previous,
                 worker.token_progress_age(),
-                wedge,
+                wedge_bound(worker, wedge),
             ) {
                 set(
                     worker,
@@ -293,6 +316,8 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use tokio::sync::mpsc;
 
     use super::*;
@@ -346,6 +371,92 @@ mod tests {
             !wedged_by_pile(8, 4, Duration::from_secs(1), wedge),
             "tokens still flowing"
         );
+    }
+
+    #[test]
+    fn the_first_requests_after_registration_are_not_a_wedge() {
+        // The policy lane saw every mock worker vetoed 3.5 s after
+        // registration when the first requests arrived: the no-progress clock
+        // counted from registration. It counts from the dispatch now.
+        let w = worker();
+        thread::sleep(Duration::from_millis(15));
+        w.increment_load();
+        w.increment_load();
+        w.increment_load();
+        let age = w.token_progress_age();
+        assert!(
+            age < Duration::from_millis(10),
+            "clock started at the dispatch"
+        );
+        sweep(&w);
+        assert!(w.stall_reason().is_none());
+        on_load_report(&w, 3);
+        assert!(w.stall_reason().is_none());
+        // The same pile with a clock that had run from registration would be
+        // the false positive.
+        assert!(wedged_by_pile(
+            3,
+            0,
+            Duration::from_millis(3_500),
+            DEFAULT_WEDGE
+        ));
+        assert!(!wedged_by_pile(3, 0, age, DEFAULT_WEDGE));
+    }
+
+    #[test]
+    fn a_batch_still_in_prefill_is_not_a_wedge() {
+        // The GPU lane saw the veto fire with no token for 3 to 5 s while a
+        // running batch was all in prefill: 128 prompts of 1,152 tokens.
+        let w = worker();
+        for _ in 0..128 {
+            w.increment_load();
+        }
+        w.note_prefill_started(128 * 1_152);
+        let bound = wedge_bound(&w, DEFAULT_WEDGE);
+        assert_eq!(
+            bound,
+            Duration::from_millis(14_745),
+            "cold prior: 10k tokens/s"
+        );
+        let silent = Duration::from_millis(5_300);
+        assert!(!wedged_by_pile(128, 0, silent, bound));
+        assert!(!wedged_by_queue(128, 16, 0, silent, bound));
+        assert!(
+            wedged_by_pile(128, 0, silent, DEFAULT_WEDGE),
+            "the bare threshold would have fired"
+        );
+        // The first tokens arrive: the backlog is gone and the bound is the
+        // configured threshold again.
+        w.note_prefill_ended(128 * 1_152, true);
+        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
+        // The bound is capped against leaking books.
+        w.note_prefill_started(100_000_000);
+        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), WEDGE_BOUND_CAP);
+        assert_eq!(
+            wedge_bound(&w, Duration::from_secs(600)),
+            Duration::from_secs(600),
+            "a longer configured threshold stands"
+        );
+    }
+
+    #[test]
+    fn a_paused_engine_with_short_prompts_is_still_a_wedge() {
+        // The pause drill: eight chat prompts of ~150 tokens in flight, the
+        // engine frozen, health and load polls still answering.
+        let w = worker();
+        for _ in 0..8 {
+            w.increment_load();
+        }
+        w.note_prefill_started(8 * 150);
+        let bound = wedge_bound(&w, DEFAULT_WEDGE);
+        assert_eq!(
+            bound, DEFAULT_WEDGE,
+            "0.12 s of prefill is inside the threshold"
+        );
+        let silent = Duration::from_millis(3_200);
+        assert!(wedged_by_queue(8, 8, 8, silent, bound), "standing queue");
+        assert!(wedged_by_pile(8, 8, silent, bound), "deep pile");
+        assert!(!wedged_by_pile(8, 8, Duration::from_millis(2_900), bound));
     }
 
     #[test]
@@ -427,7 +538,7 @@ mod tests {
     #[test]
     fn re_admission_restarts_the_warm_up_clock() {
         let w = worker();
-        std::thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(20));
         let before = w.admitted_age();
         set(&w, Some(StallReason::Unreachable), "test");
         on_contact(&w);

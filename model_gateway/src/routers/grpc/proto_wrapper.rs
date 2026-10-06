@@ -1650,6 +1650,34 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Prompt tokens the engine has to prefill for this request: the
+    /// tokenized input's length (zero for a text input, which the engine
+    /// tokenizes itself).
+    pub fn prompt_len(&self) -> usize {
+        match self {
+            Self::Sglang(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_ids.len()),
+            Self::Vllm(req) => match &req.input {
+                Some(vllm::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
+                _ => 0,
+            },
+            Self::Trtllm(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_token_ids.len()),
+            Self::Mlx(req) => match &req.input {
+                Some(mlx::generate_request::Input::Tokenized(input)) => input.input_ids.len(),
+                _ => 0,
+            },
+            Self::TokenSpeed(req) => req
+                .tokenized
+                .as_ref()
+                .map_or(0, |input| input.input_ids.len()),
+        }
+    }
+
     /// Attach media references for worker-side multimodal processing (vLLM only).
     pub fn set_vllm_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
         match self {
@@ -2528,10 +2556,38 @@ pub enum ProtoStream {
 }
 
 /// A [`ProtoStream`] paired with the worker serving it, so each response it
-/// yields counts as token progress for that worker.
+/// yields counts as token progress for that worker, and its prompt counts as
+/// pending prefill on the worker until the first response.
 pub struct TrackedStream {
     inner: ProtoStream,
     worker: Arc<dyn Worker>,
+    prefill: Option<PrefillTicket>,
+}
+
+/// The prompt tokens a dispatched request adds to its worker's prefill
+/// backlog (see [`Worker::prefill_backlog`]), released by the first response
+/// or, failing that, when the stream is dropped.
+struct PrefillTicket {
+    worker: Arc<dyn Worker>,
+    tokens: u64,
+    released: bool,
+}
+
+impl PrefillTicket {
+    fn first_response(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.worker.note_prefill_ended(self.tokens, true);
+        }
+    }
+}
+
+impl Drop for PrefillTicket {
+    fn drop(&mut self) {
+        if !self.released {
+            self.worker.note_prefill_ended(self.tokens, false);
+        }
+    }
 }
 
 /// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
@@ -2547,12 +2603,22 @@ fn reject_engine_error(
 }
 
 impl ProtoStream {
-    /// Count this stream's responses as progress for `worker`.
+    /// Count this stream's responses as progress for `worker`, and its
+    /// `prompt_tokens` as pending prefill there until the first response.
     #[must_use]
-    pub fn tracked(self, worker: Arc<dyn Worker>) -> Self {
+    pub fn tracked(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {
+        let prefill = (prompt_tokens > 0).then(|| {
+            worker.note_prefill_started(prompt_tokens);
+            PrefillTicket {
+                worker: Arc::clone(&worker),
+                tokens: prompt_tokens,
+                released: false,
+            }
+        });
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
+            prefill,
         }))
     }
 
@@ -2596,6 +2662,10 @@ impl ProtoStream {
                 let item = Box::pin(tracked.inner.next()).await;
                 if matches!(item, Some(Ok(_))) {
                     liveness::on_token_progress(&tracked.worker);
+                    if let Some(ticket) = tracked.prefill.as_mut() {
+                        ticket.first_response();
+                    }
+                    tracked.prefill = None;
                 }
                 return item;
             }
@@ -2636,8 +2706,16 @@ impl ProtoStream {
             Self::Zmq(stream) => Self::Zmq(stream),
             Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
             Self::Tracked(stream) => {
-                let TrackedStream { inner, worker } = *stream;
-                inner.defer_abort_until_first_item().tracked(worker)
+                let TrackedStream {
+                    inner,
+                    worker,
+                    prefill,
+                } = *stream;
+                Self::Tracked(Box::new(TrackedStream {
+                    inner: inner.defer_abort_until_first_item(),
+                    worker,
+                    prefill,
+                }))
             }
         }
     }
