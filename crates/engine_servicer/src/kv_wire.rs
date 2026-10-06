@@ -39,7 +39,10 @@
 //! folds to its last eight bytes big-endian, the integer vLLM would have sent
 //! for it.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
@@ -623,6 +626,13 @@ pub struct Counts {
     /// (the adapter path is not in the event), or a key shape it does not
     /// model.
     pub hash_unverifiable: u64,
+    /// Forwarded stores of a sliding-window group on a rank that showed no
+    /// main-attention group (a window-only model): the rank's only signal,
+    /// see the group policy on [`Normalizer`].
+    pub window_only_stores: u64,
+    /// Forwarded stores that named fewer blocks than their tokens spanned,
+    /// the hashes aligned to the tail of the tokens.
+    pub tail_aligned_stores: u64,
     pub dropped: HashMap<DropReason, u64>,
 }
 
@@ -662,9 +672,42 @@ struct RankState {
     tiers: HashMap<i32, HashMap<i64, BlockRecord>>,
     /// KV cache groups seen on stores: whether each is a main-attention group.
     groups: HashMap<u32, bool>,
+    /// Hashes forwarded from a sliding-window group while the rank had no
+    /// main-attention group, so their removals still go through once it has.
+    window_forwarded: HashSet<i64>,
+}
+
+impl RankState {
+    fn main_seen(&self) -> bool {
+        self.groups.values().any(|&main| main)
+    }
+}
+
+/// What the shared gates let through, and under which group policy.
+struct Admitted {
+    tier: KvCacheTier,
+    locality: KvCacheLocality,
+    /// A sliding-window group's event on a rank without a main-attention
+    /// group, forwarded as the rank's only signal.
+    window_only: bool,
 }
 
 /// Per-stream normalization state (one engine endpoint, all its DP ranks).
+///
+/// KV-cache groups: an event names its group (`group_idx`) and, on stores,
+/// the group's attention kind. A model with full attention alongside sliding
+/// windows (vLLM's hybrid KV-cache manager) publishes every block twice under
+/// the same hash, once per group: the full-attention group holds the whole
+/// prefix, which is what a prefix hit needs, while the window group names
+/// only the window's blocks against the whole computed span and removes them
+/// as the window moves on. So on a rank with a main-attention group every
+/// non-main event, store and removal alike, is dropped and counted
+/// ([`DropReason::NonMainAttentionGroup`]); forwarding the window group's
+/// removals would take the full group's copies out of the gateway's count.
+/// A rank that shows only sliding-window groups (a window-only model) would
+/// otherwise give the gateway nothing: its window stores are forwarded with
+/// their group identity, the hashes aligned to the tail of the tokens, and
+/// counted ([`Counts::window_only_stores`]).
 #[derive(Default)]
 pub struct Normalizer {
     ranks: HashMap<i32, RankState>,
@@ -801,6 +844,25 @@ impl Normalizer {
         sequence_number: u64,
         event_id: &mut u64,
     ) -> common::KvEventBatch {
+        // Learn the batch's groups before normalizing any of its events: the
+        // engine lists a sliding-window group's store before the
+        // full-attention group's in the same step, and what to do with the
+        // window group depends on whether the rank has a main group at all.
+        let rank = batch.dp_rank.unwrap_or(-1);
+        for event in &batch.events {
+            if let WireEvent::BlockStored(stored) = event {
+                if let (Some(group), Some(kind)) = (
+                    stored.tail.group_idx,
+                    stored.tail.kv_cache_spec_kind.as_deref(),
+                ) {
+                    self.ranks
+                        .entry(rank)
+                        .or_default()
+                        .groups
+                        .insert(group, MAIN_ATTENTION_KINDS.contains(&kind));
+                }
+            }
+        }
         let mut events = Vec::with_capacity(batch.events.len());
         for event in batch.events {
             *event_id += 1;
@@ -849,14 +911,17 @@ impl Normalizer {
         })
     }
 
-    /// The shared gates: ownership, locality, medium, cache group.
+    /// The shared gates: ownership, locality, medium, cache group. `hashes`
+    /// are the event's, for the one non-main event a rank with a main group
+    /// still forwards: the removal of blocks it forwarded while window-only.
     fn admit(
         &mut self,
         tail: &EventTail,
         rank: i32,
         event_id: u64,
         learn_group: bool,
-    ) -> Result<(KvCacheTier, KvCacheLocality), DropReason> {
+        hashes: &[BlockHash],
+    ) -> Result<Admitted, DropReason> {
         if is_residency_agent(tail.ownership.as_deref()) {
             return Err(self.drop(DropReason::UnsupportedOwnership, event_id));
         }
@@ -864,6 +929,7 @@ impl Normalizer {
             .map_err(|()| self.drop(DropReason::NonLocalLocality, event_id))?;
         let tier = tier_of(tail.medium.as_deref())
             .ok_or_else(|| self.drop(DropReason::UnknownMedium, event_id))?;
+        let mut window_only = false;
         if let Some(group) = tail.group_idx {
             let state = self.ranks.entry(rank).or_default();
             let main = match tail.kv_cache_spec_kind.as_deref() {
@@ -880,10 +946,21 @@ impl Normalizer {
                 None => state.groups.get(&group).copied().unwrap_or(true),
             };
             if !main {
-                return Err(self.drop(DropReason::NonMainAttentionGroup, event_id));
+                let forwarded_before = !learn_group
+                    && hashes
+                        .iter()
+                        .any(|hash| state.window_forwarded.contains(&hash.0));
+                if state.main_seen() && !forwarded_before {
+                    return Err(self.drop(DropReason::NonMainAttentionGroup, event_id));
+                }
+                window_only = true;
             }
         }
-        Ok((tier, locality))
+        Ok(Admitted {
+            tier,
+            locality,
+            window_only,
+        })
     }
 
     fn normalize_stored(
@@ -892,11 +969,16 @@ impl Normalizer {
         rank: i32,
         event_id: u64,
     ) -> Result<kv_cache_event::Data, DropReason> {
-        let (tier, locality) = self.admit(&stored.tail, rank, event_id, true)?;
+        let Admitted {
+            tier,
+            locality,
+            window_only,
+        } = self.admit(&stored.tail, rank, event_id, true, &stored.block_hashes)?;
         // A bigram page lists (token, next token) per position; its tokens
         // are the first elements and the page grid is unchanged. The pairs
         // stay around for the engine-hash check, which hashes both words.
-        let (token_ids, bigram_words): (Vec<u32>, Option<Vec<u32>>) = match stored.token_ids {
+        let (mut token_ids, mut bigram_words): (Vec<u32>, Option<Vec<u32>>) = match stored.token_ids
+        {
             WireTokens::Ids(ids) => (ids, None),
             WireTokens::Bigrams(pairs) => (
                 pairs.iter().map(|&(token, _)| token).collect(),
@@ -912,16 +994,30 @@ impl Normalizer {
         if stored.block_hashes.is_empty() || token_ids.is_empty() {
             return Err(self.drop(DropReason::Placeholder, event_id));
         }
-        let width = usize::try_from(stored.block_size).ok().filter(|&width| {
-            width > 0
-                && i32::try_from(width).is_ok()
-                && stored.block_hashes.len().checked_mul(width) == Some(token_ids.len())
-        });
+        // The hashes name block_size tokens each, normally the whole span. A
+        // sliding-window group's store spans the whole range the step
+        // computed while naming only the window's blocks, the newest ones,
+        // so fewer hashes than blocks take the tail of the tokens, never the
+        // head; a span that is not whole blocks is unreadable.
+        let width = usize::try_from(stored.block_size)
+            .ok()
+            .filter(|&width| width > 0 && i32::try_from(width).is_ok());
         let Some(width) = width else {
             return Err(self.drop(DropReason::UnalignedBlocks, event_id));
         };
+        let span = token_ids.len();
+        let tail_aligned = match stored.block_hashes.len().checked_mul(width) {
+            Some(need) if need == span => false,
+            Some(need) if need < span && span.is_multiple_of(width) => {
+                let start = span - need;
+                token_ids = token_ids.split_off(start);
+                bigram_words = bigram_words.map(|mut words| words.split_off(start * 2));
+                true
+            }
+            _ => return Err(self.drop(DropReason::UnalignedBlocks, event_id)),
+        };
         {
-            let mut seen = std::collections::HashSet::with_capacity(stored.block_hashes.len() + 1);
+            let mut seen = HashSet::with_capacity(stored.block_hashes.len() + 1);
             if let Some(parent) = stored.parent_block_hash {
                 seen.insert(parent.0);
             }
@@ -981,6 +1077,9 @@ impl Normalizer {
         if bigrams {
             self.counts.bigram_stores += 1;
         }
+        if tail_aligned {
+            self.counts.tail_aligned_stores += 1;
+        }
         if let Some(check) = self.hash_check {
             verify_hashes(
                 check,
@@ -997,6 +1096,15 @@ impl Normalizer {
                     cache_salt: namespace.cache_salt.as_deref(),
                 },
             );
+        }
+
+        if window_only {
+            self.counts.window_only_stores += 1;
+            self.ranks
+                .entry(rank)
+                .or_default()
+                .window_forwarded
+                .extend(stored.block_hashes.iter().map(|hash| hash.0));
         }
 
         let cache_level = cache_level_of(tier);
@@ -1050,17 +1158,29 @@ impl Normalizer {
         rank: i32,
         event_id: u64,
     ) -> Result<kv_cache_event::Data, DropReason> {
-        let (tier, locality) = self.admit(&removed.tail, rank, event_id, false)?;
-        if let Some(blocks_state) = self
-            .ranks
-            .get_mut(&rank)
-            .and_then(|state| state.tiers.get_mut(&(tier as i32)))
-        {
-            for hash in &removed.block_hashes {
-                blocks_state.remove(&hash.0);
+        let Admitted {
+            tier,
+            locality,
+            window_only,
+        } = self.admit(&removed.tail, rank, event_id, false, &removed.block_hashes)?;
+        let mut block_hashes: Vec<i64> = removed.block_hashes.iter().map(|hash| hash.0).collect();
+        if let Some(state) = self.ranks.get_mut(&rank) {
+            if window_only {
+                // Once the rank has a main group, a window group's removal
+                // reaches only the blocks forwarded while it had none.
+                if state.main_seen() {
+                    block_hashes.retain(|hash| state.window_forwarded.contains(hash));
+                }
+                for hash in &block_hashes {
+                    state.window_forwarded.remove(hash);
+                }
+            }
+            if let Some(blocks_state) = state.tiers.get_mut(&(tier as i32)) {
+                for hash in &block_hashes {
+                    blocks_state.remove(hash);
+                }
             }
         }
-        let block_hashes = removed.block_hashes.iter().map(|hash| hash.0).collect();
         self.counts.forwarded_removed += 1;
         let EventTail {
             medium,
@@ -1927,5 +2047,148 @@ mod tests {
         // Without the check, a wrong hash is nobody's business here.
         let (_, normalizer) = normalize_all(vec![one(vec![store(&[1], None, &[1, 2, 3, 4])])]);
         assert_eq!(normalizer.counts().hash_checked, 0);
+    }
+
+    /// A sliding-window group's store: the window's blocks against the whole
+    /// span the step computed.
+    fn window(hashes: &[i64], parent: Option<i64>, tokens: &[u32]) -> Value {
+        let event = with(store(hashes, parent, tokens), "group_idx", json!(1));
+        let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
+        with(event, "kv_cache_spec_sliding_window", json!(128))
+    }
+
+    fn remove_in(hashes: &[i64], group: u32) -> Value {
+        with(remove(hashes), "group_idx", json!(group))
+    }
+
+    #[test]
+    fn two_groups_with_identical_hashes_index_the_full_attention_group_once() {
+        // vLLM's hybrid manager publishes every block in both groups under
+        // the same hash, the window group's store first in the step and its
+        // removals as the window moves on; only the full-attention group's
+        // events are forwarded, stores and removals alike, so the gateway
+        // counts one copy per physical block.
+        let (batches, normalizer) = normalize_all(vec![
+            one(vec![
+                window(&[2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+                store(&[1, 2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            ]),
+            one(vec![
+                remove_in(&[2], 1),
+                store(&[1, 2], None, &[1, 2, 3, 4, 5, 6, 7, 8]), // the second copy
+                remove_in(&[1], 0),
+                remove_in(&[1], 0),
+            ]),
+        ]);
+        assert_eq!(batches[0].events.len(), 1);
+        let full = stored(&batches[0].events[0]);
+        assert_eq!(
+            full.blocks.iter().map(|b| b.block_hash).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(full.group_idx, Some(0));
+        assert_eq!(batches[1].events.len(), 3);
+        assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![1]);
+        assert_eq!(removed(&batches[1].events[2]).block_hashes, vec![1]);
+        let counts = normalizer.counts();
+        assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 2);
+        assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (2, 2));
+        assert_eq!(
+            (
+                counts.duplicate_stores,
+                counts.window_only_stores,
+                counts.tail_aligned_stores
+            ),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_window_groups_hashes_take_the_tail_of_its_tokens() {
+        // A rank with only a sliding-window group: a store spans the whole
+        // range the step computed and names the window's last blocks, so the
+        // hashes get the tail of the tokens, and the group rides along.
+        let span: Vec<u32> = (1..=12).collect();
+        let (batches, normalizer) = normalize_all(vec![one(vec![
+            window(&[5], None, &span),
+            window(&[6, 7], Some(5), &span),
+            // A span that is not whole blocks is unreadable.
+            window(&[8], Some(7), &(1..=13).collect::<Vec<u32>>()),
+            // The window moved on without caching anything new.
+            window(&[], Some(7), &(1..=16).collect::<Vec<u32>>()),
+        ])]);
+        assert_eq!(batches[0].events.len(), 2);
+        let first = stored(&batches[0].events[0]);
+        assert_eq!(first.blocks[0].token_ids, vec![9, 10, 11, 12]);
+        assert_eq!(first.group_idx, Some(1));
+        assert_eq!(first.kv_cache_spec_kind.as_deref(), Some("sliding_window"));
+        assert_eq!(first.kv_cache_spec_sliding_window, Some(128));
+        let second = stored(&batches[0].events[1]);
+        assert_eq!(
+            second
+                .blocks
+                .iter()
+                .map(|b| b.token_ids.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![5, 6, 7, 8], vec![9, 10, 11, 12]]
+        );
+        assert_eq!(second.parent_block_hash, Some(5));
+        let counts = normalizer.counts();
+        assert_eq!(
+            (counts.window_only_stores, counts.tail_aligned_stores),
+            (2, 2)
+        );
+        assert_eq!(counts.dropped(DropReason::UnalignedBlocks), 1);
+        assert_eq!(counts.dropped(DropReason::Placeholder), 1);
+    }
+
+    #[test]
+    fn a_window_only_rank_is_forwarded_until_a_main_group_appears() {
+        let (batches, normalizer) = normalize_all(vec![
+            one(vec![
+                window(&[1], None, &[1, 2, 3, 4]),
+                remove_in(&[1], 1),
+                window(&[2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            ]),
+            one(vec![
+                store(&[3], None, &[1, 2, 3, 4]), // a main-attention group shows up
+                window(&[4], Some(3), &[1, 2, 3, 4, 5, 6, 7, 8]),
+                remove_in(&[2], 1), // forwarded while window-only: still removable
+                remove_in(&[9], 1), // never forwarded: dropped
+                remove_in(&[2, 9], 1), // nothing left of it
+            ]),
+        ]);
+        assert_eq!(batches[0].events.len(), 3);
+        assert_eq!(batches[1].events.len(), 2);
+        assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![2]);
+        let counts = normalizer.counts();
+        assert_eq!(
+            (counts.window_only_stores, counts.tail_aligned_stores),
+            (2, 1)
+        );
+        assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 3);
+    }
+
+    #[test]
+    fn one_copy_removals_pass_through_uncollapsed() {
+        // vLLM keeps up to two physical blocks per hash and publishes a
+        // removal when one copy goes; the gateway counts copies, so both
+        // stores and both removals must reach it as they are.
+        let (batches, normalizer) = normalize_all(vec![one(vec![
+            store(&[1], None, &[1, 2, 3, 4]),
+            store(&[1], None, &[1, 2, 3, 4]),
+            remove(&[1]),
+            remove(&[1]),
+        ])]);
+        assert_eq!(batches[0].events.len(), 4);
+        let counts = normalizer.counts();
+        assert_eq!(
+            (
+                counts.forwarded_stored,
+                counts.forwarded_removed,
+                counts.duplicate_stores
+            ),
+            (2, 2, 1)
+        );
     }
 }

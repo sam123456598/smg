@@ -111,7 +111,7 @@ use zeromq::{
 use crate::{
     kv_history::{History, Window},
     kv_state::{LiveState, Snapshot, SnapshotChunks},
-    kv_wire::{low64_big_endian, Normalizer, WireBatch, WireEvent},
+    kv_wire::{low64_big_endian, Counts as WireCounts, Normalizer, WireBatch, WireEvent},
     BoxStream,
 };
 
@@ -144,6 +144,10 @@ const PRIME_RETRY: Duration = Duration::from_secs(1);
 /// Live batches a slow subscriber may fall behind before it is refilled from
 /// the history.
 const LIVE_CHANNEL: usize = 4_096;
+/// A relay summary line (relay and normalizer counters) every this many
+/// relayed batches, so a live run shows them before the relay closes.
+const SUMMARY_EVERY_BATCHES: u64 = 500;
+
 /// How often a subscriber's stream checks the load record for a change.
 pub const DEFAULT_LOAD_TICK: Duration = Duration::from_millis(100);
 /// Silence after which a `load_only` heartbeat goes out.
@@ -339,6 +343,9 @@ struct Shared {
     /// Counts the publisher's restarts; sequences compare within one.
     generation: u64,
     counts: RelayCounts,
+    /// The normalizer's counters as of the last relayed batch: what was
+    /// forwarded, dropped by reason, and the engine-hash check's tally.
+    wire: WireCounts,
     /// Why the publisher task gave up, when it did.
     failed: Option<String>,
 }
@@ -458,6 +465,7 @@ impl Drop for KvEventRelay {
         info!(
             endpoint = %self.config.endpoint,
             ?counts,
+            wire = ?shared.wire,
             window = shared.history.len(),
             holes = shared.history.holes(),
             bytes = shared.history.bytes(),
@@ -477,6 +485,7 @@ impl KvEventRelay {
                 state: LiveState::new(),
                 cursor: None,
                 started_at: None,
+                wire: WireCounts::default(),
                 unknown_before: 0,
                 generation: 0,
                 counts: RelayCounts::default(),
@@ -514,6 +523,12 @@ impl KvEventRelay {
 
     pub fn counts(&self) -> RelayCounts {
         lock(&self.shared).counts.clone()
+    }
+
+    /// The normalizer's counters as of the last relayed batch (forwarded,
+    /// dropped by reason, the engine-hash check's tally).
+    pub fn wire_counts(&self) -> WireCounts {
+        lock(&self.shared).wire.clone()
     }
 
     /// Record `batches` as relayed without a publisher: the history, the
@@ -1008,6 +1023,13 @@ async fn run(
         normalizer: Normalizer::from_env(),
         event_id: 0,
     };
+    if let Some(check) = relay.normalizer.hash_check() {
+        info!(
+            endpoint = %config.endpoint,
+            check = check.as_str(),
+            "KV event engine-hash check on; its tally is in the relay's summary and closing lines"
+        );
+    }
     // The publisher may have been counting before the subscription reached
     // it: take what its replay still holds before the first live batch, and
     // keep asking until the engine answers (it may still be starting). A
@@ -1153,6 +1175,17 @@ impl Relaying<'_> {
             shared.counts.relayed += 1;
             if undecodable {
                 shared.counts.undecodable_batches += 1;
+            }
+            shared.wire = self.normalizer.counts().clone();
+            if shared.counts.relayed.is_multiple_of(SUMMARY_EVERY_BATCHES) {
+                info!(
+                    endpoint = %self.config.endpoint,
+                    counts = ?shared.counts,
+                    wire = ?shared.wire,
+                    live_blocks = shared.state.blocks(),
+                    live_entries = shared.state.entries(),
+                    "KV event relay summary"
+                );
             }
         }
         let _ = self.live.send(Live::Batch(batch));
@@ -2383,6 +2416,7 @@ mod tests {
             unknown_before: 0,
             generation: 0,
             counts: RelayCounts::default(),
+            wire: WireCounts::default(),
             failed: None,
         };
         let restart = |reason| Admission::Restart { reason, last: 500 };
@@ -3111,5 +3145,28 @@ mod tests {
             assert_eq!(read(&mut snapshot).await.sequence_number, expected);
             expected += 1;
         }
+    }
+
+    /// The normalizer's counters ride on the relay: readable after every
+    /// relayed batch and logged with the relay's own counts, so a live run
+    /// shows what was forwarded, dropped by reason and, with the engine-hash
+    /// check on, verified.
+    #[tokio::test]
+    async fn the_relays_wire_counts_follow_the_normalizer() {
+        let mut lab = start_lab(8, false).await;
+        assert_eq!(lab.relay.wire_counts(), WireCounts::default());
+        lab.prime().await;
+        lab.publish(1, &golden::bytes(golden::BATCH2)).await;
+        lab.wait_relayed(2).await;
+        let wire = lab.relay.wire_counts();
+        assert!(
+            wire.forwarded_stored + wire.forwarded_removed + wire.forwarded_cleared > 0,
+            "{wire:?}"
+        );
+        assert_eq!(
+            wire.hash_checked, 0,
+            "the check is off unless the environment asks"
+        );
+        assert_eq!(wire.window_only_stores, 0);
     }
 }
