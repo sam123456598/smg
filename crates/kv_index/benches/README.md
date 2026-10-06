@@ -375,6 +375,8 @@ SMG harness rows (the cross-check):
 | control (same binary) (SMG PositionalIndexer) | same | 20 / 2 | 0 of 20 | 132.6 [131.2, 133.1] | | 31.9 [30.5, 32.1] | 597 [592, 605] | |
 | SMG RunIndex, SMG harness | sustained bracket (559 ms window, 572M offered) | 21 / 0 | 18 of 21 | 570.3 [570.0, 570.6] | 10.97 (52 cores) | 1.1 [1.1, 1.1] | 6 [6, 6] | -0.1 [-0.5, +0.4], -0.0 [-0.0, +0.0], +0.0 [-0.0, +0.1] |
 | control (same binary) (SMG RunIndex) | same | 20 / 1 | 20 of 20 | 570.3 [570.1, 570.5] | | 1.1 [1.1, 1.1] | 6 [6, 6] | |
+| SMG RunIndex, SMG harness | sustained, re-bracketed (470 ms window, 682M offered; the 571.7M point was decided by one trial at 96.9% of 611.3M, the new bracket keeps up at 681.6M and fails at 719.8M on one generator-invalid trial, 760M fails) | 20 / 6 | 19 of 20 | 679.6 [679.3, 679.8] | 13.07 (52 cores) | 1.1 [1.1, 1.1] | 6 [6, 6] | +0.0 [-0.4, +0.5], +0.0 [-0.0, +0.0], -0.0 [-0.2, +0.2] |
+| control (same binary) (SMG RunIndex) | same | 21 / 5 | 20 of 21 | 679.6 [679.1, 679.7] | | 1.1 [1.1, 1.1] | 6 [6, 6] | |
 | SMG RunIndex, SMG harness | overload (279 ms window, 1.14B offered) | 21 / 0 | 2 of 21 | 1069.9 [980.0, 1114.6] | 20.58 (52 cores) | 1.0 [1.0, 1.1] | 8 [7, 8] | +41.7 [-71.4, +127.2], +0.0 [-0.1, +0.1], -1.0 [-2.0, +0.1] |
 | control (same binary) (SMG RunIndex) | same | 20 / 1 | 1 of 20 | 1028.3 [958.0, 1076.7] | | 1.0 [1.0, 1.1] | 9 [8, 9] | |
 | no indexer (harness ceiling), SMG harness | sustained bracket (191 ms window, 1.67B offered) | 20 / 2 | 18 of 20 | 1667.9 [1667.5, 1668.1] | 32.07 (52 cores) | 0.5 [0.5, 0.5] | 4 [4, 4] | -0.1 [-0.5, +2.6], +0.0 [+0.0, +0.0], +0.0 [-0.0, +0.0] |
@@ -400,8 +402,9 @@ cores). The SMG harness reads 7% lower than Dynamo's for the same indexers at th
 points (positional 122.0 against 131.6M, run index 570.3 against 654.6M) with the same latencies
 within 2 us at p99, and its run-index overload row shows the bracket is conservative: at 1.14B
 offered the index still achieved 1,069.9M [980, 1,115] (94% of offered, 2 of 21 trials kept up),
-so its ceiling in this harness lies near 1.1B and the 571.7M bracket, decided by one trial at
-96.9% of 611.3M, is being re-bracketed higher.
+so its ceiling in this harness lies near 1.1B; the re-bracketed point (681.6M kept up, 719.8M
+lost to one generator-invalid trial, 760M failing at 93.2% in one trial) and its 20-trial series
+are the row above the overload row (679.6M, 19 of 20, p99 6 us).
 
 Discarded trials were replaced and are listed per series in `summary.md`: across the twelve
 scaled series 0-13 of 40-58 attempts each were discarded for other users' jobs above half a core
