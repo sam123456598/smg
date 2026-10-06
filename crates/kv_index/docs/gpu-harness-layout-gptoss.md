@@ -75,6 +75,42 @@ current date, reasoning level and channels, then the developer turn) is shared b
    `hash_mismatch` counts in logs or metrics; the offline reproduction above stands in until the servicer lane's
    follow-up.
 
+## Re-run on 823792b5: the cap was the servicer's, and it is gone
+
+Same session on the pushed head 823792b5 (servicer wheel with the KV-cache group policy, the normalizer and hash-check
+counters, the pushed load records and the start-time replay priming; gateway and replay client from the same revision),
+same engine launch, same three phases, plus the replay joining each debug gateway's decisions (`agree` per request) and a
+fourth phase that sends one fixed 3,656-token prompt twice through the phase-3 gateway.
+
+| phase (823792b5 wheel + gateway) | served | router branches | router credit / prompt | engine reuse | `agree` | `event_hit` overlap blocks min / median / max |
+|---|---|---|---|---|---|---|
+| 2: first `cache_aware` gateway, rows 300-599 | 260 | `event_hit` 260, `event_miss` 0 | 0.518 | 0.518 | 260 / 260 | 4 / 34 / 364 |
+| 3: fresh gateway after the window rolled (snapshot), rows 0-299 again | 265 | `event_hit` 265, `event_miss` 0 | 0.503 | 0.503 | 264 / 265 | 4 / 154 / 365 |
+| 4: trace prompt, send 1 | 1 | `event_hit` 4 of 228 blocks (the preamble, which the engine had meanwhile evicted: `cached_tokens` 0) | | | | |
+| 4: trace prompt, send 2 | 1 | `event_hit` 228 of 228 blocks; engine `cached_tokens` 3,648 of 3,656 (every full block) | | | | |
+
+The router's credit now equals engine truth on every request but one, and the overlap distribution is the engine's
+(34 blocks for the 544-token shared prefixes, 364-365 for the 5,824-token ones). Relay closing line: relayed 1,135,
+served_snapshots 2, publisher_gaps 0, `forwarded_stored` 2,199, `forwarded_removed` 140,173, `duplicate_stores` 1,
+`dropped: {NonMainAttentionGroup: 8,077}` (the window group's 2,200 stores and 5,877 removals), `window_only_stores` 0,
+`tail_aligned_stores` 0, `hash_checked` 10,558, `hash_mismatch` 0, `hash_unverifiable` 138,377, live_blocks 8,762; the
+relay asked the publisher's replay at start (it held nothing yet) and the late-join loss did not recur. The
+`hash_unverifiable` count is exactly the single-copy cascade of item 1: the checker's parent memory forgets a hash at its
+first removal, so 93 % of the main group's stores cannot be verified although the offline reproduction verifies all of
+them; a copy-counted parent memory would check them all.
+
+Trace, both sides: the gateway's tokenization of the HF-rendered prompt string and the HF tokenizer agree token for
+token (3,654); the engine's stored prompt for the chat request has two more tokens before the user text (the gateway's
+own chat rendering, 3,656) and is identical to the gateway's ids from the user text on (3,550 of 3,550 compared), so the
+lookup and the stored blocks hash the same ids, which is what the 228-of-228 overlap shows.
+
+Attribution (A/B): the 85f9d28c servicer wheel under the same 823792b5 gateway brings the cap back in full: phase 2
+`event_hit` 61 (all at 4 blocks) / `event_miss` 199, router credit 0.003 of the prompt against engine reuse 0.518; phase 3
+30 / 235, credit 0.001 against 0.503; `agree` 0 of 525; the trace prompt's second send alone matched 228 blocks (a fresh
+chain, no eviction involved). The four-block cap was therefore on the servicer side of 85f9d28c (what the relay forwarded
+or how the normalizer chained stores after a copy's removal), not in the gateway's index, and 823792b5 removes it. The
+servicer lane names the mechanism from its side; this run closes the question for the harness.
+
 ## Next
 
 When the group-aware normalizer ships, the first run on the fleet is this same gpt-oss replay with the new wheel,
