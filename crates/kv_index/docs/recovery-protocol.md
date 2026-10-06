@@ -347,6 +347,81 @@ tiny `KvEventStreamInfo`) states `replay_supported`, `snapshot_supported`, `reta
 (replay buffer size) and `block_size`. The gateway uses them to pick a recovery path without a
 failed round trip and exposes them as metrics.
 
+### 6. Pushed load updates (design note, 2026-10-05; decision pending, nothing built)
+
+**Why.** The load-aware policies (`least_load`, `cache-aware-balanced`) score on five numbers the
+gateway polls per worker with `GetLoads` every `load_monitor_interval` (10 s by default): queued
+requests, queued uncached token-work, running requests, token usage, generation rate. On the GB300
+fleet the 10 s picture produced the hot worker (one fallback target at KV 1.00 with a 15-38-deep
+queue) and a 1 s poll removed it (`gpu-harness-e69487f8.md` section 6), but a 1 s poll is 10,000
+RPCs per second per gateway at fleet scale and is ruled out. The policy lane's v2 already prices
+in-flight work locally (token-work dispatched since the last report, reset when a report arrives)
+and treats the engine's report as a slow correction; what it needs is that correction arriving when
+the engine's state changes, not on a timer.
+
+**Option A: piggyback on the KV-event stream.** Every batch the relay streams already crosses the
+wire once per scheduler step of the engine, which is exactly when queue, running set, KV usage and
+rate change. Add one message to `KvEventBatch` (field 8; 5-7 are taken or reserved):
+
+```proto
+message EngineLoad {
+  uint32 running_requests = 1;         uint32 waiting_requests = 2;
+  uint32 waiting_uncached_tokens = 3;  uint32 token_usage_permille = 4;
+  uint32 gen_tokens_per_second = 5;    uint32 age_ms = 6;   // of the sample behind it
+  bool heartbeat = 7;  // the batch carries no events and no new sequence: read the load, admit nothing
+}
+message KvEventBatch { ...; EngineLoad load = 8; }
+```
+
+The servicer (not the relay, which stays engine-neutral) attaches the record at send time from the
+bookkeeping `GetLoads` answers from, per rank (`dp_rank` is on the batch already). Cost: six
+varints and a bool, about 20-30 bytes per batch (at most 40), against batches of 7-27 KB on the
+recorded engines (SGLang median 6.8 KB, vLLM median 26.7 KB; a 64-block store encodes to 3.4 KB):
+under one percent. Rate: whatever the event rate is, 15-20 batches per second per worker on the 8B
+fleet at 3x Mooncake, so the gateway sees a record every 50-100 ms per loaded worker, and none for
+an idle one. Idle engines therefore need the heartbeat: a batch with no events, the last relayed
+sequence as its stamp and `heartbeat = true`, sent when no batch went out for `heartbeat_interval`
+(1 s, backing off to 5 s after two idle heartbeats; an idle engine's load does not move). At fleet
+scale that is at most one 30-byte one-way message per second per idle worker on a stream that
+already exists, no RPC, no server work beyond a timer; the gateway reads the load, skips admission
+(the stamp is a duplicate by design) and treats a worker with no record for twice the interval as
+having no fresh snapshot, which the policies already score from live in-flight alone.
+
+**Option B: a `SubscribeLoads` server stream with on-change semantics.** One more long-lived stream
+per worker (the connection is shared; HTTP/2 multiplexes it with the event stream), the servicer
+pushing a record when a field moved past a threshold (a running or waiting request, 10 % or 4,096
+tokens of queued token-work, 0.02 of token usage) and never more often than `min_interval`, plus a
+heartbeat every `max_interval`. Decoupled from events, so it also serves engines that publish none
+and keeps load updates flowing when the relay is replaying or snapshotting. Cost: bounded only by
+`min_interval` in the worst case (10,000 workers at 100 ms is 100,000 messages per second per
+gateway), so at fleet scale `min_interval` must be 500 ms or more, which is back to a slow picture
+exactly in the bursts the thresholds are for; the steady-state rate under the thresholds is far
+lower, but the bound is what has to be provisioned.
+
+**Option C: both.** A for the hot path, B for the idle heartbeat and for event-less engines; two
+code paths to reconcile on the gateway for one struct.
+
+**Gateway reconciliation (either option).** A pushed record replaces the polled
+`SchedulerLoadSnapshot` for its rank (same struct, same `smg_engine_*` gauges, same per-worker
+aggregation across ranks) and resets the in-flight tally the way a poll does, so v2's shape is
+unchanged and the correction merely arrives sooner: with records every 100 ms the in-flight term
+covers 100 ms of dispatches instead of 10 s. One hazard the poll path shares and this makes
+visible: a request dispatched just before the record was sampled is in neither the record nor the
+tally once the tally resets. Keep dispatches stamped and reset only those older than the record's
+sample (`age_ms` plus the gateway-side one-way latency, 20 ms covers it), so a request is counted
+exactly once at every instant. A record older than the heartbeat bound demotes the worker to the
+"no fresh snapshot" scoring, never to zero load.
+
+**Recommendation to decide on.** A first: one optional message, the servicer already has the
+numbers and the per-worker stream, the gateway already owns one task per worker on that stream
+(`kv_event_monitor`) that can hand the record to the load state; B only if event-less gRPC engines
+need load pushing. Open choices for the policy lane: the field set (the five above plus
+`max_total_tokens` once, or `token_usage_permille` as proposed), the heartbeat interval and
+backoff, whether a record on a snapshot chunk is wanted (it is the servicer's current load, which is
+fine, but the chunk is not a scheduler step), and whether `GetLoads` stays as the probe for the
+first report and for gauges. The poll stays as the fallback for workers whose servicer predates the
+field.
+
 ### 5. Servicer-side changes that need no proto change
 
 - Done on the Rust relay: a non-zero cursor it cannot honour is `OUT_OF_RANGE`, and one
