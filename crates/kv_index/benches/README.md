@@ -305,11 +305,26 @@ kept up / 634.9M failing (one trial at 92.4% under foreign load) and a 20-trial 
 read 587.9M [585.2, 588.5], 14 of 19 kept up with 10 of 29 attempts discarded, p50 3.5 / p99 14.0
 us; but an interleaved same-session control of the two binaries afterwards kept up 3 of 3 for both
 at 682.2M (old 99.2-99.6%, new 99.2-99.3%) and at 590.8M (99.1-99.7% both) with identical lookup
-latencies (p50 3.2-3.6, p99 13-15 us). The head's code change has no measurable effect on the
-competitor's sustained point or latencies; the first-pass failure and the lower bracket were the
-host's foreign load during those minutes, and the published 682.2M row stands for the new head
-until a quiet-host bracket replaces it (results: `competitor-head/`, `bisect-dynamo-head2b20`,
-`protocol/dynamo-sustained-head2b20`, with provenance).
+latencies (p50 3.2-3.6, p99 13-15 us); the first-pass failure and the lower bracket were the
+host's foreign load during those minutes (results: `competitor-head/`, `bisect-dynamo-head2b20`,
+`protocol/dynamo-sustained-head2b20`).
+
+Quiet-host rows for the new head (02:15-02:56 on 2026-10-06, host load 16-22, the editor server
+still present and costing discards), competitor layout, brackets with verified ends and 20-trial
+series with interleaved controls (`bisect-dynamo-head2b20q[-localmem]`,
+`protocol/dynamo-sustained-head2b20q[-localmem]`):
+
+| Memory | Keeps up at | Fails at (trials) | Series at the kept-up point: achieved median [95% CI] (M) | Per lane core (M) | Kept up | Lookup p50 / p99 (us) | Control |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `--interleave=all` (published method) | 744.5M (430 ms; 692.8M 3 of 3 clean) | 800.0M (98.9%, 99.2%, 99.3%) | 739.1 [736.8, 740.8] | 12.5 | 13 of 20 (6 discarded) | 3.3 [3.1, 3.4] / 13.8 [13.0, 14.0] | 739.1 [735.6, 741.1], 14 of 21 |
+| local (`cpunodebind=0 membind=0`) | 924.0M (346 ms) | 992.9M (97.4%, 96.6%, 98.0%) | 918.1 [916.1, 919.4] | 15.5 | 16 of 22 (3 discarded) | 2.7 [2.7, 2.7] / 9.9 [9.9, 10.0] | 917.9 [914.5, 918.9], 12 of 20 |
+
+These are the competitor's top-of-stack rows: 744.5M interleaved against the 682.2M published for
+`50bdb355f8` (+9%), 924.0M local against 859.7M (+7%), lookups unchanged. Whether the gain is the
+head's chunked idle drain or the quieter host than the earlier brackets had is settled by the
+measured `50bdb355f8` binary at these same points in the same session (`competitor-head/newpoints-*`,
+reported with the rows); the two systems' same-binary ratio with local memory becomes 1,383.8M
+against 924.0M = 1.50x at p99 3-4 against 10 us.
 
 ## Scaled layout: equal backend cores and same-binary rows
 
