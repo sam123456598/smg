@@ -45,7 +45,7 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use kv_index::{
-    ContentHash, PositionalIndexer, ReferenceIndexer, RunBlockMap, RunIndex, SequenceHash,
+    ContentHash, PositionalIndexer, ReferenceIndexer, RunBlockMap, SequenceHash, ShardedRunIndex,
     StoredBlock, WorkerBlockMap,
 };
 use rustc_hash::FxHashMap;
@@ -328,6 +328,15 @@ trait ReplayBackend: Send + Sync + 'static {
     type Lane: Send;
     fn name(&self) -> &'static str;
     fn new_lane(&self) -> Self::Lane;
+    /// A lane with its index and the CPUs it is pinned to (one CPU under `--pin-event-lanes`);
+    /// backends that place state by lane override it.
+    fn new_lane_for(&self, _lane: usize, _cpus: &[usize]) -> Self::Lane {
+        self.new_lane()
+    }
+    /// Figures to print and record at the end of a run, if the backend has any.
+    fn report(&self) -> Option<String> {
+        None
+    }
     /// Apply one stored event; `false` when the backend rejected it (counted, as Dynamo's lanes
     /// count rejected events).
     fn apply_stored(
@@ -437,10 +446,30 @@ impl ReplayBackend for Positional {
 }
 
 struct Run {
-    inner: RunIndex,
+    inner: ShardedRunIndex,
+    /// The shard of every backend CPU (by position in the backend CPU list): the NUMA node's
+    /// index when the list spans exactly `shards` nodes, else contiguous groups of the list.
+    shard_of_cpu: FxHashMap<usize, usize>,
+    event_lanes: usize,
+}
+
+impl Run {
+    fn shard_for(&self, lane: usize, cpus: &[usize]) -> usize {
+        let shards = self.inner.shards();
+        if shards == 1 {
+            return 0;
+        }
+        match cpus {
+            [cpu] => self.shard_of_cpu.get(cpu).copied().unwrap_or(0),
+            // A floating lane has no socket: shards by lane index, exact but without the
+            // placement the split exists for.
+            _ => lane * shards / self.event_lanes.max(1),
+        }
+    }
 }
 
 struct RunLane {
+    shard: usize,
     workers: FxHashMap<(u64, u32), (u32, RunBlockMap)>,
 }
 
@@ -453,8 +482,42 @@ impl ReplayBackend for Run {
 
     fn new_lane(&self) -> Self::Lane {
         RunLane {
+            shard: 0,
             workers: FxHashMap::default(),
         }
+    }
+
+    fn new_lane_for(&self, lane: usize, cpus: &[usize]) -> Self::Lane {
+        RunLane {
+            shard: self.shard_for(lane, cpus),
+            workers: FxHashMap::default(),
+        }
+    }
+
+    fn report(&self) -> Option<String> {
+        let mut out = format!("shards = {}", self.inner.shards());
+        for (shard, stats) in self.inner.shard_stats().iter().enumerate() {
+            out.push_str(&format!(
+                "\n  shard {shard}: distinct blocks {} runs live {} blocks in live runs {} arena bytes {} (chunks {}, free-listed {}) slab bytes {}",
+                self.inner.shard(shard).entry_count(),
+                stats.runs_live,
+                stats.blocks_live,
+                stats.arena_bytes,
+                stats.arena_chunk_bytes,
+                stats.arena_free_bytes,
+                stats.slab_bytes
+            ));
+        }
+        let total = self.inner.stats();
+        out.push_str(&format!(
+            "\n  total: memberships {} distinct blocks summed over shards {} arena bytes {} chunks {} slab bytes {}",
+            self.inner.current_size(),
+            self.inner.entry_count(),
+            total.arena_bytes,
+            total.arena_chunk_bytes,
+            total.slab_bytes
+        ));
+        Some(out)
     }
 
     fn apply_stored(
@@ -467,7 +530,7 @@ impl ReplayBackend for Run {
         let (smg_id, blocks_map) = lane.workers.entry(worker).or_insert_with(|| {
             let id = self
                 .inner
-                .intern_worker(&format!("{}:{}", worker.0, worker.1))
+                .intern_worker_in(lane.shard, &format!("{}:{}", worker.0, worker.1))
                 .expect("worker slots; raise --max-workers");
             (id, RunBlockMap::default())
         });
@@ -735,17 +798,44 @@ struct EventCompletion {
     ok: bool,
 }
 
+/// Where an event lane runs: its index, the CPUs it is pinned to (one under `--pin-event-lanes`)
+/// and whether it prefers its own NUMA node for memory.
+struct LanePlacement {
+    index: usize,
+    cpus: Arc<[usize]>,
+    local_memory: bool,
+}
+
 fn event_lane_worker<B: ReplayBackend>(
     backend: Arc<B>,
     receiver: mpsc::Receiver<EventMsg>,
     corpus: Arc<Corpus>,
     epoch: Instant,
-    cpus: Arc<[usize]>,
+    placement: LanePlacement,
     expected: usize,
 ) -> (Vec<EventCompletion>, u64) {
+    let LanePlacement {
+        index: lane_index,
+        cpus,
+        local_memory,
+    } = placement;
     let _ = pin_current_thread(&cpus);
+    if local_memory {
+        match cpus.first().and_then(|&cpu| node_of_cpu(cpu)) {
+            Some(node) => {
+                if let Err(err) = prefer_node(node) {
+                    println!(
+                        "event lane {lane_index}: set_mempolicy for node {node} failed: {err}"
+                    );
+                }
+            }
+            None => println!(
+                "event lane {lane_index}: no NUMA node for CPUs {cpus:?}, memory policy inherited"
+            ),
+        }
+    }
     let cpu_started = thread_cpu_time_ns();
-    let mut lane = backend.new_lane();
+    let mut lane = backend.new_lane_for(lane_index, &cpus);
     let mut completions = Vec::with_capacity(expected);
     while let Ok(EventMsg { id, payload }) = receiver.recv() {
         let op = &corpus.ops[id as usize];
@@ -897,6 +987,49 @@ fn pin_current_thread(cpus: &[usize]) -> std::io::Result<()> {
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
+    }
+    Ok(())
+}
+
+/// The NUMA node a CPU belongs to, from `/sys/devices/system/node/node*/cpulist`.
+fn node_of_cpu(cpu: usize) -> Option<usize> {
+    let nodes = std::fs::read_dir("/sys/devices/system/node").ok()?;
+    for entry in nodes.flatten() {
+        let name = entry.file_name();
+        let Some(number) = name.to_str().and_then(|n| n.strip_prefix("node")) else {
+            continue;
+        };
+        let Ok(node) = number.parse::<usize>() else {
+            continue;
+        };
+        let Ok(list) = std::fs::read_to_string(entry.path().join("cpulist")) else {
+            continue;
+        };
+        if parse_cpu_list(list.trim()).is_ok_and(|cpus| cpus.contains(&cpu)) {
+            return Some(node);
+        }
+    }
+    None
+}
+
+/// Prefer `node` for this thread's page allocations from now on (`set_mempolicy`,
+/// `MPOL_PREFERRED`): the arena chunks, run slab chunks and lane maps a lane first touches land
+/// on its own socket whatever the process policy (`numactl --interleave=all` in the protocol).
+fn prefer_node(node: usize) -> std::io::Result<()> {
+    let mut mask = [0u64; 16];
+    mask[node / 64] |= 1u64 << (node % 64);
+    // SAFETY: set_mempolicy reads `maxnode` bits from `mask`, which holds 16 * 64 of them, and
+    // changes only the calling thread's allocation policy.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            libc::MPOL_PREFERRED as libc::c_long,
+            mask.as_ptr(),
+            (mask.len() * 64) as libc::c_ulong,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -1081,6 +1214,14 @@ fn issue_events(
 // Run
 // ---------------------------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LaneMemory {
+    /// The process policy (the protocol's `numactl --interleave=all`).
+    Inherit,
+    /// Each pinned event lane prefers its own NUMA node (`set_mempolicy(MPOL_PREFERRED)`).
+    Local,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BackendKind {
     /// This crate's event-driven PositionalIndexer.
@@ -1106,6 +1247,16 @@ struct Args {
     /// Worker slots of the run index (one coverage bit per slot per run, at most 1024).
     #[arg(long, default_value = "256")]
     max_workers: usize,
+    /// Run index shards, one per socket of the lane set: each shard is a complete run index
+    /// written only by the lanes placed on it (a pinned lane goes to its CPU's NUMA node's
+    /// shard when the lane set spans exactly this many nodes, else to its contiguous group of
+    /// the backend CPU list), and a lookup walks every shard. One shard is the run index itself.
+    #[arg(long, default_value = "1")]
+    shards: usize,
+    /// Memory policy of the event lanes: `inherit` the process policy, or `local`, which makes
+    /// each pinned lane prefer its own NUMA node for what it allocates (set_mempolicy).
+    #[arg(long, value_enum, default_value = "inherit")]
+    lane_memory: LaneMemory,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
     /// reference window when they differ.
     #[arg(long, conflicts_with = "offered_block_ops_per_sec")]
@@ -1198,16 +1349,58 @@ fn main() -> anyhow::Result<()> {
                 }),
             )
         }
-        BackendKind::Run => run(
-            &args,
-            corpus,
-            window_ns,
-            Arc::new(Run {
-                inner: RunIndex::with_max_workers(args.max_workers),
-            }),
-        ),
+        BackendKind::Run => {
+            let backend_cpus = args
+                .backend_cpus
+                .as_deref()
+                .map(parse_cpu_list)
+                .transpose()?
+                .unwrap_or_default();
+            let shard_of_cpu = shard_map(&backend_cpus, args.shards.max(1));
+            run(
+                &args,
+                corpus,
+                window_ns,
+                Arc::new(Run {
+                    inner: ShardedRunIndex::new(args.shards.max(1), args.max_workers),
+                    shard_of_cpu,
+                    event_lanes: args.event_lanes,
+                }),
+            )
+        }
         BackendKind::Null => run(&args, corpus, window_ns, Arc::new(Null)),
     }
+}
+
+/// The shard of each backend CPU: the index of its NUMA node among the nodes the list spans when
+/// there are exactly `shards` of them, else the CPU's contiguous group of the list.
+fn shard_map(backend_cpus: &[usize], shards: usize) -> FxHashMap<usize, usize> {
+    let mut map = FxHashMap::default();
+    if backend_cpus.is_empty() || shards <= 1 {
+        return map;
+    }
+    let mut nodes: Vec<usize> = Vec::new();
+    let mut node_of: Vec<Option<usize>> = Vec::with_capacity(backend_cpus.len());
+    for &cpu in backend_cpus {
+        let node = node_of_cpu(cpu);
+        if let Some(node) = node {
+            if !nodes.contains(&node) {
+                nodes.push(node);
+            }
+        }
+        node_of.push(node);
+    }
+    if nodes.len() == shards && node_of.iter().all(Option::is_some) {
+        for (&cpu, node) in backend_cpus.iter().zip(&node_of) {
+            let node = node.expect("checked");
+            map.insert(cpu, nodes.iter().position(|&n| n == node).expect("listed"));
+        }
+    } else {
+        for (position, &cpu) in backend_cpus.iter().enumerate() {
+            map.insert(cpu, position * shards / backend_cpus.len());
+        }
+    }
+    map
 }
 
 fn run<B: ReplayBackend>(
@@ -1262,7 +1455,7 @@ fn run<B: ReplayBackend>(
     }
     // The layout, first line of every run log, so the provenance shows it at a glance.
     println!(
-        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores)",
+        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores), shards {}, lane memory {:?}, event lanes {}",
         issuer_threads,
         issuer_cpus,
         query_issuers,
@@ -1271,6 +1464,9 @@ fn run<B: ReplayBackend>(
         args.query_lanes,
         backend_cpus,
         backend_cpus.len(),
+        args.shards.max(1),
+        args.lane_memory,
+        if args.pin_event_lanes { "pinned one per core" } else { "floating" },
     );
     if window_ns != corpus.reference_window_ns {
         let reference = corpus.reference_window_ns.max(1) as u128;
@@ -1427,8 +1623,13 @@ fn run<B: ReplayBackend>(
             Arc::clone(&backend_cpus)
         };
         let (backend, corpus) = (Arc::clone(&backend), Arc::clone(&corpus));
+        let placement = LanePlacement {
+            index: idx,
+            cpus,
+            local_memory: matches!(args.lane_memory, LaneMemory::Local),
+        };
         event_threads.push(thread::spawn(move || {
-            event_lane_worker(backend, rx, corpus, epoch, cpus, expected)
+            event_lane_worker(backend, rx, corpus, epoch, placement, expected)
         }));
     }
 
@@ -1687,6 +1888,9 @@ fn run<B: ReplayBackend>(
         "backend": backend.name(),
         "corpus": args.corpus,
         "mirror_dynamo_costs": args.mirror_dynamo_costs,
+        "shards": args.shards.max(1),
+        "lane_memory": format!("{:?}", args.lane_memory).to_lowercase(),
+        "backend_report": backend.report(),
         "provenance": {
             "argv": std::env::args().collect::<Vec<_>>(),
             "binary": std::env::current_exe().ok().map(|p| p.display().to_string()),
