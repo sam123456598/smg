@@ -15,7 +15,11 @@
 //! very end of the text is a valid prefix but never whole, since more digits may come, so a bare
 //! number is whole only once a byte that cannot continue it has arrived; and a raw control character
 //! inside a string is taken as the string's content, as the model wrote it, rather than refused.
-//! Nesting beyond [`MAX_DEPTH`] is refused, as the ported parser refused it.
+//! Nesting beyond [`MAX_DEPTH`] is refused, as the ported parser refused it. One malformation the
+//! ported parser tolerated is refused here as the grammar refuses it: a trailing comma before a
+//! closing bracket, `{"a": 1,}`, which the old gateway healed into `{"a":1}`, stops the fragments
+//! before the bracket and makes the bracket malformed. Whether to heal it instead is a policy
+//! question for the formats, not for the acceptor.
 
 /// Where a text stands as the prefix of one JSON value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,7 +172,7 @@ impl Machine {
                         b'0' => self.enter(State::Number(Number::Zero)),
                         b'1'..=b'9' => self.enter(State::Number(Number::Int)),
                         b't' => self.enter(State::Literal(b"rue")),
-                        b'f' => self.enter(State::Literal(b"alse")),
+                        b'f' => self.enter(State::Literal(b"alse")), // codespell:ignore alse
                         b'n' => self.enter(State::Literal(b"ull")),
                         _ => Step::Reject,
                     };
@@ -429,8 +433,8 @@ mod tests {
             "\"abc",
             "\"a\\",
             "\"a\\u00",
-            "tru",
-            "fals",
+            "tru",  // codespell:ignore tru
+            "fals", // codespell:ignore fals
             "nul",
             "{\"a\": [1, {\"b\": \"c",
         ] {
