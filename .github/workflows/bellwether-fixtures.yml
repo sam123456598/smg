@@ -27,10 +27,12 @@ on:
       - crates/symphony/**
       - model_gateway/src/routers/grpc/**
       - model_gateway/tests/bellwether_*.rs
+      - model_gateway/Cargo.toml
       - Cargo.toml
       - Cargo.lock
       - .github/versions/bellwether.ref
       - .github/workflows/bellwether-fixtures.yml
+      - .github/actions/setup-rust/**
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened]
@@ -40,10 +42,12 @@ on:
       - crates/symphony/**
       - model_gateway/src/routers/grpc/**
       - model_gateway/tests/bellwether_*.rs
+      - model_gateway/Cargo.toml
       - Cargo.toml
       - Cargo.lock
       - .github/versions/bellwether.ref
       - .github/workflows/bellwether-fixtures.yml
+      - .github/actions/setup-rust/**
   workflow_dispatch:
 
 permissions:
@@ -108,7 +112,9 @@ jobs:
           cache-key: bellwether-fixtures
 
       # The tests fetch each model's tokenizer files from Hugging Face once, at
-      # the revision its manifest pins, into these directories.
+      # the revision its manifest pins, into these directories. The files
+      # depend on the manifests alone, so the key is their hash: moving the
+      # pin to a commit with the same models stores nothing new.
       - name: Cache tokenizer files
         if: steps.pin.outputs.available == 'true'
         uses: actions/cache@v6
@@ -116,7 +122,7 @@ jobs:
           path: |
             crates/tokenizer/.tokenizer_cache/bellwether
             model_gateway/.tokenizer_cache/bellwether
-          key: bellwether-tokenizers-${{ steps.pin.outputs.ref }}
+          key: bellwether-tokenizers-${{ hashFiles('.bellwether/fixtures/*/manifest.toml') }}
           restore-keys: |
             bellwether-tokenizers-
 
