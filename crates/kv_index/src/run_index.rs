@@ -340,6 +340,15 @@ impl WordArena {
 
     /// The child continuing with `head`, as `(run, generation)`.
     #[inline]
+    /// Live entries of a child table (`NONE` has none).
+    fn table_live(&self, table: u32) -> usize {
+        if table == NONE {
+            0
+        } else {
+            self.word(table + 1).load(Ordering::Relaxed) as usize
+        }
+    }
+
     fn table_find(&self, table: u32, head: u64) -> Option<(u32, u32)> {
         if table == NONE {
             return None;
@@ -1475,6 +1484,20 @@ impl RunIndex {
 
     pub fn worker_id(&self, worker: &str) -> Option<u32> {
         self.worker_to_id.get(worker).map(|entry| *entry.value())
+    }
+
+    /// Whether no worker holds any block: the root has no live child, read under the root's
+    /// version. O(1), for a caller that asks before every lookup (`current_size` reads a line
+    /// per worker slot).
+    pub fn is_empty(&self) -> bool {
+        let root = self.slab.run(ROOT);
+        loop {
+            let (window, version) = root.snapshot();
+            let empty = window.children == NONE || self.arena.table_live(window.children) == 0;
+            if root.confirm(version) {
+                return empty;
+            }
+        }
     }
 
     /// Blocks held across all workers (a block two workers hold counts twice).
@@ -3439,6 +3462,35 @@ mod tests {
             .apply_stored(w, &blocks, None, &mut map)
             .expect("store");
         assert_eq!(scores(&index, &held), vec![(w, 12)]);
+    }
+
+    /// `is_empty` follows the blocks: false from the first store, true again once every block
+    /// is removed, cleared or taken with its worker.
+    #[test]
+    fn emptiness_follows_the_blocks() {
+        let index = RunIndex::with_max_workers(8);
+        assert!(index.is_empty());
+        let a = index.intern_worker("a").expect("id");
+        let b = index.intern_worker("b").expect("id");
+        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let chain: Vec<ContentHash> = (0..12).map(|p| content(21, p)).collect();
+        let blocks = blocks_of(&chain);
+        index.apply_stored(a, &blocks, None, &mut ma).expect("a");
+        assert!(!index.is_empty());
+        index
+            .apply_stored(b, &blocks[..6], None, &mut mb)
+            .expect("b");
+        let hashes: Vec<SequenceHash> = blocks.iter().map(|block| block.seq_hash).collect();
+        index.apply_removed(a, &hashes, &mut ma);
+        assert!(!index.is_empty(), "b still holds a prefix");
+        index.apply_cleared(b, &mut mb);
+        assert!(index.is_empty());
+        index
+            .apply_stored(a, &blocks[..3], None, &mut ma)
+            .expect("a again");
+        assert!(!index.is_empty());
+        index.remove_worker(a, ma);
+        assert!(index.is_empty());
     }
 
     /// A content array recycled from a larger class gets an engine-hash twin of at least that

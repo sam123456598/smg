@@ -19,6 +19,7 @@ mod path_hash;
 pub mod reference;
 pub mod run_index;
 pub mod salt;
+pub mod sharded;
 pub mod snapshot;
 mod string_tree;
 mod token_tree;
@@ -36,6 +37,7 @@ pub use lane_pool::{
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
 pub use run_index::{BlockRef, RunIndex, RunIndexStats};
+pub use sharded::{ShardedRunIndex, SHARD_SHIFT};
 // Re-export under names matching old tree.rs API for easier migration
 pub use string_tree::Tree;
 pub use string_tree::{

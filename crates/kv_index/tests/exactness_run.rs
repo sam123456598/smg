@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kv_index::{
     request_prefix_hashes, ContentHash, ReferenceIndexer, RunBlockMap, RunIndex, SequenceHash,
-    StoredBlock,
+    ShardedRunIndex, StoredBlock,
 };
 use rustc_hash::FxHashMap;
 
@@ -80,7 +80,7 @@ struct Held {
 }
 
 struct Harness {
-    production: RunIndex,
+    production: ShardedRunIndex,
     reference: ReferenceIndexer,
     maps: FxHashMap<u32, RunBlockMap>,
     workers: Vec<u32>,
@@ -115,7 +115,9 @@ impl Harness {
     fn new(seed: u64, workers: usize) -> Self {
         let mut rng = Rng::new(seed);
         let mut harness = Self {
-            production: RunIndex::with_max_workers(1024),
+            // `KV_INDEX_EXACTNESS_SHARDS` shards (default one, the run index itself); workers are
+            // interned round robin, so two shards hold every other worker and share most content.
+            production: ShardedRunIndex::new(env_or("KV_INDEX_EXACTNESS_SHARDS", 1) as usize, 1024),
             reference: ReferenceIndexer::new(),
             maps: FxHashMap::default(),
             workers: Vec::new(),
@@ -178,7 +180,11 @@ impl Harness {
         let blocks = blocks_of(&contents);
         let held = self.maps.get(&worker).expect("worker map");
         let mut known = 0;
-        while known < blocks.len() && self.production.is_held(held, blocks[known].seq_hash) {
+        while known < blocks.len()
+            && self
+                .production
+                .is_held(worker, held, blocks[known].seq_hash)
+        {
             known += 1;
         }
         let start = if known == blocks.len() {
@@ -509,12 +515,20 @@ impl Harness {
             total,
             "{label}: total blocks"
         );
+        // Distinct blocks are counted per shard: content held on two shards is stored twice.
         assert_eq!(
             self.production.entry_count(),
             self.production
                 .debug_blocks()
                 .iter()
-                .map(|(_, position, content, prefix)| (*position, *content, *prefix))
+                .map(|(worker, position, content, prefix)| {
+                    (
+                        ShardedRunIndex::shard_of(*worker),
+                        *position,
+                        *content,
+                        *prefix,
+                    )
+                })
                 .collect::<BTreeSet<_>>()
                 .len(),
             "{label}: distinct blocks"

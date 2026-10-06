@@ -20,8 +20,8 @@ use std::{
 };
 
 use kv_index::{
-    request_prefix_hashes, ContentHash, ReferenceIndexer, RunBlockMap, RunIndex, SequenceHash,
-    StoredBlock,
+    request_prefix_hashes, ContentHash, ReferenceIndexer, RunBlockMap, SequenceHash,
+    ShardedRunIndex, StoredBlock,
 };
 
 struct Rng(u64);
@@ -109,7 +109,7 @@ struct Logged {
 }
 
 struct Lane<'a> {
-    index: &'a RunIndex,
+    index: &'a ShardedRunIndex,
     pool: &'a [Vec<ContentHash>],
     clock: &'a AtomicU64,
     worker: u32,
@@ -138,7 +138,11 @@ impl Lane<'_> {
     fn store(&mut self, contents: &[ContentHash]) {
         let blocks = blocks_of(contents);
         let mut known = 0;
-        while known < blocks.len() && self.index.is_held(&self.map, blocks[known].seq_hash) {
+        while known < blocks.len()
+            && self
+                .index
+                .is_held(self.worker, &self.map, blocks[known].seq_hash)
+        {
             known += 1;
         }
         let start = if known == blocks.len() {
@@ -165,7 +169,10 @@ impl Lane<'_> {
     fn remove_some(&mut self, contents: &[ContentHash]) {
         let blocks = blocks_of(contents);
         let held: Vec<usize> = (0..blocks.len())
-            .filter(|&i| self.index.is_held(&self.map, blocks[i].seq_hash))
+            .filter(|&i| {
+                self.index
+                    .is_held(self.worker, &self.map, blocks[i].seq_hash)
+            })
             .collect();
         if held.is_empty() {
             return;
@@ -229,7 +236,7 @@ impl Lane<'_> {
     }
 }
 
-fn scores(index: &RunIndex, query: &[ContentHash], early_exit: bool) -> BTreeMap<u32, u32> {
+fn scores(index: &ShardedRunIndex, query: &[ContentHash], early_exit: bool) -> BTreeMap<u32, u32> {
     index
         .find_matches(query, early_exit)
         .scores
@@ -246,7 +253,13 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
         .unwrap_or(4000usize);
     let mut rng = Rng::new(20261005);
     let pool = pool(&mut rng);
-    let index = RunIndex::with_max_workers(64);
+    let shards = std::env::var("KV_INDEX_CONCURRENCY_SHARDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1usize);
+    // Lanes intern their workers round robin over the shards, so with two shards every
+    // other lane writes the other index and every lookup merges both.
+    let index = ShardedRunIndex::new(shards, 64);
     let clock = AtomicU64::new(0);
     let stop = AtomicBool::new(false);
     let logs: Mutex<Vec<Logged>> = Mutex::new(Vec::new());
@@ -361,11 +374,19 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
         }
     }
     assert!(checked > 100);
+    // Distinct blocks are counted per shard: content held on two shards is stored twice.
     assert_eq!(
         index.entry_count(),
         expected
             .iter()
-            .map(|(_, position, content, prefix)| (*position, *content, *prefix))
+            .map(|(worker, position, content, prefix)| {
+                (
+                    ShardedRunIndex::shard_of(*worker),
+                    *position,
+                    *content,
+                    *prefix,
+                )
+            })
             .collect::<BTreeSet<_>>()
             .len(),
         "distinct block counter"
