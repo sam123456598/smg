@@ -21,8 +21,8 @@
 //! conservation forbids saying a byte twice, so nothing a parser pushed can be taken back through
 //! the event list. The fifth property, token identity (every token counted once, in the event that
 //! carries its first byte, whatever the cuts), is checked event by event with a synthetic
-//! tokenization of each output. A format joins the
-//! contract with one entry in [`FORMATS`], its constructor and its corpus.
+//! tokenization of each output. A format joins the contract with one entry in [`FORMATS`], its
+//! constructor and its corpus.
 
 mod common;
 
@@ -432,10 +432,16 @@ fn every_token_is_counted_in_the_event_that_carries_its_first_byte_whatever_the_
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", format.name));
             let place = || format!("{}: {text:?} cut at {cuts:?}", format.name);
             let mut at = 0;
+            let mut total = 0;
             for event in &events {
-                let Some(tokens) = tokens_of(event) else {
+                if matches!(
+                    event,
+                    Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. }
+                ) {
                     continue;
-                };
+                }
+                let tokens =
+                    tokens_of(event).unwrap_or_else(|| panic!("{}: uncounted {event:?}", place()));
                 let length = bytes_of(event).len();
                 let expected = match event {
                     // The byte-less token at the end has no byte to follow it.
@@ -455,7 +461,9 @@ fn every_token_is_counted_in_the_event_that_carries_its_first_byte_whatever_the_
                     place()
                 );
                 at += length;
+                total += tokens as usize;
             }
+            assert_eq!(total, starts.len(), "{}: every token counted once", place());
             let reasoning: u32 = events
                 .iter()
                 .filter_map(|e| match e {
@@ -463,8 +471,15 @@ fn every_token_is_counted_in_the_event_that_carries_its_first_byte_whatever_the_
                     _ => None,
                 })
                 .sum();
-            assert!(
-                matches!(events.last(), Some(Event::Finish { reasoning_tokens, .. }) if *reasoning_tokens == reasoning),
+            let Some(Event::Finish {
+                reasoning_tokens, ..
+            }) = events.last()
+            else {
+                panic!("{}: Finish is last", place());
+            };
+            assert_eq!(
+                *reasoning_tokens,
+                reasoning,
                 "{}: Finish counts the reasoning tokens",
                 place()
             );
