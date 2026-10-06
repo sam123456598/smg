@@ -340,10 +340,13 @@ pub struct ChatCompletionRequest {
     )]
     pub continue_final_message: bool,
 
-    /// Skip special tokens during detokenization
+    /// Skip special tokens during detokenization. Serialized only when
+    /// `false`, like `separate_reasoning`: `true` is what the engine applies
+    /// without the field.
     #[serde(
         default = "default_true",
-        deserialize_with = "deserialize_null_as_true"
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
     )]
     pub skip_special_tokens: bool,
 
@@ -993,6 +996,7 @@ mod tests {
             "ignore_eos",
             "continue_final_message",
             "return_hidden_states",
+            "skip_special_tokens",
             "separate_reasoning",
             "stream_reasoning",
         ] {
@@ -1004,6 +1008,7 @@ mod tests {
         assert!(!back.ignore_eos);
         assert!(!back.continue_final_message);
         assert!(!back.return_hidden_states);
+        assert!(back.skip_special_tokens);
         assert!(back.separate_reasoning);
         assert!(back.stream_reasoning);
     }
@@ -1015,6 +1020,7 @@ mod tests {
             ("ignore_eos", json!(true)),
             ("continue_final_message", json!(true)),
             ("return_hidden_states", json!(true)),
+            ("skip_special_tokens", json!(false)),
             ("separate_reasoning", json!(false)),
             ("stream_reasoning", json!(false)),
         ]);
@@ -1023,6 +1029,7 @@ mod tests {
         assert_eq!(value["ignore_eos"], true);
         assert_eq!(value["continue_final_message"], true);
         assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["skip_special_tokens"], false);
         assert_eq!(value["separate_reasoning"], false);
         assert_eq!(value["stream_reasoning"], false);
 
@@ -1031,6 +1038,7 @@ mod tests {
         assert!(back.ignore_eos);
         assert!(back.continue_final_message);
         assert!(back.return_hidden_states);
+        assert!(!back.skip_special_tokens);
         assert!(!back.separate_reasoning);
         assert!(!back.stream_reasoning);
     }

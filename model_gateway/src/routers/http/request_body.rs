@@ -451,13 +451,37 @@ mod tests {
         assert_eq!(plain, serialize_json_sized(&req, None).unwrap());
         let parsed: Value = serde_json::from_slice(&plain).unwrap();
         assert!(parsed.get("separate_reasoning").is_none());
-        assert_eq!(parsed["skip_special_tokens"], true);
+        assert!(parsed.get("skip_special_tokens").is_none());
 
         let aliased = serialize_request_body(&req, Some("canonical-model"), &worker, None).unwrap();
         assert_eq!(
             aliased,
             value_path_bytes(&req, Some("canonical-model"), &worker)
         );
+    }
+
+    /// `separate_reasoning`, `stream_reasoning` and `skip_special_tokens`
+    /// default to `true` on the engine, so an explicit `false` is the value
+    /// the client means; it must reach the worker on both body paths.
+    #[test]
+    fn explicit_false_on_true_default_fields_reaches_the_worker() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "alias-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "separate_reasoning": false,
+            "stream_reasoning": false,
+            "skip_special_tokens": false
+        }))
+        .unwrap();
+
+        for worker in [worker(), dp_worker()] {
+            let body = serialize_request_body(&req, None, &worker, None).unwrap();
+            assert_eq!(body, value_path_bytes(&req, None, &worker));
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["separate_reasoning"], false);
+            assert_eq!(parsed["stream_reasoning"], false);
+            assert_eq!(parsed["skip_special_tokens"], false);
+        }
     }
 
     #[test]
