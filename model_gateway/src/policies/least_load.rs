@@ -51,9 +51,11 @@ struct SincePollDispatch {
 ///   `waiting_reqs · p̄`, keeping the queue visible in time units rather than
 ///   scoring a backlogged worker as idle. Only a backend reporting neither
 ///   scores `queued_tokens = 0`;
-/// - zero/absent throughput (backend reports no generation rate): falls back to
-///   the configured `default_throughput`, so the work term stays in seconds and
-///   the KV barrier stays relevant;
+/// - zero/absent throughput (backend reports no generation rate, or reports
+///   one for a rank with nothing running, which is a stale gauge rather than a
+///   rate; see [`live_throughput`]): falls back to the configured
+///   `default_throughput`, so the work term stays in seconds and the KV
+///   barrier stays relevant;
 /// - a worker with no fresh snapshot while peers report: its live in-flight is
 ///   converted to a drain-time estimate (`load · p̄ / fleet_nominal_throughput`)
 ///   so it is comparable to reporting workers, not scored on a raw count;
@@ -116,6 +118,25 @@ struct ScoreInputs<'a> {
     /// The best-known reporting peer's score: what a worker without a
     /// fresh report scores before its own in-flight.
     peer_baseline: f64,
+}
+
+/// Generation rate a report can be scored against: the sum over ranks with
+/// requests running.
+///
+/// An engine never clears `gen_throughput`: it is the rate of the last decode
+/// interval, so an idle rank reports a residual (SGLang: the ~0.3 tok/s of
+/// its last one-token health generation) or nothing at all. A dispatch
+/// divided by a residual reads as thousands of seconds, so a burst followed
+/// whichever worker happened to report the larger stale number until the
+/// next poll. A rank with nothing running contributes no rate; a worker with
+/// none scores at the fallback throughput, like one that never reports a
+/// rate.
+fn live_throughput(load: &WorkerLoadResponse) -> f64 {
+    load.loads
+        .iter()
+        .filter(|rank| rank.num_running_reqs > 0)
+        .map(|rank| rank.gen_throughput)
+        .sum()
 }
 
 impl LeastLoadPolicy {
@@ -214,9 +235,9 @@ impl LeastLoadPolicy {
             Some(load) => {
                 let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens;
                 let queued_tokens = self.queued_tokens(load);
-                let live_throughput = load.total_gen_throughput();
-                let throughput = if live_throughput > 0.0 {
-                    live_throughput
+                let live = live_throughput(load);
+                let throughput = if live > 0.0 {
+                    live
                 } else {
                     self.default_throughput
                 };
@@ -355,7 +376,7 @@ impl LeastLoadPolicy {
         let (tp_sum, tp_count) = candidates
             .iter()
             .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
-            .map(|l| l.total_gen_throughput())
+            .map(live_throughput)
             .filter(|t| *t > 0.0)
             .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
         let nominal_throughput = if tp_count > 0 {
@@ -551,7 +572,8 @@ mod tests {
         }
     }
 
-    /// One DP rank with the given queued tokens, KV utilization, and throughput.
+    /// One DP rank with the given queued tokens, KV utilization, and live
+    /// throughput (a request is running, so the rate gauge counts).
     fn make_load(
         num_waiting_uncached_tokens: i32,
         token_usage: f64,
@@ -562,7 +584,7 @@ mod tests {
             dp_rank_count: 1,
             loads: vec![SchedulerLoadSnapshot {
                 dp_rank: 0,
-                num_running_reqs: 0,
+                num_running_reqs: 1,
                 num_waiting_reqs: 0,
                 num_waiting_uncached_tokens,
                 num_total_reqs: 0,
@@ -954,6 +976,52 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn idle_rank_rate_is_not_a_live_throughput() {
+        // Only a rank with requests running has a live rate; an idle rank's
+        // gauge is whatever its last decode interval left behind.
+        let mut load = make_load(0, 0.1, 0.36);
+        load.loads[0].num_running_reqs = 0;
+        assert_eq!(live_throughput(&load), 0.0);
+
+        load.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 1,
+            num_running_reqs: 4,
+            gen_throughput: 800.0,
+            ..Default::default()
+        });
+        assert_eq!(live_throughput(&load), 800.0);
+    }
+
+    #[test]
+    fn stale_idle_rate_does_not_herd_a_burst() {
+        // Two idle workers: a reports the ~0.36 tok/s residual of its last
+        // one-token health generation, b reports nothing. Scored against the
+        // residual, a's first dispatch would read as 1024 / 0.36 ≈ 2800 s and
+        // the rest of the burst would follow b until the next poll. Neither
+        // rate is live, so both score at the default throughput and the
+        // burst water-fills.
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut a = make_load(0, 0.1, 0.36);
+        a.loads[0].num_running_reqs = 0;
+        let mut b = make_load(0, 0.1, 0.0);
+        b.loads[0].num_running_reqs = 0;
+        policy.update_loads(&HashMap::from([
+            ("http://a:8000".to_string(), a),
+            ("http://b:8000".to_string(), b),
+        ]));
+
+        let mut picks = [0usize; 2];
+        for _ in 0..8 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
     }
 
     #[test]

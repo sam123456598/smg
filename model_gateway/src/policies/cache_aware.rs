@@ -1333,7 +1333,10 @@ impl CacheAwarePolicy {
     /// hot prefixes replicate instead of queueing behind one engine. Both
     /// margins must clear so the gate neither fires on steady-state variance
     /// (relative alone would, at low means) nor stays blind to a deep queue
-    /// (absolute alone would, at high means).
+    /// (absolute alone would, at high means). A request with no holder is
+    /// routed among the workers under the same gate
+    /// ([`Self::ungated_candidates`]), so a burst of misses is bounded by
+    /// the margins a hit spills at.
     fn candidate_requires_spill(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1367,23 +1370,36 @@ impl CacheAwarePolicy {
             return self.select_expected_wait(workers, &safe_affinity, info);
         }
 
-        // A miss has no affinity candidates and is not a spill: every healthy
-        // worker participates. A true spill excludes other workers that trip
-        // the same gate, preventing a fallback from reselecting a hot holder.
-        if affinity_candidates.is_empty() {
-            return self.select_expected_wait(workers, healthy_indices, info);
-        }
-        let spill_candidates: Vec<usize> = healthy_indices
+        // No safe holder: a miss (no holder at all) or a spill (every holder
+        // gated). Both go to the expected-wait worker among those under the
+        // same gate, so a spill never reselects a hot holder and a burst of
+        // misses is bounded by the margins a hit spills at. Expected wait
+        // alone keeps no count bound: its queue and rate signals are a poll
+        // old, and a burst routed on them piles onto one worker while
+        // another has free slots.
+        let candidates = self.ungated_candidates(workers, healthy_indices, avg_load);
+        self.select_expected_wait(workers, &candidates, info)
+    }
+
+    /// The healthy workers under the count-pressure gate. Every worker
+    /// trips it only for an empty fleet (the lightest worker never clears
+    /// the mean), but the guard keeps a selection from returning no worker.
+    fn ungated_candidates(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        avg_load: f64,
+    ) -> Vec<usize> {
+        let ungated: Vec<usize> = healthy_indices
             .iter()
             .copied()
             .filter(|&idx| !self.candidate_requires_spill(workers, idx, avg_load))
             .collect();
-        let candidates = if spill_candidates.is_empty() {
-            healthy_indices
+        if ungated.is_empty() {
+            healthy_indices.to_vec()
         } else {
-            &spill_candidates
-        };
-        self.select_expected_wait(workers, candidates, info)
+            ungated
+        }
     }
 
     /// Pick an effective-affinity score group while preserving temperature.
@@ -1526,8 +1542,10 @@ impl CacheAwarePolicy {
             return Some(idx);
         }
 
-        // No cache overlap — expected-wait fallback over the healthy fleet.
-        let selected = self.select_expected_wait(workers, healthy_indices, info)?;
+        // No cache overlap — expected-wait fallback over the healthy fleet,
+        // bounded by the count-pressure gate like a tree miss.
+        let candidates = self.ungated_candidates(workers, healthy_indices, avg_load);
+        let selected = self.select_expected_wait(workers, &candidates, info)?;
         debug!(
             worker = workers[selected].url(),
             model_id, "Event-driven routing: no overlap, expected-wait fallback"
@@ -1821,10 +1839,13 @@ impl CacheAwarePolicy {
             return Some(selected);
         }
 
+        // No live holder at any boundary: bounded by the count-pressure gate
+        // like a tree miss.
+        let candidates = self.ungated_candidates(workers, healthy_indices, avg_load);
         self.hash_expected_wait(
             workers,
             info,
-            healthy_indices,
+            &candidates,
             model_id,
             "expected_wait_fallback",
             tokens,
@@ -1833,21 +1854,21 @@ impl CacheAwarePolicy {
         )
     }
 
-    /// Expected-wait dispatch for hash-path fallback branches; records only
-    /// the final worker when boundaries apply.
+    /// Expected-wait dispatch over `candidates` for hash-path fallback
+    /// branches; records only the final worker when boundaries apply.
     #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn hash_expected_wait(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
-        healthy_indices: &[usize],
+        candidates: &[usize],
         model_id: &str,
         branch: &'static str,
         tokens: &[u32],
         applicable: &[usize],
         now: Instant,
     ) -> Option<usize> {
-        let idx = self.select_expected_wait(workers, healthy_indices, info)?;
+        let idx = self.select_expected_wait(workers, candidates, info)?;
         if !applicable.is_empty() {
             self.record_placement(
                 model_id,
@@ -2434,7 +2455,8 @@ mod tests {
     }
 
     /// Single-DP snapshot used to make live request count and LeastLoad's
-    /// expected-wait score disagree deterministically.
+    /// expected-wait score disagree deterministically. A request is running,
+    /// so the rate gauge counts as live.
     fn expected_wait_load(
         queued_tokens: i32,
         token_usage: f64,
@@ -2442,6 +2464,7 @@ mod tests {
     ) -> WorkerLoadResponse {
         WorkerLoadResponse {
             loads: vec![SchedulerLoadSnapshot {
+                num_running_reqs: 1,
                 num_waiting_uncached_tokens: queued_tokens,
                 token_usage,
                 gen_throughput,
@@ -3420,6 +3443,148 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(policy.select_worker(&workers, &info).unwrap(), 1);
+    }
+
+    /// Two busy, empty-queued workers whose live rates differ so much that
+    /// expected wait alone would send every miss to w1.
+    fn skewed_rate_loads(workers: &[Arc<dyn Worker>]) -> HashMap<String, WorkerLoadResponse> {
+        HashMap::from([
+            (
+                workers[0].url().to_string(),
+                expected_wait_load(0, 0.1, 10_000.0),
+            ),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(0, 0.1, 100.0),
+            ),
+        ])
+    }
+
+    /// Gate at the mean (no margins), so an above-mean worker sits out.
+    fn gate_at_mean(config: CacheAwareConfig) -> CacheAwareConfig {
+        CacheAwareConfig {
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.0,
+            ..config
+        }
+    }
+
+    /// A request at or below `cache_threshold` has no holder to spill from,
+    /// and expected wait alone keeps no count bound: its queue and rate
+    /// signals are a poll old, so a burst of misses followed one worker
+    /// while the other had free slots. Misses route among the workers under
+    /// the same count-pressure gate a hit spills at.
+    #[test]
+    fn miss_burst_is_bounded_by_the_count_pressure_gate() {
+        let policy = CacheAwarePolicy::with_config(gate_at_mean(test_config()));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&skewed_rate_loads(&workers));
+
+        let mut picks = [0usize; 2];
+        for i in 0..8 {
+            let text = format!("{i} novel prompt with nothing in common");
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(&text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            // The router counts the dispatch in flight; the gate reads it.
+            workers[idx].increment_load();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
+    }
+
+    #[test]
+    fn event_miss_burst_is_bounded_by_the_count_pressure_gate() {
+        let policy = CacheAwarePolicy::with_config(gate_at_mean(test_config()));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&skewed_rate_loads(&workers));
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+
+        let mut picks = [0usize; 2];
+        for i in 0..8u32 {
+            let novel = [100 + i, 200, 300, 400];
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&novel),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            workers[idx].increment_load();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
+    }
+
+    #[test]
+    fn hash_miss_burst_is_bounded_by_the_count_pressure_gate() {
+        let policy = CacheAwarePolicy::with_config(gate_at_mean(hash_config(&[4])));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&skewed_rate_loads(&workers));
+
+        let mut picks = [0usize; 2];
+        for i in 0..8u32 {
+            let head = [i, i, i, i, 9];
+            let idx = route_tokens(&policy, &workers, &head);
+            workers[idx].increment_load();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
+    }
+
+    /// Two idle SGLang workers, one reporting the ~0.36 tok/s residual of
+    /// its last one-token health generation, the other nothing. Scored
+    /// against the residual, one dispatch read as ~2800 s of wait and the
+    /// whole burst piled onto the other worker. An idle rank has no live
+    /// rate, so both score at the default throughput and the misses
+    /// water-fill without the gate's help.
+    #[test]
+    fn idle_rate_residual_does_not_herd_misses() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let idle = |gen_throughput| WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                num_running_reqs: 0,
+                gen_throughput,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), idle(0.36)),
+            (workers[1].url().to_string(), idle(0.0)),
+        ]));
+
+        let mut picks = [0usize; 2];
+        for i in 0..8 {
+            let text = format!("{i} novel prompt with nothing in common");
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(&text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            picks[idx] += 1;
+        }
+        assert_eq!(picks, [4, 4]);
     }
 
     #[test]
