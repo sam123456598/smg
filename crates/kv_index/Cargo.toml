@@ -38,8 +38,8 @@ criterion = { version = "0.8", features = ["html_reports"] }
 rand = { workspace = true }
 serde_json = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
-# mooncake_replay: CPU pinning and absolute monotonic sleeps, and the allocator Dynamo's bench
-# binary links, so the two harnesses measure the indexer under the same allocator.
+# mooncake_replay: CPU pinning and absolute monotonic sleeps, and one allocator for every
+# backend the harness measures.
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 

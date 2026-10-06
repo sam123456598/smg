@@ -1,10 +1,9 @@
-//! Open-loop replay of a Mooncake indexer corpus, by Dynamo's method, against this crate's
-//! indexers.
+//! Open-loop replay of an exported Mooncake indexer corpus against this crate's indexers, with
+//! drain-inclusive accounting.
 //!
-//! The corpus is the schedule Dynamo's `mooncake_bench` prepares (after trace duplication, deadline
-//! sort and id assignment), exported with its `--export-corpus` option; see `README.md` next to
-//! this file for the format. Replaying it here reproduces their measurement without their
-//! repository at measurement time:
+//! The corpus is a prepared schedule of the public Mooncake trace (after trace duplication,
+//! deadline sort and id assignment) in the export format described in `README.md` next to this
+//! file. Replaying it here measures the indexer alone, with the harness's own threads and queues:
 //!
 //! - queries go to `worker_id % query_lanes` lanes, each an OS thread that services lookups
 //!   inline; events go to `(worker, dp_rank)`-pinned event lanes assigned round-robin on first
@@ -18,14 +17,13 @@
 //! - lookup `query_service` is the time inside the indexer, `query_scheduled_to_finished` includes
 //!   queueing; percentiles use the nearest-rank method.
 //!
-//! Differences from Dynamo's harness, stated so parity numbers can be read correctly: lanes are
-//! OS threads parked on `std::thread::park` rather than tokio tasks on a `Notify`; event queues are
-//! `std::sync::mpsc` (unbounded, one consumer) rather than `flume`. With `--mirror-dynamo-costs`
-//! (default) the lanes pay what Dynamo's harness charges every backend: each event arrives as an
-//! owned payload in Dynamo's block layout (40 bytes per block, allocated before the trial) that the
-//! lane converts into this crate's 16-byte blocks and frees after the apply, and each lookup copies
-//! its hashes into this crate's hash type, as the SMG adapter does inside Dynamo's binary. The
-//! binary links mimalloc, as Dynamo's bench binary does.
+//! What the harness charges every backend, stated so numbers can be read correctly: lanes are OS
+//! threads parked on `std::thread::park`; event queues are `std::sync::mpsc` (unbounded, one
+//! consumer). With `--owned-payloads` (default) the lanes pay for owning their events: each event
+//! arrives as an owned payload in the engine's wire layout (40 bytes per block, allocated before
+//! the trial) that the lane converts into this crate's 16-byte blocks and frees after the apply,
+//! and each lookup copies its hashes into this crate's hash type, as an adapter in front of the
+//! index would. The binary links mimalloc, so every backend is measured under one allocator.
 #![expect(clippy::expect_used, clippy::print_stdout, clippy::print_stderr)]
 // The harness pins threads and sleeps to absolute monotonic deadlines through libc, which the
 // standard library does not expose; the five calls are wrapped in small checked helpers below.
@@ -331,7 +329,8 @@ fn load_corpus(path: &str) -> anyhow::Result<Corpus> {
 
 /// What a backend must offer the replay. `Lane` is the per-event-lane state (SMG keeps a block
 /// map per worker in the lane that owns the worker, like the gateway's event monitor). Workers
-/// are `(worker_id, dp_rank)` pairs as Dynamo keys them; a backend interns them as it likes.
+/// are `(worker_id, dp_rank)` pairs as the engine streams key them; a backend interns them as it
+/// likes.
 trait ReplayBackend: Send + Sync + 'static {
     type Lane: Send;
     fn name(&self) -> &'static str;
@@ -345,8 +344,7 @@ trait ReplayBackend: Send + Sync + 'static {
     fn report(&self) -> Option<String> {
         None
     }
-    /// Apply one stored event; `false` when the backend rejected it (counted, as Dynamo's lanes
-    /// count rejected events).
+    /// Apply one stored event; `false` when the backend rejected it (counted).
     fn apply_stored(
         &self,
         lane: &mut Self::Lane,
@@ -380,17 +378,17 @@ trait ReplayBackend: Send + Sync + 'static {
     }
 }
 
-/// One stored block as Dynamo's lanes receive it: two hashes and an always-empty multimodal slot.
+/// One stored block in the engine's wire layout: two hashes and an always-empty multimodal slot.
 struct WireBlock {
     block_hash: u64,
     tokens_hash: u64,
-    /// Never set by the Mooncake trace; present so the record has Dynamo's size.
+    /// Never set by the Mooncake trace; present so the record has the wire layout's size.
     #[expect(dead_code)]
     mm_extra_info: Option<Vec<u64>>,
 }
 const _: () = assert!(size_of::<WireBlock>() == 40);
 
-/// The owned event payload an issuer moves to a lane under `--mirror-dynamo-costs`; `None` when
+/// The owned event payload an issuer moves to a lane under `--owned-payloads`; `None` when
 /// the lane reads the event from the corpus slabs instead.
 enum Payload {
     None,
@@ -1022,8 +1020,8 @@ fn event_lane_worker<B: ReplayBackend>(
         let worker = (op.worker, op.dp_rank());
         let ok = match (&op.kind, payload) {
             (&OpKind::Stored { parent, .. }, Payload::Stored(wire)) => {
-                // The adapter's copy, Dynamo's records into this crate's blocks; the payload is
-                // freed after the apply, as Dynamo's lanes free the event they were handed.
+                // The adapter's copy, wire records into this crate's blocks; the payload is
+                // freed after the apply, as a lane frees the event it was handed.
                 let owned: Vec<StoredBlock> = wire
                     .iter()
                     .map(|block| StoredBlock {
@@ -1194,7 +1192,8 @@ fn node_of_cpu(cpu: usize) -> Option<usize> {
 
 /// Prefer `node` for this thread's page allocations from now on (`set_mempolicy`,
 /// `MPOL_PREFERRED`): the arena chunks, run slab chunks and lane maps a lane first touches land
-/// on its own socket whatever the process policy (`numactl --interleave=all` in the protocol).
+/// on its own socket whatever the process policy (an interleaving policy set by the launcher,
+/// for instance).
 fn prefer_node(node: usize) -> std::io::Result<()> {
     let mut mask = [0u64; 16];
     mask[node / 64] |= 1u64 << (node % 64);
@@ -1243,7 +1242,7 @@ fn parse_cpu_list(value: &str) -> anyhow::Result<Vec<usize>> {
     Ok(cpus)
 }
 
-/// Dynamo's `contiguous_worker_issuer`: contiguous worker ranges per event issuer.
+/// Contiguous worker ranges per event issuer.
 fn event_issuer_for(worker: u64, logical_workers: u64, issuers: usize) -> usize {
     let per = (logical_workers as usize).div_ceil(issuers).max(1);
     ((worker as usize) / per).min(issuers - 1)
@@ -1324,8 +1323,8 @@ fn issue_queries(
     (thread_cpu_time_ns().saturating_sub(cpu_started), failure)
 }
 
-/// The owned payload of one event in Dynamo's block layout, as its lane receives it under
-/// `--mirror-dynamo-costs`.
+/// The owned payload of one event in the engine's wire layout, as its lane receives it under
+/// `--owned-payloads`.
 fn payload_for(corpus: &Corpus, op: &Op) -> Payload {
     match op.kind {
         OpKind::Stored { start, len, .. } => Payload::Stored(
@@ -1348,8 +1347,8 @@ fn payload_for(corpus: &Corpus, op: &Op) -> Payload {
     }
 }
 
-/// One event in an issuer's dispatch: its operation, deadline group, lane and (when mirroring
-/// Dynamo's costs) the owned payload the lane receives.
+/// One event in an issuer's dispatch: its operation, deadline group, lane and (under
+/// `--owned-payloads`) the owned payload the lane receives.
 struct EventDispatch {
     id: u32,
     group: u32,
@@ -1426,7 +1425,7 @@ fn issue_events(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum LaneMemory {
-    /// The process policy (the protocol's `numactl --interleave=all`).
+    /// The process policy, whatever the launcher set.
     Inherit,
     /// Each pinned event lane prefers its own NUMA node (`set_mempolicy(MPOL_PREFERRED)`).
     Local,
@@ -1444,11 +1443,11 @@ enum Queries {
     Off,
 }
 
-/// Which thread builds the owned event payloads of `--mirror-dynamo-costs`, and so which
+/// Which thread builds the owned event payloads of `--owned-payloads`, and so which
 /// allocator arena and NUMA node they live on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum PayloadHome {
-    /// The main thread, before the trial, as Dynamo's preparation does: one arena for every
+    /// The main thread, before the trial, as a preparation step does: one arena for every
     /// payload, which every lane frees into. On two sockets that one arena's lock and free lists
     /// bounce between the sockets on every event, and the lanes' CPU per block doubles.
     Main,
@@ -1487,9 +1486,12 @@ enum BackendKind {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Open-loop replay of an exported Mooncake indexer corpus, by Dynamo's method")]
+#[command(
+    about = "Open-loop replay of an exported Mooncake indexer corpus with drain-inclusive accounting"
+)]
 struct Args {
-    /// Corpus file written by Dynamo's `mooncake_bench --export-corpus`.
+    /// Corpus file in the export format described in benches/README.md: a prepared schedule of
+    /// the Mooncake trace.
     corpus: String,
     #[arg(long, value_enum, default_value = "positional")]
     backend: BackendKind,
@@ -1521,8 +1523,8 @@ struct Args {
     /// `per-shard` (one lane per shard on the shard's cores, merged by the last to finish).
     #[arg(long, value_enum, default_value = "all-shards")]
     lookups: Lookups,
-    /// Who builds the mirrored event payloads: the `main` thread before the trial (Dynamo's
-    /// method) or each `issuer` in its own pinned thread (payloads on the issuer's socket).
+    /// Who builds the owned event payloads: the `main` thread before the trial, or each `issuer`
+    /// in its own pinned thread (payloads on the issuer's socket).
     #[arg(long, value_enum, default_value = "main")]
     payload_home: PayloadHome,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
@@ -1535,7 +1537,7 @@ struct Args {
     offered_block_ops_per_sec: Option<f64>,
     #[arg(long, default_value = "128")]
     query_lanes: usize,
-    /// Event lanes (OS threads applying events), Dynamo's `--num-event-workers`.
+    /// Event lanes (OS threads applying events).
     #[arg(long, default_value = "64")]
     event_lanes: usize,
     /// Event issuer threads; events are sharded by contiguous worker ranges.
@@ -1544,8 +1546,8 @@ struct Args {
     /// CPUs for the event issuers (one per issuer thread when given).
     #[arg(long)]
     issuer_cpus: Option<String>,
-    /// Query issuer threads; query lanes are sharded over them in contiguous ranges (Dynamo
-    /// issues all queries from one thread, which caps its generator near 1.5B block ops/s here).
+    /// Query issuer threads; query lanes are sharded over them in contiguous ranges (one issuer
+    /// caps the generator near 1.5B block ops/s here).
     #[arg(long, default_value = "1")]
     query_issuer_threads: usize,
     /// CPUs for the query issuers (one per thread when given); `--query-issuer-cpu` is an alias.
@@ -1561,22 +1563,21 @@ struct Args {
     #[arg(long, default_value = "5000")]
     pre_run_quiescence_ms: u64,
     /// Pin each event lane to one backend CPU (round robin) instead of letting it float over
-    /// the set; a diagnostic for scheduler effects, not Dynamo's method.
+    /// the set; a diagnostic for scheduler effects.
     #[arg(long)]
     pin_event_lanes: bool,
     /// Give each worker's events to the issuer whose lane range holds the worker's lane (issuer k
-    /// feeds lanes [k * lanes / issuers, (k + 1) * lanes / issuers)) instead of Dynamo's contiguous
+    /// feeds lanes [k * lanes / issuers, (k + 1) * lanes / issuers)) instead of contiguous
     /// worker-id ranges; with `--pin-event-lanes` and the issuer CPUs listed in lane order every
-    /// issuer then sits on the socket of the lanes it feeds. A two-socket diagnostic, not Dynamo's
-    /// method.
+    /// issuer then sits on the socket of the lanes it feeds. A two-socket diagnostic.
     #[arg(long)]
     issuer_by_lane: bool,
-    /// Charge what Dynamo's harness charges every backend: each event arrives as an owned payload
-    /// in Dynamo's block layout (40 bytes per block, allocated before the trial) that the lane
-    /// converts into this crate's blocks and frees after the apply, and each lookup copies its
-    /// hashes into this crate's hash type. Off: lanes read the corpus slabs and copy nothing.
+    /// Charge every backend for owning its events: each event arrives as an owned payload in the
+    /// engine's wire layout (40 bytes per block, allocated before the trial) that the lane converts
+    /// into this crate's blocks and frees after the apply, and each lookup copies its hashes into
+    /// this crate's hash type. Off: lanes read the corpus slabs and copy nothing.
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
-    mirror_dynamo_costs: bool,
+    owned_payloads: bool,
     #[arg(long, default_value = "mooncake_replay_result.json")]
     result_json_output: String,
 }
@@ -1713,7 +1714,7 @@ fn run<B: ReplayBackend>(
         query_cpus.len()
     };
     // Issuers and lanes must not share cores: a lane on an issuer's core eats the issue schedule
-    // and the trial measures the layout mistake, not the indexer (Dynamo's runner refuses too).
+    // and the trial measures the layout mistake, not the indexer.
     if !backend_cpus.is_empty() {
         let overlap: Vec<usize> = issuer_cpus
             .iter()
@@ -1750,8 +1751,8 @@ fn run<B: ReplayBackend>(
             op.deadline_ns = ((op.deadline_ns as u128 * window_ns as u128) / reference) as u64;
         }
     }
-    // Lane assignment and deadline groups, as Dynamo's prepare_open_loop_trial.
-    let mirror = args.mirror_dynamo_costs;
+    // Lane assignment and deadline groups.
+    let mirror = args.owned_payloads;
     // Lanes per lookup: one, or one per shard under `--lookups per-shard` (query lane
     // `group * fan + shard` walks `shard` for lookup group `group`).
     let fan = match args.lookups {
@@ -1803,9 +1804,8 @@ fn run<B: ReplayBackend>(
             } else {
                 event_issuer_for(op.worker, corpus.logical_workers, issuer_threads)
             };
-            // Under --mirror-dynamo-costs the payload is built here, before the trial, as Dynamo's
-            // preparation builds the owned events its issuers move to the lanes; or by the issuer
-            // itself under --payload-home issuer.
+            // Under --owned-payloads the payload is built here, before the trial, or by the
+            // issuer itself under --payload-home issuer.
             let payload = if mirror && args.payload_home == PayloadHome::Main {
                 payload_for(&corpus, op)
             } else {
@@ -1825,7 +1825,7 @@ fn run<B: ReplayBackend>(
         .collect::<Vec<_>>()
         .into_boxed_slice();
 
-    // Quiescence, as Dynamo: return preparation pages and let the allocator settle.
+    // Quiescence: return preparation pages and let the allocator settle.
     // SAFETY: malloc_trim takes an integer pad and has no other preconditions.
     unsafe {
         libc::malloc_trim(0);
@@ -2058,7 +2058,7 @@ fn run<B: ReplayBackend>(
             records[id as usize] = record;
         }
     }
-    // Completions by id, with the order checks Dynamo makes.
+    // Completions by id, with order checks.
     let mut query_done: Vec<Option<QueryCompletion>> = vec![None; n];
     for (lane_idx, completions) in query_results.iter().enumerate() {
         let group = lane_idx / fan;
@@ -2208,7 +2208,7 @@ fn run<B: ReplayBackend>(
     let generator_valid = failure_reasons.is_empty() && issue_span_valid;
     let kept_up = generator_valid && elapsed <= window_ns.saturating_mul(110) / 100;
 
-    // Per-lane diagnostics (not in Dynamo's result): CPU time, event count and the time of the
+    // Per-lane diagnostics: CPU time, event count and the time of the
     // last completion of each event lane, which tell scheduler starvation from slower work.
     let event_lane_cpu_ms: Vec<f64> = event_lane_cpu_ns
         .iter()
@@ -2227,7 +2227,7 @@ fn run<B: ReplayBackend>(
         "harness": "smg-mooncake-replay",
         "backend": backend.name(),
         "corpus": args.corpus,
-        "mirror_dynamo_costs": args.mirror_dynamo_costs,
+        "owned_payloads": args.owned_payloads,
         "shards": args.shards.max(1),
         "lane_memory": format!("{:?}", args.lane_memory).to_lowercase(),
         "queries": format!("{:?}", args.queries).to_lowercase(),

@@ -4,9 +4,8 @@
 //! plain prompt, and two salts are not reusable by each other. The engines
 //! fold these into their own block hashes; this crate recomputes content
 //! hashes from token ids, so it folds them into the XXH3 seed instead. The
-//! mixing is the one Dynamo's `kv-hashing` crate uses (seed = 1337 +
-//! xxh3(lora_name, 0) + xxh3(cache_salt, 1), wrapping), so a corpus hashed by
-//! either side stays comparable. Empty strings count as absent, as a client
+//! mixing is fixed (seed = 1337 + xxh3(lora_name, 0) + xxh3(cache_salt, 1),
+//! wrapping), so a corpus hashed elsewhere by the same rule stays comparable. Empty strings count as absent, as a client
 //! sending `lora_name = ""` means the base model.
 
 use xxhash_rust::xxh3::{xxh3_64_with_seed, Xxh3};
