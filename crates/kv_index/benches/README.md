@@ -414,6 +414,84 @@ the lanes on cores 5-63 under issuers on 0-11, seven cores shared, because the w
 default lane mask before the layout selection; the replayer now refuses issuer CPUs inside the lane
 set and prints the layout at the top of every log.
 
+### Two-socket lane sets: the generator is the limit in Dynamo's harness
+
+A same-binary comparison on all lane cores of both sockets (lanes 5-63 and 72-143, 131 cores, 128
+event lanes and 128 query lanes, event issuers on 0-3 and 64-71, query issuer on 4, `numactl
+--interleave=all`) was prepared and smoke-tested with the out-of-tree adapter built against the
+run index at `9f9c7c04` (binary and commits in the measurement scripts' provenance file). At the
+3000 ms window (107M) it keeps up; at 500 ms (640M offered) the generator is invalid: the issue
+span is 743 ms, read and update issue lag p99 240 ms, issuers busy the whole time, 430M achieved.
+One trial each at 500 ms localises it: lanes on socket 0 only (5-63) with the same issuers keep up
+(639M, read lag p99 0.85 ms); lanes on socket 1 only (72-143) keep up with read lag p50/p99 9.8/33
+ms; both sockets with 32 query lanes still fail (span 519 ms); 64 event lanes on both sockets are
+worse (span 815 ms). Dynamo's harness has one query issuer and its event issuers wait for it at
+every deadline, so each publish to a lane parked on the other socket costs a cross-socket wake:
+its generator ceiling on a two-socket lane set is 430-550M block ops/s, below the single-socket
+52-lane sustained points above (run index 656M, competitor 481M). Brackets on that layout would be
+generator rows for both systems, so none were run; the harness was not changed. The SMG harness
+with five query issuers issues on schedule on the same 131 lanes (read lag p99 78 us) but the run
+index achieved only 528M of 640M there, a lane-side cliff that the rows below take apart.
+
+### Two-socket lane sets in the SMG harness: where the lane cost goes
+
+One variable per row, run index at `9f9c7c04` through the replayer at `0d8f3ba9` (this branch's
+`70702f80` on that tree: `--issuer-by-lane`), three fresh processes at the 500 ms window (640M
+offered) and one at 300 ms (1,067M), the host otherwise idle (19:05-19:25). Lane CPU per event is
+the median lane's event-lane CPU over its events, read per socket from the pinning (lane `i` on
+backend CPU `i mod n`); per lane core divides the achieved median by the lane cores.
+
+| Row | Configuration (run index unless said, 500 ms window = 640M offered, 3 trials) | Achieved (M), kept up | Per lane core (M) | Lane CPU per event, socket 0 / 1 (us) | Lookup p50 / p99 (us) | 300 ms (1,067M offered): achieved (M) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | socket 0 only: 60 lane cores (12-71), issuers 0-7 and 8-11, 64 lanes pinned, interleave | 637 (637-638), 3 of 3 | 10.62 (60) | 5.7 / - | 1.1 / 6 | 749 |
+| 2 | socket 1 only: 60 lane cores (72-131), issuers 136-143 and 132-135, 64 lanes pinned, interleave | 602 (537-616), 2 of 3, generator invalid in 1 | 10.03 (60) | - / 5.7 | 1.1 / 6 | 899 |
+| 3 | socket 0 only, `--cpunodebind=0 --membind=0` (all memory local) | 639 (638-639), 3 of 3 | 10.65 (60) | 4.2 / - | 0.9 / 4 | 1061 |
+| 4 | socket 1 only, `--cpunodebind=1 --membind=1` | 639 (638-639), 3 of 3 | 10.65 (60) | - / 4.1 | 0.8 / 4 | 1047 |
+| 5 | socket 1 only, no numactl (first touch) | 639 (597-639), 3 of 3 | 10.64 (60) | - / 5.1 | 1.1 / 7 | 924 |
+| 6 | socket 0 only, 64 lane cores, 128 lanes pinned two per core (lane-count control) | 638 (638-639), 3 of 3 | 9.96 (64) | 6.1 / - | 1.1 / 7 | 911 |
+| 7 | both sockets: 131 lane cores (5-63, 72-143), issuers on socket 0, 128 lanes floating, interleave | 519 (506-529), 0 of 3 | 3.96 (131) | 18.8 (floating, all lanes) | 1.3 / 10 | 520 |
+| 8 | same, 128 lanes pinned (59 on socket 0, 69 on socket 1) | 542 (531-570), 0 of 3 | 4.13 (131) | 11.7 / 14.9 | 1.3 / 9 | 504 |
+| 9 | both sockets, floating, the scaled-scoreboard replayer (`b4943d69` index) | 536 (476-548), 0 of 3 | 4.09 (131) | 18.9 (floating, all lanes) | 1.4 / 10 | 561 |
+| 10 | 64 lane cores per socket (8-71, 72-135), 4+4 event and 4+4 query issuers, lanes pinned, each socket's issuers feed its own lanes (`--issuer-by-lane`), interleave | 524 (502-525), 0 of 3 | 4.09 (128) | 13.4 / 19.6 | 1.2 / 10 | 532 |
+| 11 | same, issuers by worker id (half the feeds cross the interconnect) | 529 (497-546), 0 of 3 | 4.13 (128) | 11.1 / 13.7 | 1.3 / 9 | 579 |
+| 12 | split, own-socket feeding, no numactl (first touch) | 508 (497-516), 0 of 3 | 3.97 (128) | 17.9 / 10.5 | 1.2 / 9 | 540 |
+| 13 | split, own-socket feeding, `--membind=0` | 506 (504-551), 0 of 3 | 3.95 (128) | 20.4 / 13.6 | 1.5 / 11 | 477 |
+| 14 | split, own-socket feeding, `--membind=1` | 499 (421-500), 0 of 3 | 3.90 (128) | 13.6 / 19.9 | 1.5 / 11 | 560 |
+| 15 | split cores but 64 lanes, which pinning puts all on socket 0 while the socket-1 issuers feed half of them across the interconnect (feeding control) | 639 (639-639), 3 of 3 | 4.99 (128) | 6.2 / - | 1.2 / 8 | 1060 |
+| 16 | both sockets, pinned, `--mirror-dynamo-costs false` (no payload allocation or free in the lanes) | 578 (556-589), 1 of 3 | 4.41 (131) | 10.9 / 17.5 | 0.9 / 4 | 561 |
+| 17 | socket 0 only, `--mirror-dynamo-costs false` | 637 (621-639), 3 of 3 | 10.62 (60) | 4.6 / - | 0.6 / 3 | 658 |
+| 18 | both sockets, pinned, null backend (harness floor) | 639 (636-640), 3 of 3 | 4.88 (131) | 4.7 / 4.7 | 0.4 / 6 | 897 (generator invalid) |
+| 19 | socket 0 only, null backend | 639 (610-640), 3 of 3 | 10.65 (60) | 1.4 / - | 0.4 / 4 | 1062 |
+
+Reading, for the run index's owners:
+
+- **Not wake latency or feeding.** Lanes fed across the interconnect keep up as well as lanes fed
+  locally: row 15 (socket-1 issuers feeding socket-0 lanes) keeps up at 640M and achieves 1,060M at
+  300 ms, and own-socket feeding (row 10) is no better than feeding by worker id (row 11). The
+  issue lag stays in the microseconds to low milliseconds wherever the lanes are pinned.
+- **Not memory placement.** With lanes on both sockets the per-event lane cost is 11-20 us whether
+  the memory is interleaved (rows 8, 10), first-touched (row 12) or bound to either socket (rows 13,
+  14); binding only moves which socket's lanes are slower, and the slower lanes are the ones on the
+  memory's home socket. On one socket, local memory does matter: it cuts the per-event cost from 5.7
+  to 4.2 us and lifts the 300 ms point from 749M to 1,061M (rows 1 and 3, 2 and 4), which is the
+  cost of `--interleave=all` to a single-socket lane set.
+- **Not the lane count, the harness's payload path, or the pool.** 128 lanes on one socket cost
+  6.1 us per event and keep up (row 6); with the payload allocation and free removed the two-socket
+  cost is still 10.9 / 17.5 us against 4.6 us on one socket (rows 16, 17); the null backend's lanes
+  pay 4.7 us on two sockets against 1.4 us on one (rows 18, 19, the harness's own share: the channel
+  receive and the payload free of memory the issuers allocated) and still keep up; the SMG harness
+  has no lane pool (lanes own their workers by first appearance), so stealing is not involved.
+- **What is left is the index's shared writable state.** Lanes applying events on both sockets pay
+  two to three times the per-event CPU of lanes on one socket, with the same events per lane, the
+  same binary (the `b4943d69` index behaves the same, row 9) and lookups unaffected; the extra time
+  is cache lines of the run index written from both sockets bouncing across the interconnect. The
+  duplicated corpus makes the sharing true sharing: twenty workers carry the same content, so the
+  runs they converge on (coverage words, run metadata, arena and lane-map lines) are written by
+  lanes on both sockets. The fix is placement or partition, not parking: route the workers that
+  share content to lanes on one socket, or keep per-socket copies of the mutable run state and
+  arenas so that no line is written from both sockets; the single-socket 1,061M at 300 ms with
+  local memory is the figure a two-socket layout has to beat per socket.
+
 ## Plugging in a new index
 
 `ReplayBackend` is four slice-based methods plus a per-lane state type. The run-compressed index
