@@ -100,6 +100,20 @@ def _proc_snapshot() -> dict[str, tuple[int, int]]:
     return out
 
 
+def _thread_cpus(pid: str, cores: set[int]) -> set[int]:
+    """The last CPU of every thread of `pid` (what `ps -o psr` shows), within `cores`."""
+    out: set[int] = set()
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return out
+    for tid in tids:
+        ticks = _task_ticks(pid, tid)
+        if ticks is not None and ticks[1] in cores:
+            out.add(ticks[1])
+    return out
+
+
 def _all_cpus() -> set[int]:
     try:
         return set(range(os.cpu_count() or 0))
@@ -127,14 +141,19 @@ def sample(cores: set[int], seconds: float, ignore_pids: set[int]) -> list[dict]
             if delta <= 0:
                 continue
             comm, cmdline, kernel = _describe(pid)
+            pct = delta / CLK_TCK / elapsed * 100.0
+            cpus = {c for c in (cpu, first[pid][1]) if c in cores}
+            if pct >= 5.0:
+                # `ps -o psr` for every thread of a process worth recording: the cores it favours.
+                cpus |= _thread_cpus(pid, cores)
             rows.append(
                 {
                     "pid": int(pid),
                     "comm": comm,
                     "cmdline": cmdline,
-                    "cpu_pct": delta / CLK_TCK / elapsed * 100.0,
+                    "cpu_pct": pct,
                     "kernel_thread": kernel,
-                    "cpus": sorted({c for c in (cpu, first[pid][1]) if c in cores}),
+                    "cpus": sorted(cpus),
                 }
             )
         rows.sort(key=lambda row: -row["cpu_pct"])
