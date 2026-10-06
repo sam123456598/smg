@@ -245,6 +245,78 @@ one gateway a cut idles the engine, so the window never rolls past the cursor an
 served from history (exact); the window rolls only while the engine publishes for someone else,
 which is why the drill runs a second gateway, the shape of a multi-router deployment.
 
+## Publication drill table
+
+One pass of the contract's section 5 on the fleet the publication cites, 2026-10-05 evening, gateway and
+mock engines built from the pushed head (binaries named below by sha256), eight `mock-worker --engine
+realistic` workers on cores 72-143 with the gateway and the load generators on 64-71 (both shared
+with two other lanes' runs that evening), health checks 10 s apart so only the liveness vetoes act,
+load 8 x oha at 8 streams each (64 streams; 512 for the overload row), the fleet settled 2 s after
+registration before the load (the relays' ZMQ subscriptions join first). The relay topology runs the
+same mocks as vLLM-wire ZMQ ranks behind the Rust servicer (`crates/engine_servicer` through the
+`smg` binding, wheel named below) with a 100-batch history window so a resubscription from zero
+receives the relay's state snapshot. Sources: routing state (`is_healthy`, `stalled`) from
+`GET /workers` sampled every 100 ms; every event-side timing from the Prometheus counters sampled
+every 200 ms (`smg_kv_event_subscriptions_total`, `smg_kv_event_resyncs_total{reason}`,
+`smg_kv_event_gaps_total{outcome}`, `smg_kv_event_lag_seconds`, `smg_kv_index_blocks`,
+`smg_worker_stalled{reason}`); engine truth (admitted requests, cached and oracle tokens, resident
+block keys) from the mock's admin API; nothing from the gateway's log. Budgets are the pass rules as
+the drills implement them (`~/smg-perf/chaos/`), with the contract's 2 s exclusion given 0.5 s for
+the drill's own sampling.
+
+Two caveats. The drills compare block counts and the engines' own hit ratio, not block hashes: the
+mock's dump is its engine keys while the index keeps content hashes, and a gateway dump endpoint is
+proposed, not started (section 6 below). The fleet's steady cached/oracle ratio is 0.974 in every
+run; the recovery checks return to that value, and the gap to 0.98 is the workload's (eight fixed
+prompts whose first visit on each worker is a miss the oracle counts), not a recovery matter.
+
+Binaries (built from the pushed head c719dea6; the loop head moved to ce53d732 before this table was
+written with changes to `kv_index`, the mock and the documents only, so the gateway under test is
+the one these commits describe): `smg` sha256
+9f20d1001291b935ece05644d296faeb3c7febd5d85692479740e02367e60704, `mock-worker`
+4e6935b78cd27b91175857b21d7d2d393cdacbded673bdbe0fd5256a96fa28a2, servicer wheel
+`smg-1.11.0-cp38-abi3-linux_aarch64.whl` 2469e4864bce401d288edb5aff8d701cdc3cf0240c08b9d446ce3152ef31a41a
+(its `smg_rs.abi3.so` 3f1e11c94c34384561e9b01123af42b94f74da9cae60b5951a3f8be463b61f86). Results and
+every log under `~/smg-perf/results/chaos-*-20261005-21{29..46}*/`, verdicts in `chaos.tsv` between the
+`PUBLICATION-DIRECT-START` and `PUBLICATION-END` markers.
+
+| Drill | Topology | Pass rule (budget) | Measured | Detected by |
+|---|---|---|---|---|
+| engine killed (SIGKILL) | direct | out of routing <= 2.5 s (the contract's 2 s plus 0.5 s for the drill's sampling); no hung stream; slowest request < 30 s | PASS: out of routing in 2.1 s; 0 errored requests around the kill; slowest 0.70 s; hit/oracle 91.9/94.3 -> 92.3/95.0 % in the afternoon pass | `smg_worker_stalled{reason="unreachable"}` from the KV stream's reset |
+| worker partitioned (blackhole) | direct | out of routing <= 2.5 s; back after the heal; slowest < 60 s | PASS: out in 2.0 s, back 0.1 s after the heal; slowest 2.65 s | same, by keepalive failure |
+| worker unreachable (listener closed, connections reset) | direct | out of routing <= 2.5 s; back after the listener returns; slowest < 30 s | PASS: out in 2.2 s, back 0.3 s; slowest 0.77 s | same |
+| engine restarted (same port, empty cache; the fleet older than the warm-up window) | direct | out of routing <= 2.5 s; re-admitted <= 2.5 s after the port answers; stream resubscribed <= 2.5 s; first request <= 10 s into a 10 req/s trickle of unique prompts; the publisher restart counted as a resync; batches apply after | PASS: out in 2.0 s; re-admitted 0.8 s after the port answered, stream resubscribed at 1.0 s; first request 0.3 s into the trickle (warm-up slice); restart resync 1.1 s after the port answered; 1,422 batches applied after | `smg_kv_event_subscriptions_total`, `smg_kv_event_resyncs_total{reason="publisher_restart"}`, the engine's admitted-request count |
+| engine paused 8 s, health and load polls answering | direct | vetoed as wedged within the pause; routable after resume; gateway RSS growth < 512 MB | PASS: `wedged` 3.1 s into the pause; routable 0.0 s after resume; slowest 5.86 s; RSS +49 MB | `smg_worker_stalled{reason="wedged"}` (prefill-aware bound at the 3 s floor for chat-sized prompts) |
+| gateway restarted under load (SIGKILL, fleet re-registered) | direct | serving again <= 10 s; p99 over the run spanning the restart <= 2x the steady p99 + 0.5 s; no hung stream | PASS: serving again 0.8 s (`/health` 0.4 s, registrations 0.5 s, first worker 0.6 s); p99 0.58 -> 0.64 s (load capped at 40 req/s per generator) | `/health`, `/workers` |
+| 20 event batches dropped on the wire | direct | gap detected (`replay_requested` >= 1); batches apply after | PASS: gap seen 0.6 s after the drop, replayed by the engine (20 missed, recovered); 738 batches applied after | `smg_kv_event_gaps_total{outcome="replay_requested"}`, `smg_kv_event_missed_batches_total` |
+| publisher delayed 1.5 s for 10 s | direct | mean apply lag over the window >= 0.75 s; batches apply | PASS: mean lag 1.49 s over 267 batches | `smg_kv_event_lag_seconds` |
+| publisher restarted (cache kept, sequence back to 1) | direct | a resync counted after the fault (baseline before arming it); batches apply after | PASS: `publisher_restart` resync 0.2 s after the restart; 14 batches applied after, none stale | `smg_kv_event_resyncs_total{reason="publisher_restart"}` |
+| engine frozen 8 s (SIGSTOP, then SIGCONT) | direct | no hung stream; back after SIGCONT; RSS growth < 512 MB | PASS: back 0.0 s after SIGCONT; slowest 2.05 s; RSS +46 MB over the stall | `/workers`, `smg_kv_event_lag_seconds` |
+| engine CPU-starved 15 s (eight busy loops on its two cores) | direct | no hung stream; slowest < 60 s; healthy after the hogs; RSS growth < 512 MB | PASS: healthy 0.0 s after the hogs stopped; slowest 0.70 s; RSS +58 MB | `/workers` |
+| overload, 512 streams (8x the harness's 64) | direct | no hung stream; slowest < 60 s; RSS growth < 1,024 MB | PASS: p99 1.39 s, slowest 1.45 s, RSS +96 MB | load generator, RSS |
+| gateway restarted under load (history window 100, rolled) | relay | as direct, plus: `smg_kv_index_blocks` within 1 % of each engine's resident count <= 2.5 s after the registrations and equal once the load is over; cached/oracle >= 0.98 or back at the steady ratio over the next 10 s (a `snapshot` resync per worker whose window rolled, reported) | FAIL on the c719dea6 relay: serving again 0.6 s; the five busy workers exact 0.9 s after the registrations (4,171 to 4,821 blocks) and exact once the load was over (6,654 to 7,849), a snapshot resync each; cached/oracle 0.974 (steady 0.973); but three near-idle workers came back with 0 against 13, 13 and 14 resident blocks: their relays' ZMQ subscriptions joined after the batches the mock published at registration, so two relays had no state and one a single block (served `through=4 blocks=1`). Fixed in the servicer lane's ec2121b7 (the relay replays from zero when its first batch is past sequence 1): re-run below | `smg_kv_event_resyncs_total{reason="snapshot"}`, `smg_kv_index_blocks`, `GET /admin/cache` |
+| gap beyond the relay's window (100 batches; the first gateway's link to the busiest relay cut 15 s while a second gateway keeps the engine publishing) | relay | a `snapshot` resync after the cut; nothing settled as unrecovered; no degraded rank; index within 1 % <= 10 s and equal once the load is over | PASS: out of routing 2.0 s into the cut, back 0.0 s after the heal; the cursor lay below the window: `OUT_OF_RANGE`, resubscription from zero, snapshot resync 17.3 s after the cut (15 s of blackhole plus the reconnect), one chunk; index within 1 % 0.4 s later and equal once the load was over; no unrecovered gap, no degraded rank | `smg_kv_event_resyncs_total{reason="out_of_range"}` then `{reason="snapshot"}`, `smg_kv_event_gaps_total`, `smg_kv_index_blocks` |
+| 20 event batches dropped on the wire | relay | relay `publisher_gaps` >= 1 with `gap_batches_lost` 0; gateway unrecovered 0; applied batches keep growing | PASS: the relay saw the gap 0.6 s after it was armed and refilled it from the engine's replay (recovered 21, lost 0); the gateway saw no gap (`replay_requested` 0, unrecovered 0, missed 0); 865 batches applied after | relay counters, `smg_kv_event_gaps_total` |
+| publisher delayed 1.5 s for 10 s | relay | mean apply lag over the window >= 0.75 s; batches apply | PASS: mean lag 1.48 s over 420 batches | `smg_kv_event_lag_seconds` |
+| publisher restarted (cache kept) | relay | a resync counted after the fault; batches apply after | PASS: the relay reads the restart on the next batch and ends the stream with `DATA_LOSS`; `data_loss` resync 0.2 s after the restart; 12 batches applied after, none stale | `smg_kv_event_resyncs_total{reason="data_loss"}` |
+
+Re-run of the relay gateway-restart row on the servicer lane's ec2121b7 (the relay replays from
+zero when its first batch is past sequence 1; wheel `smg-1.11.0-cp38-abi3-linux_aarch64.whl` sha256
+0a7483a9425a20948b5bdfaa39f5e94945a34f6a0329202ac35f01d1f59d5891, its `smg_rs.abi3.so`
+2f8347c3fc3ada29356f7687bc405834a4e8362a2efb5c8f287a2b1a004928e7; gateway and mock as above; no
+settle before the load): still FAIL, for the other half of the race. The two busy workers' relays
+logged `joined a publisher already counting; its replay covered the batches before`
+(`unknown_before_start` 0) and came back exact (14,009 and 19,395 blocks on both sides, a snapshot
+resync each, cached/oracle 0.974 at once); four near-idle workers (73, 73, 146 and 74 resident
+blocks: five to ten requests each at the very start and nothing after) came back at 0, because
+their relays never saw a batch, so the first-batch trigger never fired and they had no state to
+serve. What closes the row is a replay from zero that does not wait for a first batch (at boot once
+the engine handshake is up, or when a subscriber asks from zero and the relay has relayed nothing);
+the row is re-run when it lands. Until then a fresh gateway in front of this relay knows a worker's
+resident set exactly when the relay saw the worker's stream from its first batch or any later one,
+and not at all for a worker that published only before the relay joined and never again. The
+direct topology has no such gap: the mock replays its buffer to a subscriber from zero.
+
 ## Comparison with Dynamo (`lib/llm/src/kv_router/indexer/recovery/`)
 
 | Property | Dynamo | SMG after this branch |
