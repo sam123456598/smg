@@ -4,9 +4,9 @@
 | --- | --- |
 | `throughput_bench.rs` | Criterion micro-benchmarks of the indexers (see its module doc). |
 | `mooncake_replay.rs` | Open-loop replay of a Mooncake indexer corpus by Dynamo's method, against this crate's indexers (`cargo bench -p kv-index --bench mooncake_replay -- --help`). |
-| `protocol/bisect_sustained.py` | Threshold search for sustained throughput: brackets the highest offered rate at which trials keep up (3 fresh-process trials per point, geometric bisection to within 10%), for either harness. |
-| `protocol/publish_protocol.py` | Guardrail 5 runner: N fresh-process trials with an interleaved same-binary control pair, the lock held per trial, a foreign-load check on the measurement cores before and after each trial, medians with bootstrap 95% confidence intervals, markdown output. |
-| `protocol/hostload.py` | The foreign-load sampler the two scripts share (per-process CPU on a core set over a short interval). |
+| `../docs/protocol/bisect_sustained.py` | Threshold search for sustained throughput: brackets the highest offered rate at which trials keep up (3 fresh-process trials per point, geometric bisection to within 10%), for either harness. |
+| `../docs/protocol/publish_protocol.py` | Guardrail 5 runner: N fresh-process trials with an interleaved same-binary control pair, the lock held per trial, a foreign-load check on the measurement cores before and after each trial, medians with bootstrap 95% confidence intervals, markdown output. |
+| `../docs/protocol/hostload.py` | The foreign-load sampler the two scripts share (per-process CPU on a core set over a short interval). |
 
 ## Why a corpus and a replay
 
@@ -141,7 +141,7 @@ The contract defines sustained throughput as the highest offered rate at which a
 at this window", so the threshold has to be bracketed:
 
 ```
-python3 benches/protocol/bisect_sustained.py --lock /tmp/measure.lock --out out/bisect \
+python3 docs/protocol/bisect_sustained.py --lock /tmp/measure.lock --out out/bisect \
   --lo 107e6 --hi 427e6 --trials 3 --tolerance 0.10 \
   --command "numactl --interleave=all <mooncake_replay> <corpus> --backend positional ... \
              --offered-block-ops-per-sec {rate} --result-json-output {json}"
@@ -169,7 +169,7 @@ are in `bracket.json`, and a looser rule (two of three) would move both upper en
 ## Publication protocol (guardrail 5)
 
 ```
-python3 benches/protocol/publish_protocol.py --name "<system, harness>" --trials 20 \
+python3 docs/protocol/publish_protocol.py --name "<system, harness>" --trials 20 \
   --lock /tmp/measure.lock --cores 0-63 --allow '<background daemon regex>' --out out/protocol/<tag> \
   --command "<one trial, with {json} for the result path>"
 ```
