@@ -47,13 +47,23 @@ current date, reasoning level and channels, then the developer turn) is shared b
    belong to the last `len(block_hashes) x 16` tokens of `token_ids`, not the first. Read head-aligned, 5,629 of the
    window group's 5,641 verifiable hashes mismatch the servicer's reproduction; read tail-aligned they are the
    full-attention group's hashes. The full-attention group stores each shared hash first (4,204 in the same batch listed
-   earlier, 2,154 in an earlier batch), so a consumer that slices the window group from the head files a second copy of
-   the hash under the wrong content from the first block after the shared preamble onward. That is the shape of the
-   live result: in both `cache_aware` phases every `event_hit` had `overlap_blocks=4` (the preamble) and the rest were
-   `event_miss` (phase 3: 42 hits, 264 misses), while the engine served 158 of those 265 requests with at least half the
-   prompt cached (engine-truth reuse 0.50). The servicer's normalizer and the gateway's content hashing both need the
-   tail rule for `kv_cache_spec_kind = sliding_window`; the servicer lane is folding a tail-aligned window-group store
-   into its vLLM scenario (dropped whole through the group gate rather than sliced from the head).
+   earlier, 2,154 in an earlier batch), so a consumer that slices the window group from the head would file a second
+   copy of the hash under the wrong content from the first block after the shared preamble onward. The servicer's
+   normalizer has dropped the window group whole on ranks with a main-attention group since d868d876 (in the 85f9d28c
+   wheel), stores and removals alike, so no window event reached the live index; the tail rule matters only for a
+   pure sliding-window model, and the servicer lane's group-aware normalizer now takes the last k blocks there and
+   drops the k=0 placeholder events (1,399 of the 2,200 window-group events carry no hashes).
+   **Live result, unexplained.** In both `cache_aware` phases every `event_hit` had `overlap_blocks=4` (the preamble)
+   and the rest were `event_miss` (phase 3: 42 hits, 264 misses), while the engine served 158 of those 265 requests with
+   at least half the prompt cached (engine-truth reuse 0.50). An earlier draft blamed the window group's token layout;
+   that is withdrawn. What the data supports: the live picture is the signature of single-copy semantics on this
+   stream. Fed the raw full-attention events with one copy per hash, both indexers cut every chain right after the
+   preamble (the fork block at position 4 is computed concurrently by the first requests, gets two physical copies,
+   and the eviction of one copy reads as its removal; 93 % of stores then fail on a missing parent), which is exactly
+   a four-block overlap for every later request; fed copy-counted events they hold the chains. Where the second copy
+   is collapsed on the live path (the relay's live-block store, the normalizer, or the monitor's copy accounting) is
+   what the re-run on the group-aware wheel, with its drop reasons and hash counters in the relay-closed line, has to
+   say; the oracle's position-4 and -5 discrepancy (item 2) sits at the same fork and is the run-index lane's item.
 4. **Relay paths on this stream.** Late join: the relay started with the first `cache_aware` subscription after 385
    batches, applied 361 live batches and never learned what was stored before (relay-closed line `relayed: 747,
    served_snapshots: 1, publisher_gaps: 0, live_blocks=8201` against 8,745 hashes live in the engine). That is the
@@ -68,4 +78,6 @@ current date, reasoning level and channels, then the developer turn) is shared b
 ## Next
 
 When the group-aware normalizer ships, the first run on the fleet is this same gpt-oss replay with the new wheel,
-measuring `event_hit` overlap against engine reuse; the hybrid Mamba corpus follows once its weights are on the host.
+reading the relay's drop reasons and hash counters live and measuring `event_hit` overlap against engine reuse, with
+one request's lookup traced to the block where its overlap stops; the hybrid Mamba corpus follows once its weights are
+on the host.
