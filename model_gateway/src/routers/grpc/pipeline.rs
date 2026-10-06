@@ -244,6 +244,8 @@ pub(crate) struct RequestPipeline {
     backend_type: &'static str,
     /// Disaggregation mode, for per-leg retry metric labels.
     mode: Mode,
+    /// The registry, read at dispatch for `--worker-overload-shed`.
+    worker_registry: Arc<WorkerRegistry>,
 }
 
 /// Outcome of one full pipeline run.
@@ -407,6 +409,7 @@ impl RequestPipeline {
             stages: Arc::new(stages),
             backend_type: backend,
             mode,
+            worker_registry: deps.worker_registry.clone(),
         })
     }
 
@@ -459,7 +462,12 @@ impl RequestPipeline {
         )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
-            acquire_clients(workers, &ctx.input.model_id).await
+            acquire_clients(
+                workers,
+                &ctx.input.model_id,
+                self.worker_registry.overload_shed_enabled(),
+            )
+            .await
         )?);
         if let Some(encode) = &stages.encode {
             step!(encode.name(), encode.execute(ctx).await)?;
@@ -497,7 +505,14 @@ impl RequestPipeline {
                     "Worker selection not completed",
                 )
             })?;
-            dctx.clients = Some(acquire_clients(workers, &dctx.model_id).await?);
+            dctx.clients = Some(
+                acquire_clients(
+                    workers,
+                    &dctx.model_id,
+                    self.worker_registry.overload_shed_enabled(),
+                )
+                .await?,
+            );
             let retained = plan.as_mut().ok_or_else(|| {
                 error!(function = "run_attempt", "Execution plan already consumed");
                 error::internal_error("execution_plan_consumed", "Execution plan already consumed")

@@ -1,5 +1,9 @@
-//! Shed responses for the absolute worker-overload guard. Failure paths only —
-//! nothing here runs for a served request.
+//! The two answers to a candidate pool whose every worker is over the overload
+//! thresholds: by default the request steers to the least-loaded of them
+//! ([`fallback_if_all_overloaded`]); under `--worker-overload-shed` it is
+//! refused with a distinct 503 ([`shed_if_all_overloaded`]). Nothing here runs
+//! while some worker is under the thresholds: such workers are simply left
+//! out of selection.
 //!
 //! The verdict is taken from the candidate pool the caller selected over, never
 //! from the model index: selection narrows by worker type and transport first,
@@ -22,8 +26,9 @@ use crate::{
     routers::{common::retry::mark_non_retryable, error},
     worker::{
         overload::{
-            BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
-            STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
+            BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_OVERLOADED_SHED,
+            BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED, STAGE_DISPATCH,
+            STAGE_PD_ADMISSION, STAGE_SELECTION,
         },
         Worker,
     },
@@ -56,12 +61,19 @@ pub fn all_overloaded(candidates: &[Arc<dyn Worker>]) -> bool {
     !candidates.is_empty() && candidates.iter().all(|w| w.is_overloaded())
 }
 
-/// Shed when every worker selection could have used is flagged overloaded.
+/// Shed when every worker selection could have used is flagged overloaded
+/// and shedding is on (`--worker-overload-shed`, `shedding`).
 ///
-/// `None` means the empty pool has some other cause, and the caller's existing
-/// not-found / unavailable answer stands.
-pub fn shed_if_all_overloaded(candidates: &[Arc<dyn Worker>], model_id: &str) -> Option<Response> {
-    if !all_overloaded(candidates) {
+/// `None` means the pool is not all-overloaded, or shedding is off and the
+/// caller steers through [`fallback_if_all_overloaded`] instead; either way
+/// the caller's existing not-found / unavailable answer stands when nothing
+/// is routable.
+pub fn shed_if_all_overloaded(
+    candidates: &[Arc<dyn Worker>],
+    model_id: &str,
+    shedding: bool,
+) -> Option<Response> {
+    if !shedding || !all_overloaded(candidates) {
         return None;
     }
     Some(shed(
@@ -72,12 +84,47 @@ pub fn shed_if_all_overloaded(candidates: &[Arc<dyn Worker>], model_id: &str) ->
     ))
 }
 
-/// Dispatch-time re-check: one atomic read on the already-chosen worker,
-/// covering the selection→dispatch window. Deliberately sheds rather than
-/// re-selecting — the flag moves at the poll interval, so the window is rare —
-/// and reports only what it knows: this worker went over, not the fleet.
-pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<Response> {
-    if !worker.is_overloaded() {
+/// The default answer to a pool whose every worker is over the thresholds:
+/// the least-loaded worker that is routable but for the flag (ready, circuit
+/// closed, not stalled). A fleet that is uniformly over the thresholds is
+/// still a fleet; refusing the request would turn a load signal into an
+/// outage. `None` when the pool is not all-overloaded, or when no worker in
+/// it is routable at all (then the caller's unavailable answer stands).
+pub fn fallback_if_all_overloaded(
+    candidates: &[Arc<dyn Worker>],
+    model_id: &str,
+    stage: &'static str,
+) -> Option<Arc<dyn Worker>> {
+    if !all_overloaded(candidates) {
+        return None;
+    }
+    let worker = candidates
+        .iter()
+        .filter(|w| w.is_healthy() && w.circuit_breaker_can_execute() && w.stall_reason().is_none())
+        .min_by_key(|w| w.load())?;
+    Metrics::record_worker_overload_fallback(stage);
+    debug!(
+        branch = BRANCH_ALL_OVERLOADED_FALLBACK,
+        stage,
+        worker = worker.url(),
+        model_id,
+        "Overload fallback"
+    );
+    Some(Arc::clone(worker))
+}
+
+/// Dispatch-time re-check under `--worker-overload-shed` (`shedding`): one atomic
+/// read on the already-chosen worker, covering the selection→dispatch window.
+/// Deliberately sheds rather than re-selecting — the flag moves at the poll
+/// interval, so the window is rare — and reports only what it knows: this
+/// worker went over, not the fleet. Without shedding the dispatch stands: the
+/// worker was the right choice when it was made.
+pub fn shed_if_worker_overloaded(
+    worker: &dyn Worker,
+    model_id: &str,
+    shedding: bool,
+) -> Option<Response> {
+    if !shedding || !worker.is_overloaded() {
         return None;
     }
     let url = worker.url();
@@ -172,12 +219,16 @@ mod tests {
 
         a.set_overloaded(true);
         assert!(
-            shed_if_all_overloaded(&pool, "m").is_none(),
+            shed_if_all_overloaded(&pool, "m", true).is_none(),
             "one eligible worker left is not a shed"
         );
 
         b.set_overloaded(true);
-        let response = shed_if_all_overloaded(&pool, "m").expect("shed");
+        assert!(
+            shed_if_all_overloaded(&pool, "m", false).is_none(),
+            "without shedding an all-overloaded pool is steered, not refused"
+        );
+        let response = shed_if_all_overloaded(&pool, "m", true).expect("shed");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
@@ -199,7 +250,7 @@ mod tests {
         let a = worker("http://127.0.0.1:9811", "m");
         a.set_overloaded(true);
 
-        let selection = shed_if_all_overloaded(std::slice::from_ref(&a), "m").expect("shed");
+        let selection = shed_if_all_overloaded(std::slice::from_ref(&a), "m", true).expect("shed");
         assert!(
             is_retryable_status(selection.status()),
             "the status stays the retryable 503 clients already understand"
@@ -209,7 +260,7 @@ mod tests {
             "but the retry layer must decline it"
         );
 
-        let dispatch = shed_if_worker_overloaded(a.as_ref(), "m").expect("shed");
+        let dispatch = shed_if_worker_overloaded(a.as_ref(), "m", true).expect("shed");
         assert!(!is_retryable_response(&dispatch));
     }
 
@@ -220,8 +271,8 @@ mod tests {
         let a = worker("http://127.0.0.1:9821", "m");
         a.set_overloaded(true);
 
-        let selection = shed_if_all_overloaded(std::slice::from_ref(&a), "m").expect("shed");
-        let dispatch = shed_if_worker_overloaded(a.as_ref(), "m").expect("shed");
+        let selection = shed_if_all_overloaded(std::slice::from_ref(&a), "m", true).expect("shed");
+        let dispatch = shed_if_worker_overloaded(a.as_ref(), "m", true).expect("shed");
         for response in [&selection, &dispatch] {
             let value = response
                 .headers()
@@ -237,20 +288,67 @@ mod tests {
         }
     }
 
-    /// An empty pool is a 404/unavailable question for the caller, not a shed.
+    /// An empty pool is a 404/unavailable question for the caller, not a shed
+    /// and not a fallback.
     #[test]
     fn empty_pool_is_not_a_shed() {
-        assert!(shed_if_all_overloaded(&[], "nobody").is_none());
+        assert!(shed_if_all_overloaded(&[], "nobody", true).is_none());
+        assert!(fallback_if_all_overloaded(&[], "nobody", STAGE_SELECTION).is_none());
         assert!(!all_overloaded(&[]));
+    }
+
+    /// The steering default: an all-overloaded pool routes to its least-loaded
+    /// routable worker; a pool with an eligible worker left is not touched,
+    /// and a worker that is also unhealthy is never the fallback.
+    #[test]
+    fn all_overloaded_falls_back_to_the_least_loaded_routable_worker() {
+        let a = worker("http://127.0.0.1:9831", "m");
+        let b = worker("http://127.0.0.1:9832", "m");
+        let c = worker("http://127.0.0.1:9833", "m");
+        let pool = vec![Arc::clone(&a), Arc::clone(&b), Arc::clone(&c)];
+        for _ in 0..3 {
+            a.increment_load();
+        }
+        b.increment_load();
+
+        a.set_overloaded(true);
+        b.set_overloaded(true);
+        assert!(
+            fallback_if_all_overloaded(&pool, "m", STAGE_SELECTION).is_none(),
+            "an eligible worker left means selection handles it"
+        );
+
+        c.set_overloaded(true);
+        let picked = fallback_if_all_overloaded(&pool, "m", STAGE_SELECTION).expect("fallback");
+        assert_eq!(
+            picked.url(),
+            "http://127.0.0.1:9833",
+            "the least-loaded wins"
+        );
+
+        c.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        let picked = fallback_if_all_overloaded(&pool, "m", STAGE_SELECTION).expect("fallback");
+        assert_eq!(
+            picked.url(),
+            "http://127.0.0.1:9832",
+            "an unhealthy worker is not routable even as the fallback"
+        );
+
+        a.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        b.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        assert!(
+            fallback_if_all_overloaded(&pool, "m", STAGE_SELECTION).is_none(),
+            "nothing routable: the caller's unavailable answer stands"
+        );
     }
 
     #[test]
     fn dispatch_recheck_sheds_only_for_a_flagged_worker() {
         let w = worker("http://127.0.0.1:9803", "m");
-        assert!(shed_if_worker_overloaded(w.as_ref(), "m").is_none());
+        assert!(shed_if_worker_overloaded(w.as_ref(), "m", true).is_none());
 
         w.set_overloaded(true);
-        let response = shed_if_worker_overloaded(w.as_ref(), "m").expect("shed");
+        let response = shed_if_worker_overloaded(w.as_ref(), "m", true).expect("shed");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),

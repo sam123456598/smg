@@ -427,6 +427,11 @@ pub(crate) fn init_metrics() {
         "Requests shed because every worker for the model is overloaded, by stage \
          (selection, dispatch)"
     );
+    describe_counter!(
+        "smg_worker_overload_fallback_total",
+        "Requests routed to the least-loaded worker because every worker for the model is \
+         overloaded and shedding is off, by stage"
+    );
     describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
@@ -1463,6 +1468,16 @@ impl Metrics {
     pub fn record_worker_overload_shed(stage: &'static str) {
         counter!(
             "smg_worker_overload_shed_total",
+            "stage" => stage
+        )
+        .increment(1);
+    }
+
+    /// Record a request steered to the least-loaded worker because every
+    /// worker for the model is overloaded and shedding is off.
+    pub fn record_worker_overload_fallback(stage: &'static str) {
+        counter!(
+            "smg_worker_overload_fallback_total",
             "stage" => stage
         )
         .increment(1);

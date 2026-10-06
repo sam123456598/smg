@@ -311,50 +311,46 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
-    /// Enable worker overload protection with the gateway default thresholds.
-    ///
-    /// A worker whose load signal crosses a threshold is considered overloaded
-    /// and excluded from routing until the signal recovers; when every worker
-    /// is overloaded, requests are shed immediately rather than queued.
-    ///
-    /// This flag alone applies --worker-overload-token-usage 0.9 and leaves
-    /// --worker-overload-waiting-requests unset: KV token usage means the same
-    /// thing on every engine, while a sensible waiting-requests ceiling is
-    /// workload-dependent, so it has no universal default. Explicit thresholds
-    /// override the default, and either threshold set on its own enables
-    /// protection without this flag — exactly as before it existed. Per-worker
-    /// `overload` blocks on a WorkerSpec override the gateway values per
-    /// signal, and enable protection for that worker even with everything here
-    /// unset.
-    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    /// Worker overload protection (the default; kept so existing command
+    /// lines still parse). A worker whose load report is at or above
+    /// --worker-overload-waiting-requests or --worker-overload-token-usage is
+    /// left out of routing while another worker is under them; when every
+    /// worker is over them the request goes to the least-loaded one, unless
+    /// --worker-overload-shed asks for a 503 instead. Evaluated once per load
+    /// report, never per request. Per-worker `overload` blocks on a WorkerSpec
+    /// override the gateway values per signal
+    #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
 
-    /// Queued-request count at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when
-    /// every worker is overloaded, requests are shed immediately rather than
-    /// queued. Unset disables overload protection.
-    ///
-    /// Queued (waiting) requests, summed across DP ranks. Must be >= 1: the
-    /// comparison is inclusive, so 0 would veto every worker unconditionally.
-    #[arg(long, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
-    worker_overload_waiting_requests: Option<usize>,
+    /// Switch worker overload protection off: no worker is ever left out of
+    /// routing for its waiting queue or KV usage (per-worker `overload` blocks
+    /// on a WorkerSpec still apply)
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    disable_worker_overload_protection: bool,
 
-    /// KV-cache token usage at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when
-    /// every worker is overloaded, requests are shed immediately rather than
-    /// queued. Unset disables overload protection.
-    ///
-    /// Mean KV-cache token usage across DP ranks, the same signal
-    /// `--balance-token-usage-threshold` reads, applied as an absolute
-    /// per-worker ceiling rather than a fleet-relative spread. Backend must
-    /// report token_usage. Must be in (0.0, 1.0]: the comparison is inclusive,
-    /// so 0.0 would veto every worker unconditionally.
-    ///
-    /// Distinct from `--overload-token-usage-threshold`, which only de-ranks
-    /// the hottest backend within cache-aware affinity; this flag removes the
-    /// worker from routing entirely and sheds when every worker crosses it.
-    #[arg(long, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
-    worker_overload_token_usage: Option<f64>,
+    /// Queued (waiting) requests, summed across DP ranks, at or above which a
+    /// worker counts as overloaded. Must be >= 1: the comparison is inclusive,
+    /// so 0 would veto every worker unconditionally
+    #[arg(long, default_value_t = 8, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    worker_overload_waiting_requests: usize,
+
+    /// Mean KV-cache token usage across DP ranks at or above which a worker
+    /// counts as overloaded: the same signal --balance-token-usage-threshold
+    /// reads, applied as an absolute per-worker ceiling rather than a
+    /// fleet-relative spread. Backend must report token_usage. Must be in
+    /// (0.0, 1.0]: the comparison is inclusive, so 0.0 would veto every worker
+    /// unconditionally. Distinct from --overload-token-usage-threshold, which
+    /// only de-ranks the hottest backend within cache-aware affinity
+    #[arg(long, default_value_t = 0.8, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
+    worker_overload_token_usage: f64,
+
+    /// Refuse a request with a 503 (worker_overload_protection_shed,
+    /// Retry-After the load poll interval) when every worker it could use is
+    /// overloaded, instead of routing it to the least-loaded one; also sheds a
+    /// worker that crossed a threshold between selection and dispatch. Off by
+    /// default: steering never turns a load signal into an outage
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    worker_overload_shed: bool,
 
     /// Anti-hotspot decay: de-rank cache-affine candidates by their
     /// waiting-prefill backlog (overlap score divided by 1 + overlap_decay
@@ -2028,9 +2024,12 @@ impl CliArgs {
             )
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
-            .worker_overload_protection(self.worker_overload_protection)
-            .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
-            .worker_overload_token_usage(self.worker_overload_token_usage)
+            .worker_overload_protection(
+                self.worker_overload_protection && !self.disable_worker_overload_protection,
+            )
+            .worker_overload_waiting_requests(Some(self.worker_overload_waiting_requests))
+            .worker_overload_token_usage(Some(self.worker_overload_token_usage))
+            .worker_overload_shed(self.worker_overload_shed)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
             .kv_index(self.kv_index)
@@ -2891,25 +2890,48 @@ mod tests {
         );
     }
 
-    /// Unset means off on both paths: the feature must be byte-identical to
-    /// pre-feature behavior until an operator opts in.
+    /// Protection is on by default on both signals, steering only, on both
+    /// config paths.
     #[test]
-    fn worker_overload_thresholds_default_to_unset_in_both_configs() {
+    fn worker_overload_protection_defaults_to_on_and_steering_in_both_configs() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.worker_overload_waiting_requests, None);
-        assert_eq!(router_config.worker_overload_token_usage, None);
+        assert!(router_config.worker_overload_protection);
+        assert_eq!(router_config.worker_overload_waiting_requests, Some(8));
+        assert_eq!(router_config.worker_overload_token_usage, Some(0.8));
+        assert!(!router_config.worker_overload_shed);
 
         let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.worker_overload_protection);
         assert_eq!(
             server_config.router_config.worker_overload_waiting_requests,
-            None
+            Some(8)
         );
         assert_eq!(
             server_config.router_config.worker_overload_token_usage,
-            None
+            Some(0.8)
         );
+        assert!(!server_config.router_config.worker_overload_shed);
+    }
+
+    /// The two opt-outs: `--disable-worker-overload-protection` switches the
+    /// gateway thresholds off, `--worker-overload-shed` turns steering into
+    /// refusal; both must survive into `ServerConfig.router_config`.
+    #[test]
+    fn worker_overload_opt_outs_flow_into_both_configs() {
+        let cli = cli_args_from(&["--disable-worker-overload-protection"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.worker_overload_protection);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.worker_overload_protection);
+
+        let cli = cli_args_from(&["--worker-overload-shed"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router_config.worker_overload_shed);
+        assert!(router_config.worker_overload_protection);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.worker_overload_shed);
     }
 
     /// Both thresholds are `>=` comparisons, so the excluded ends of their
@@ -2950,10 +2972,9 @@ mod tests {
             router_config.disable_load_monitoring,
             "disable_load_monitoring must reach RouterConfig via to_router_config"
         );
-        // The flag alone carries no thresholds; the token default is applied
-        // at resolution, not stored in config.
-        assert_eq!(router_config.worker_overload_waiting_requests, None);
-        assert_eq!(router_config.worker_overload_token_usage, None);
+        // The flag changes nothing: the defaults are already on.
+        assert_eq!(router_config.worker_overload_waiting_requests, Some(8));
+        assert_eq!(router_config.worker_overload_token_usage, Some(0.8));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(
@@ -2966,18 +2987,18 @@ mod tests {
         );
     }
 
-    /// Defaults: protection off, monitoring default-on (opt-out false) — the
-    /// behavior change is monitoring, and it is carried by the default here.
+    /// Defaults: protection on, monitoring on (opt-out false) — both carried
+    /// by the defaults here.
     #[test]
-    fn overload_protection_and_monitoring_flags_default_off_in_both_configs() {
+    fn overload_protection_and_monitoring_default_on_in_both_configs() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert!(!router_config.worker_overload_protection);
+        assert!(router_config.worker_overload_protection);
         assert!(!router_config.disable_load_monitoring);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert!(!server_config.router_config.worker_overload_protection);
+        assert!(server_config.router_config.worker_overload_protection);
         assert!(!server_config.router_config.disable_load_monitoring);
     }
 

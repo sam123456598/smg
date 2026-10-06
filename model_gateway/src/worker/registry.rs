@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
 };
@@ -339,6 +339,11 @@ pub struct WorkerRegistry {
     /// reading it costs one map probe and no worker walk.
     model_overloaded: Arc<DashMap<String, AtomicUsize>>,
 
+    /// `--worker-overload-shed`: refuse a request with a 503 when every
+    /// candidate is overloaded instead of steering it to the least-loaded
+    /// one. Read by every router at its overload decision points.
+    overload_shed: Arc<AtomicBool>,
+
     /// Serializes overload *edges* so a flag flip and its counter adjustment
     /// land as one step. Two group loops flipping the same worker in opposite
     /// directions would otherwise be free to apply their deltas in the reverse
@@ -407,6 +412,7 @@ impl WorkerRegistry {
             url_to_id: Arc::new(DashMap::new()),
             worker_mutation_locks: Arc::new(DashMap::new()),
             model_overloaded: Arc::new(DashMap::new()),
+            overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
             model_retry_configs: Arc::new(DashMap::new()),
             worker_origins: Arc::new(DashMap::new()),
@@ -687,6 +693,17 @@ impl WorkerRegistry {
     /// whose model/provider filters are evaluated dynamically.
     pub(crate) fn get_routing_workers(&self) -> Arc<[Arc<dyn Worker>]> {
         Arc::clone(&self.current_global_routing_snapshot().all)
+    }
+
+    /// Whether an all-overloaded candidate pool is refused (`true`) or
+    /// steered to its least-loaded worker (the default).
+    pub fn overload_shed_enabled(&self) -> bool {
+        self.overload_shed.load(Ordering::Relaxed)
+    }
+
+    /// Set `--worker-overload-shed` for every router reading this registry.
+    pub fn set_overload_shed(&self, shed: bool) {
+        self.overload_shed.store(shed, Ordering::Relaxed);
     }
 
     /// Apply the absolute overload veto to `worker`, returning `true` when the

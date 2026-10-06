@@ -528,6 +528,7 @@ struct Router {
     worker_overload_waiting_requests: Option<usize>,
     worker_overload_token_usage: Option<f64>,
     worker_overload_protection: bool,
+    worker_overload_shed: bool,
     disable_load_monitoring: bool,
     max_buffered_request_bytes: u64,
     kv_connector_annotation: String,
@@ -884,6 +885,7 @@ impl Router {
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .worker_overload_protection(self.worker_overload_protection)
+            .worker_overload_shed(self.worker_overload_shed)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1144,9 +1146,10 @@ impl Router {
         cache_ttl_secs = 180,
         job_queue_capacity = 1000,
         job_queue_concurrency = 200,
-        worker_overload_waiting_requests = None,
-        worker_overload_token_usage = None,
-        worker_overload_protection = false,
+        worker_overload_waiting_requests = Some(8),
+        worker_overload_token_usage = Some(0.8),
+        worker_overload_protection = true,
+        worker_overload_shed = false,
         disable_load_monitoring = false,
         max_buffered_request_bytes = 1_048_576,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
@@ -1317,6 +1320,7 @@ impl Router {
         worker_overload_waiting_requests: Option<usize>,
         worker_overload_token_usage: Option<f64>,
         worker_overload_protection: bool,
+        worker_overload_shed: bool,
         disable_load_monitoring: bool,
         max_buffered_request_bytes: u64,
         kv_connector_annotation: String,
@@ -1500,6 +1504,7 @@ impl Router {
             worker_overload_waiting_requests,
             worker_overload_token_usage,
             worker_overload_protection,
+            worker_overload_shed,
             disable_load_monitoring,
             max_buffered_request_bytes,
             kv_connector_annotation,

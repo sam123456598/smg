@@ -303,6 +303,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_overload_shed(mut self, shed: bool) -> Self {
+        self.config.worker_overload_shed = shed;
+        self
+    }
+
     pub fn worker_overload_token_usage(mut self, threshold: Option<f64>) -> Self {
         self.config.worker_overload_token_usage = threshold;
         self

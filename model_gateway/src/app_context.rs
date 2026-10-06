@@ -687,6 +687,9 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        if let Some(registry) = self.worker_registry.as_ref() {
+            registry.set_overload_shed(config.worker_overload_shed);
+        }
         // Progress-based liveness thresholds (see `worker::liveness`).
         liveness::configure(
             Duration::from_secs(config.worker_stall_secs),

@@ -12,7 +12,10 @@ use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{
+        overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+        ConnectionMode, RuntimeType,
+    },
 };
 
 /// Main router configuration
@@ -130,28 +133,40 @@ pub struct RouterConfig {
     /// always fed regardless of this flag.
     #[serde(default)]
     pub disable_load_monitoring: bool,
-    /// Enable absolute worker overload protection with the gateway default of
-    /// `worker_overload_token_usage = 0.9` (KV token usage is engine-universal;
-    /// a waiting-requests default would be workload-dependent, so that signal
-    /// stays unset). Redundant when either explicit threshold below is set —
-    /// those enable protection on their own, exactly as before this flag.
-    #[serde(default)]
+    /// Absolute worker overload protection, on by default. A worker whose load
+    /// report is at or above either threshold below is left out of routing
+    /// while another worker is under them; when every worker is over them the
+    /// request goes to the least-loaded one (see `worker_overload_shed` for
+    /// refusing instead). Evaluated once per ingested load report, never per
+    /// request. `false` switches both gateway thresholds off; per-worker
+    /// `overload` blocks on a WorkerSpec still apply.
+    #[serde(default = "default_worker_overload_protection")]
     pub worker_overload_protection: bool,
-    /// Queued-request count at or above which a worker is considered
-    /// overloaded and excluded from routing until the signal recovers; when all
-    /// workers are overloaded, requests are shed immediately rather than
-    /// queued. Evaluated once per ingested load report, never per request.
-    /// `None` (default) disables this signal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Queued (waiting) requests, summed across DP ranks, at or above which a
+    /// worker counts as overloaded. Default 8; `null` switches this signal off.
+    #[serde(
+        default = "default_worker_overload_waiting_requests",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub worker_overload_waiting_requests: Option<usize>,
     /// KV-cache token usage (0.0-1.0, averaged across DP ranks) at or above
-    /// which a worker is considered overloaded — the same signal
+    /// which a worker counts as overloaded — the same signal
     /// `balance_token_usage_threshold` reads, applied as an absolute per-worker
-    /// ceiling instead of a fleet-relative spread. `None` (default) disables
-    /// this signal; with both signals unset, overload protection is off and
-    /// routing behaves exactly as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// ceiling instead of a fleet-relative spread. Default 0.8; `null`
+    /// switches this signal off.
+    #[serde(
+        default = "default_worker_overload_token_usage",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub worker_overload_token_usage: Option<f64>,
+    /// Refuse a request with a 503 (`worker_overload_protection_shed`,
+    /// Retry-After the poll interval) when every worker it could use is
+    /// overloaded, instead of steering it to the least-loaded one. Off by
+    /// default: a fleet that is uniformly over the thresholds is still a
+    /// fleet, and the dispatch-time re-check that sheds a worker flagged
+    /// between selection and dispatch is part of the same opt-in.
+    #[serde(default)]
+    pub worker_overload_shed: bool,
     /// TTL in seconds for entries in the event-driven cache-aware positional
     /// indexer: entries neither stored to nor read by a query within this
     /// window are evicted by a periodic background prune. Bounds index growth
@@ -416,6 +431,27 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_worker_overload_protection() -> bool {
+    true
+}
+
+// A serde default returns the field's type, `Option` included.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default for an optional field"
+)]
+fn default_worker_overload_waiting_requests() -> Option<usize> {
+    Some(DEFAULT_WAITING_REQUESTS)
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default for an optional field"
+)]
+fn default_worker_overload_token_usage() -> Option<f64> {
+    Some(DEFAULT_TOKEN_USAGE_CEILING)
 }
 
 fn default_worker_stall_secs() -> u64 {
@@ -1283,9 +1319,10 @@ impl Default for RouterConfig {
             worker_warmup_blocks: default_worker_warmup_blocks(),
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
-            worker_overload_protection: false,
-            worker_overload_waiting_requests: None,
-            worker_overload_token_usage: None,
+            worker_overload_protection: default_worker_overload_protection(),
+            worker_overload_waiting_requests: default_worker_overload_waiting_requests(),
+            worker_overload_token_usage: default_worker_overload_token_usage(),
+            worker_overload_shed: false,
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
             kv_index: KvIndexKind::default(),
