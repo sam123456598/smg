@@ -1333,10 +1333,10 @@ impl CacheAwarePolicy {
     /// hot prefixes replicate instead of queueing behind one engine. Both
     /// margins must clear so the gate neither fires on steady-state variance
     /// (relative alone would, at low means) nor stays blind to a deep queue
-    /// (absolute alone would, at high means). A request with no holder is
-    /// routed among the workers under the same gate
-    /// ([`Self::ungated_candidates`]), so a burst of misses is bounded by
-    /// the margins a hit spills at.
+    /// (absolute alone would, at high means). Outside the fleet-wide
+    /// KV-pressure fallback, a request with no holder is routed among the
+    /// workers under the same gate ([`Self::ungated_candidates`]), so a
+    /// burst of misses is bounded by the margins a hit spills at.
     fn candidate_requires_spill(
         &self,
         workers: &[Arc<dyn Worker>],
