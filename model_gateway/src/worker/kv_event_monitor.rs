@@ -15,7 +15,7 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     fmt,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::DashMap;
@@ -997,8 +997,24 @@ impl KvEventMonitor {
         }
 
         on_batch(batch);
+        let started = Instant::now();
+        let (mut stored_blocks, mut removed_blocks) = (0usize, 0usize);
         for event in &batch.events {
+            match &event.data {
+                Some(kv_cache_event::Data::Stored(stored)) => stored_blocks += stored.blocks.len(),
+                Some(kv_cache_event::Data::Removed(removed)) => {
+                    removed_blocks += removed.block_hashes.len();
+                }
+                _ => {}
+            }
             Self::apply_event(event, worker_id, indexer, &mut state.index);
+        }
+        Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
+        if stored_blocks > 0 {
+            Metrics::record_kv_event_blocks(worker_url, "stored", stored_blocks);
+        }
+        if removed_blocks > 0 {
+            Metrics::record_kv_event_blocks(worker_url, "removed", removed_blocks);
         }
         Self::record_lag(worker_url, batch.timestamp);
         Metrics::record_kv_event_batch(worker_url, "applied");
@@ -1473,6 +1489,59 @@ impl WorkerIndexState {
                     false
                 }
             },
+        }
+    }
+}
+
+/// Hooks for benchmarks and integration tests that put an index in front of
+/// the policy and feed it events the way a subscription does, without a
+/// stream: the subscriber's per-worker state and the same apply path.
+#[cfg(any(test, feature = "test-util"))]
+pub mod bench_support {
+    use std::sync::Arc;
+
+    use kv_index::WorkerIdExhausted;
+    use smg_grpc_client::common_proto::KvEventBatch;
+
+    use super::{KvEventMonitor, KvIndex, WorkerIndexState};
+
+    impl KvEventMonitor {
+        /// Make `index` the model's index, as a worker's first subscription
+        /// would; a later subscription for the model shares it.
+        pub fn set_index(&self, model_id: &str, index: Arc<KvIndex>) {
+            self.indexers.insert(model_id.to_string(), index);
+        }
+    }
+
+    /// One worker's feed into an index.
+    pub struct IndexFeed {
+        worker: u32,
+        state: WorkerIndexState,
+    }
+
+    impl IndexFeed {
+        /// Intern `worker_url` in `index` and start with empty state.
+        pub fn new(index: &KvIndex, worker_url: &str) -> Result<Self, WorkerIdExhausted> {
+            Ok(Self {
+                worker: index.intern_worker(worker_url)?,
+                state: WorkerIndexState::default(),
+            })
+        }
+
+        pub fn worker_id(&self) -> u32 {
+            self.worker
+        }
+
+        /// Apply every event of `batch`, as an admitted batch is applied.
+        pub fn apply(&mut self, index: &KvIndex, batch: &KvEventBatch) {
+            for event in &batch.events {
+                KvEventMonitor::apply_event(event, self.worker, index, &mut self.state);
+            }
+        }
+
+        /// The worker leaves: its blocks go with it.
+        pub fn remove(self, index: &KvIndex) {
+            index.remove_worker(self.worker, self.state.blocks);
         }
     }
 }

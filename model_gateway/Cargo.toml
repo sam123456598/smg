@@ -264,6 +264,11 @@ name = "policy_selection"
 harness = false
 path = "benches/policy_selection.rs"
 
+[[bench]]
+name = "kv_index_decision"
+harness = false
+path = "benches/kv_index_decision.rs"
+
 [lints]
 workspace = true
 

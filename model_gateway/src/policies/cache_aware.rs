@@ -1961,7 +1961,9 @@ impl CacheAwarePolicy {
             return Vec::new();
         }
 
+        let started = Instant::now();
         let overlap = indexer.find_matches(content_hashes, false);
+        Metrics::record_kv_index_lookup(indexer.name(), started.elapsed().as_secs_f64());
         if overlap.scores.is_empty() {
             return Vec::new();
         }

@@ -134,6 +134,31 @@ pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
     &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
+/// Histogram buckets for `smg_kv_index_lookup_seconds` and
+/// `smg_kv_event_apply_seconds`: a lookup takes microseconds and a batch
+/// apply tens of microseconds, below the request-latency buckets' first
+/// edge, so these double from half a microsecond to a quarter of a second.
+pub(crate) const KV_INDEX_MICRO_BUCKETS: &[f64] = &[
+    0.000_000_5,
+    0.000_001,
+    0.000_002,
+    0.000_004,
+    0.000_008,
+    0.000_016,
+    0.000_032,
+    0.000_064,
+    0.000_128,
+    0.000_256,
+    0.000_512,
+    0.001_024,
+    0.002_048,
+    0.004_096,
+    0.008_192,
+    0.016_384,
+    0.065_536,
+    0.262_144,
+];
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
 /// Call this before [`start_prometheus`] only from a binary or extension that
@@ -357,6 +382,19 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_kv_event_lag_seconds",
         "Age of a KV event batch when applied: now minus the publisher timestamp, by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_blocks_total",
+        "Blocks named by applied KV events, by worker and op (stored, removed)"
+    );
+    describe_histogram!(
+        "smg_kv_event_apply_seconds",
+        "Time to apply one KV event batch to the index, by worker"
+    );
+    describe_histogram!(
+        "smg_kv_index_lookup_seconds",
+        "Time of one KV index lookup (overlap scoring of a request's block hashes) \
+         in cache-aware routing, by index kind (positional, run)"
     );
     describe_gauge!(
         "smg_kv_event_degraded_ranks",
@@ -640,6 +678,11 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     // summary.
     let match_ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_ratio"));
 
+    // The KV index's lookup and apply times are microseconds: their own
+    // buckets, or the recorder renders them as summaries.
+    let kv_lookup_matcher = Matcher::Full(String::from("smg_kv_index_lookup_seconds"));
+    let kv_apply_matcher = Matcher::Full(String::from("smg_kv_event_apply_seconds"));
+
     PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
@@ -655,6 +698,10 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         .expect("failed to set event loop delay buckets")
         .set_buckets_for_metric(match_ratio_matcher, CACHE_AWARE_MATCH_RATIO_BUCKETS)
         .expect("failed to set cache-aware match ratio buckets")
+        .set_buckets_for_metric(kv_lookup_matcher, KV_INDEX_MICRO_BUCKETS)
+        .expect("failed to set KV index lookup buckets")
+        .set_buckets_for_metric(kv_apply_matcher, KV_INDEX_MICRO_BUCKETS)
+        .expect("failed to set KV event apply buckets")
         .install_recorder()
         .inspect(|_| {
             #[cfg(all(
@@ -1631,6 +1678,30 @@ impl Metrics {
     pub fn record_kv_event_lag(worker_url: &str, seconds: f64) {
         histogram!("smg_kv_event_lag_seconds", "worker" => intern_string(worker_url))
             .record(seconds);
+    }
+
+    /// Count the blocks an applied batch's events named (`stored` or
+    /// `removed`), before the monitor's tier and group filters: the rate the
+    /// index is offered.
+    pub fn record_kv_event_blocks(worker_url: &str, op: &'static str, blocks: usize) {
+        counter!(
+            "smg_kv_event_blocks_total",
+            "worker" => intern_string(worker_url),
+            "op" => op
+        )
+        .increment(blocks as u64);
+    }
+
+    /// Time to apply one batch to the index.
+    pub fn record_kv_event_apply(worker_url: &str, seconds: f64) {
+        histogram!("smg_kv_event_apply_seconds", "worker" => intern_string(worker_url))
+            .record(seconds);
+    }
+
+    /// Time of one index lookup on the routing path, recorded after the
+    /// lookup returned and outside any lock.
+    pub fn record_kv_index_lookup(index: &'static str, seconds: f64) {
+        histogram!("smg_kv_index_lookup_seconds", "index" => index).record(seconds);
     }
 
     /// Ranks of this worker whose index may be stale.
