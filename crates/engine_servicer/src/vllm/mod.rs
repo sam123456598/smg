@@ -325,6 +325,7 @@ impl VllmServicerServer {
         );
         let connect_state = Arc::clone(&state);
         let stats_state = Arc::clone(&state);
+        let kv_relay = state.kv_relay.clone();
         let VllmServicerConfig {
             bind_address,
             ipc_base_url,
@@ -338,6 +339,12 @@ impl VllmServicerServer {
             "smg-vllm-servicer",
             &bind_address,
             move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
+                // The KV-event relay follows the publisher from the start,
+                // before any gateway asks, so its history and live-block
+                // record cover the engine's whole life.
+                if let Some(relay) = &kv_relay {
+                    relay.start_at_boot();
+                }
                 // Fire-and-forget on the server runtime: dropping the runtime
                 // with the server thread cancels a still-running connect.
                 #[expect(

@@ -257,9 +257,13 @@ failed round trip and exposes them as metrics.
 ### 5. Servicer-side changes that need no proto change
 
 - Done on the Rust relay: a non-zero cursor it cannot honour is `OUT_OF_RANGE`, and one
-  subscription per engine keeps a bounded history (the engines' `buffer_steps`, 10,000, within a
-  byte budget) that serves resumes before live events, and the live-block record that serves the
-  state snapshot. Its counters are logged with every gap, restart and refusal (the servicer has no
+  subscription per engine, taken when the servicer starts serving rather than at the first
+  `SubscribeKvEvents` (`SMG_KV_EVENT_RELAY_START=lazy` restores the latter for a memory-constrained
+  host; the record costs about 230 bytes per live block, 10 MB for an 8B worker's 42k-block pool,
+  next to the history's 256 MiB cap), keeps a bounded history (the engines' `buffer_steps`,
+  10,000, within a byte budget) that serves resumes before live events, and the live-block
+  record that serves the state snapshot, so a servicer that outlives a gateway outage or restarts
+  beside a warm engine knows the engine from its first batch. Its counters are logged with every gap, restart and refusal (the servicer has no
   metrics endpoint): `relayed`, `undecodable_batches`, `served_from_history`, `served_snapshots`,
   `out_of_range`, `publisher_gaps`, `gap_batches_recovered`, `gap_batches_lost`,
   `publisher_restarts`, `subscribers_lagged`; a served snapshot logs one info line with the cut,

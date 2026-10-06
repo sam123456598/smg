@@ -824,6 +824,81 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The relay follows the publisher from the servicer's start, before any
+/// gateway subscribes: batches published with nobody listening are in its
+/// history, and the first subscription gets them as the engine's whole state.
+#[tokio::test]
+async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
+    use zeromq::{prelude::*, PubSocket};
+
+    use crate::kv_events::golden;
+
+    let port = pick_unused_port().expect("a free publisher port");
+    let mut publisher = PubSocket::new();
+    publisher
+        .bind(&format!("tcp://127.0.0.1:{port}"))
+        .await
+        .expect("publisher binds");
+    let mut model = model_info();
+    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_topic = "kv".to_string();
+    let mut h = harness(model, None).await;
+    let relay = h
+        .server
+        .state
+        .kv_relay
+        .clone()
+        .expect("a relay for the publisher");
+    // The SUB connect is asynchronous: publish sequence 0 until the relay,
+    // with no subscriber of its own yet, has taken it (repeats are duplicates).
+    let batch1 = golden::bytes(golden::BATCH1);
+    for _ in 0..250 {
+        publisher
+            .send(golden::frame(b"kv", 0, &batch1))
+            .await
+            .expect("publish");
+        if relay.counts().relayed >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        relay.counts().relayed,
+        1,
+        "the relay took sequence 0 before any gateway subscribed"
+    );
+    publisher
+        .send(golden::frame(b"kv", 1, &golden::bytes(golden::BATCH2)))
+        .await
+        .expect("publish");
+    for _ in 0..250 {
+        if relay.counts().relayed >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(relay.counts().relayed, 2);
+
+    // The first gateway gets both from the history: the engine's whole state.
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect("subscribe")
+        .into_inner();
+    for expected in [0, 1] {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a batch in time")
+            .expect("stream open")
+            .expect("a batch");
+        assert_eq!(batch.sequence_number, expected);
+    }
+    assert_eq!(relay.counts().served_from_history, 1);
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A scheduler that never dials in fails the link at the configured bound (not
 /// a fixed one: a cold kernel cache makes a real start exceed ten minutes), the
 /// server stays up to report it, and `stop` releases the handshake port.

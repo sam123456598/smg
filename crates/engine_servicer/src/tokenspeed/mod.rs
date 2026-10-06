@@ -237,6 +237,7 @@ impl TokenSpeedServicerServer {
             Arc::new(move || health_state.is_serving()),
         );
         let connect_state = Arc::clone(&state);
+        let kv_relay = state.kv_relay.clone();
         let TokenSpeedServicerConfig {
             bind_address,
             ipc_base_url,
@@ -250,6 +251,12 @@ impl TokenSpeedServicerServer {
             "smg-tokenspeed-servicer",
             &bind_address,
             move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
+                // The KV-event relay follows the publisher from the start,
+                // before any gateway asks, so its history and live-block
+                // record cover the engine's whole life.
+                if let Some(relay) = &kv_relay {
+                    relay.start_at_boot();
+                }
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "engine connect is fire-and-forget; the runtime drop cancels it"

@@ -2,7 +2,12 @@
 //! gRPC streams through one [`KvEventRelay`] per engine.
 //!
 //! The relay subscribes to the publisher once, for the servicer's lifetime,
-//! keeps what it relays in a bounded [`History`] (the last
+//! when the servicer starts serving (so it sees the engine from its first
+//! batch, and a servicer that outlives a gateway outage or restarts beside a
+//! warm engine is not blind until eviction; `SMG_KV_EVENT_RELAY_START=lazy`
+//! defers the subscription to the first `SubscribeKvEvents` for a
+//! memory-constrained host), keeps what it relays in a bounded [`History`]
+//! (the last
 //! `SMG_KV_EVENT_HISTORY_BATCHES` batches, 10,000 by default like the
 //! engines' own `buffer_steps`, within `SMG_KV_EVENT_HISTORY_BYTES`, 256 MiB
 //! by default) and folds every batch into a record of the engine's live
@@ -96,6 +101,9 @@ pub(crate) const TOKENSPEED_DISABLED_MESSAGE: &str = "KV cache events not enable
      TokenSpeed with --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \
      \"zmq\"}'";
 
+/// When the relay subscribes to the publisher: at the servicer's start
+/// (default, any other value) or `lazy`, at the first `SubscribeKvEvents`.
+pub const RELAY_START_ENV: &str = "SMG_KV_EVENT_RELAY_START";
 /// How many relayed batches the history keeps (the engines' `buffer_steps`).
 pub const HISTORY_BATCHES_ENV: &str = "SMG_KV_EVENT_HISTORY_BATCHES";
 /// The history's byte budget over the encoded batches.
@@ -142,6 +150,11 @@ impl RelayConfig {
             replay_timeout: DEFAULT_REPLAY_TIMEOUT,
         }
     }
+}
+
+/// Whether [`RELAY_START_ENV`] set to `value` keeps the start at boot.
+fn starts_at_boot(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| value.trim().eq_ignore_ascii_case("lazy"))
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -399,7 +412,21 @@ impl KvEventRelay {
         }
     }
 
-    /// Subscribe to the publisher if not yet subscribed. Called by
+    /// [`Self::start`] when the servicer begins serving, unless
+    /// [`RELAY_START_ENV`] is `lazy`; needs a Tokio runtime.
+    pub fn start_at_boot(&self) {
+        if starts_at_boot(std::env::var(RELAY_START_ENV).ok().as_deref()) {
+            self.start();
+        } else {
+            info!(
+                endpoint = %self.config.endpoint,
+                "{RELAY_START_ENV}=lazy: the KV event relay subscribes at the first SubscribeKvEvents"
+            );
+        }
+    }
+
+    /// Subscribe to the publisher if not yet subscribed. Called at the
+    /// servicer's start ([`Self::start_at_boot`]) and by
     /// [`Self::subscribe`]; needs a Tokio runtime.
     pub fn start(&self) {
         let mut task = self.task.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1062,6 +1089,15 @@ mod tests {
             cache_level: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_relay_starts_at_boot_unless_told_to_wait() {
+        assert!(starts_at_boot(None));
+        assert!(starts_at_boot(Some("")));
+        assert!(starts_at_boot(Some("eager")));
+        assert!(!starts_at_boot(Some("lazy")));
+        assert!(!starts_at_boot(Some(" Lazy ")));
     }
 
     #[test]
