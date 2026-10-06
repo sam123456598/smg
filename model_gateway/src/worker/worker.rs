@@ -1366,7 +1366,7 @@ pub struct WorkerRuntime {
 /// Prefill rate assumed for a worker that has not shown one yet: slow enough
 /// that a cold engine handed a burst of long prompts is not called wedged
 /// before it can have answered (10k tokens/s is a small model on a modest
-/// GPU; a GB300 prefills 8B weights at ~90k).
+/// GPU; a current datacenter GPU prefills 8B weights at ~90k).
 const COLD_PREFILL_TOKENS_PER_SEC: u64 = 10_000;
 
 /// First tokens are summed over windows at least this long before they make

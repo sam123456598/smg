@@ -1793,7 +1793,7 @@ impl CacheAwarePolicy {
     /// The warm-up slice: one cache miss in `1 / share` goes to the
     /// least-loaded warming worker, so a returned, new or emptied worker
     /// builds a cache instead of idling behind the fleet's affinity (on the
-    /// GB300 fleet a restarted worker went a minute without a request; in the
+    /// real fleet a restarted worker went a minute without a request; in the
     /// soaks a worker whose index a publisher-restart resync had emptied never
     /// saw a request again, every prompt holding an overlap elsewhere). The
     /// candidates are the pool table's, chosen at its build (refreshed every
