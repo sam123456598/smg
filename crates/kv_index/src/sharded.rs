@@ -253,6 +253,25 @@ impl ShardedRunIndex {
         walked
     }
 
+    /// The lookup over one shard alone, for a caller that fans a lookup out to one thread per
+    /// shard (one per socket) and merges: the call walks only that shard's memory, and `report`
+    /// receives `(worker, score)` with the worker's global id, exactly the pairs
+    /// [`score_into`](Self::score_into) would report for the shard. Worker sets are disjoint
+    /// across shards, so the concatenation of every shard's reports is `score_into`'s answer.
+    /// Returns the runs walked on the shard.
+    pub fn score_shard_into<T>(
+        &self,
+        shard: usize,
+        content_hashes: &[T],
+        hash_of: impl Fn(&T) -> u64,
+        early_exit: bool,
+        mut report: impl FnMut(u32, u32),
+    ) -> usize {
+        self.shards[shard].score_into(content_hashes, hash_of, early_exit, |worker, score| {
+            report(Self::global(shard, worker), score);
+        })
+    }
+
     /// How many shards hold a chain starting with `first` (a diagnostic for the lookup's shard
     /// filter: a shard without the head costs one root probe, a shard with it a walk).
     pub fn shards_holding_head(&self, first: u64) -> usize {
@@ -514,6 +533,56 @@ mod tests {
 
     /// A caller that interns into shards of its own choosing, including the same name from
     /// two places, gets one id per name and the shard it asked for first.
+    /// A lookup fanned out one shard at a time reports, over the shards, exactly what the union
+    /// lookup reports, and a shard reports only the workers it holds.
+    #[test]
+    fn a_lookup_fanned_out_per_shard_is_the_union_lookup() {
+        let index = ShardedRunIndex::new(2, 8);
+        let contents: Vec<ContentHash> = (0..40).map(|p| content(7, p)).collect();
+        let mut workers = Vec::new();
+        for (shard, name, len) in [(0, "a", 40), (1, "b", 25), (0, "c", 10), (1, "d", 40)] {
+            let worker = index.intern_worker_in(shard, name).expect("id");
+            let mut map = RunBlockMap::default();
+            index
+                .apply_stored(worker, &blocks_of(&contents[..len]), None, &mut map)
+                .expect("store");
+            workers.push(worker);
+        }
+        let query = &contents[..32];
+        let mut fanned: Vec<(u32, u32)> = Vec::new();
+        for shard in 0..2 {
+            index.score_shard_into(
+                shard,
+                query,
+                |c| c.0,
+                false,
+                |worker, score| {
+                    fanned.push((worker, score));
+                },
+            );
+        }
+        fanned.sort_unstable();
+        assert_eq!(fanned, sorted(index.find_matches(query, false)));
+        let mut expected = vec![
+            (workers[0], 32),
+            (workers[1], 25),
+            (workers[2], 10),
+            (workers[3], 32),
+        ];
+        expected.sort_unstable();
+        assert_eq!(fanned, expected);
+        let mut from_shard_1 = Vec::new();
+        index.score_shard_into(
+            1,
+            query,
+            |c| c.0,
+            false,
+            |worker, _| from_shard_1.push(worker),
+        );
+        from_shard_1.sort_unstable();
+        assert_eq!(from_shard_1, vec![workers[1], workers[3]]);
+    }
+
     #[test]
     fn interning_is_idempotent_across_shards() {
         let index = ShardedRunIndex::new(3, 4);

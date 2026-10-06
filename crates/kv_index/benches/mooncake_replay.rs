@@ -80,6 +80,14 @@ impl Totals {
     fn block_ops(&self) -> u64 {
         self.request_blocks + self.stored_blocks + self.removed_blocks
     }
+    /// The block ops the dispatch schedules: all of them, or the events' alone under
+    /// `--queries off`.
+    fn scheduled_block_ops(&self, queries: Queries) -> u64 {
+        match queries {
+            Queries::On => self.block_ops(),
+            Queries::Off => self.stored_blocks + self.removed_blocks,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -355,6 +363,21 @@ trait ReplayBackend: Send + Sync + 'static {
     fn apply_cleared(&self, lane: &mut Self::Lane, worker: (u64, u32)) -> bool;
     /// Answer one lookup; the return value is only consumed by `black_box`.
     fn lookup(&self, hashes: &[ContentHash]) -> usize;
+    /// Shards a lookup can be fanned out over under `--lookups per-shard`; one when the backend
+    /// has no shards (the fan-out then is `all-shards`).
+    fn lookup_shards(&self) -> usize {
+        1
+    }
+    /// The CPUs of the event lanes placed on `shard`, when the backend places lanes by shard;
+    /// the query lanes of that shard float over them.
+    fn shard_cpus(&self, _shard: usize) -> Option<Vec<usize>> {
+        None
+    }
+    /// Answer one lookup over `shard` alone, appending its `(worker, score)` pairs to `out`:
+    /// the per-shard half of a fanned-out lookup. A backend with one shard never sees it.
+    fn lookup_shard(&self, _shard: usize, hashes: &[ContentHash], _out: &mut Vec<(u32, u32)>) {
+        black_box(self.lookup(hashes));
+    }
 }
 
 /// One stored block as Dynamo's lanes receive it: two hashes and an always-empty multimodal slot.
@@ -578,6 +601,31 @@ impl ReplayBackend for Run {
             .score_into(hashes, |content| content.0, false, |_, _| scored += 1);
         scored
     }
+
+    fn lookup_shards(&self) -> usize {
+        self.inner.shards()
+    }
+
+    fn shard_cpus(&self, shard: usize) -> Option<Vec<usize>> {
+        let mut cpus: Vec<usize> = self
+            .shard_of_cpu
+            .iter()
+            .filter(|(_, &s)| s == shard)
+            .map(|(&cpu, _)| cpu)
+            .collect();
+        cpus.sort_unstable();
+        (!cpus.is_empty()).then_some(cpus)
+    }
+
+    fn lookup_shard(&self, shard: usize, hashes: &[ContentHash], out: &mut Vec<(u32, u32)>) {
+        self.inner.score_shard_into(
+            shard,
+            hashes,
+            |content| content.0,
+            false,
+            |worker, score| out.push((worker, score)),
+        );
+    }
 }
 
 struct Reference {
@@ -741,6 +789,64 @@ struct QueryCompletion {
     finished_ns: u64,
 }
 
+/// The hand-over point of one fanned-out lookup (`--lookups per-shard`): the member lanes of a
+/// lookup group share one slot per published position, since every member receives the same
+/// ids in the same order. A lane that finishes before the others leaves its partial answer and
+/// its start time here; the last one merges and records the completion.
+#[derive(Default)]
+struct FanSlot {
+    parked: Mutex<Option<FanPartial>>,
+}
+
+struct FanPartial {
+    /// The earliest start among the lanes finished so far.
+    started_ns: u64,
+    /// Their partial answers, concatenated (worker sets are disjoint across shards).
+    scores: Vec<(u32, u32)>,
+    /// How many lanes have finished.
+    finished: usize,
+}
+
+/// What a query lane walks: every shard, or its own shard of a fanned-out lookup.
+enum LaneLookup {
+    AllShards,
+    Shard {
+        shard: usize,
+        fan: usize,
+        slots: Arc<[FanSlot]>,
+    },
+}
+
+/// Per-lane counters of the fan-out, summed per shard at the end (nothing shared on the lookup
+/// path).
+#[derive(Clone, Copy, Debug, Default)]
+struct FanStats {
+    /// Lookups this lane walked its shard for.
+    lookups: u64,
+    /// Of those, lookups whose shard held something of the request.
+    with_holders: u64,
+    /// Holders this lane's shard reported, summed over its lookups.
+    holders: u64,
+    /// Lookups this lane completed: it finished last and merged.
+    merged: u64,
+}
+
+impl FanStats {
+    fn add(&mut self, other: &FanStats) {
+        self.lookups += other.lookups;
+        self.with_holders += other.with_holders;
+        self.holders += other.holders;
+        self.merged += other.merged;
+    }
+}
+
+struct QueryLaneOutput {
+    completions: Vec<QueryCompletion>,
+    failure: Option<&'static str>,
+    cpu_ns: u64,
+    fan: FanStats,
+}
+
 fn query_lane_worker<B: ReplayBackend>(
     backend: Arc<B>,
     lane: Arc<QueryLane>,
@@ -748,13 +854,16 @@ fn query_lane_worker<B: ReplayBackend>(
     epoch: Instant,
     cpus: Arc<[usize]>,
     mirror: bool,
-) -> (Vec<QueryCompletion>, Option<&'static str>, u64) {
+    lookup: LaneLookup,
+) -> QueryLaneOutput {
     let _ = pin_current_thread(&cpus);
     let cpu_started = thread_cpu_time_ns();
     *lane.consumer.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread::current());
     let mut completions = Vec::with_capacity(lane.slots.len());
     let mut consumed = 0usize;
     let mut failure = None;
+    let mut partial: Vec<(u32, u32)> = Vec::new();
+    let mut stats = FanStats::default();
     loop {
         let published = lane.published.load(Ordering::Acquire);
         while consumed < published {
@@ -769,19 +878,72 @@ fn query_lane_worker<B: ReplayBackend>(
             };
             let hashes = &corpus.hashes[start as usize..start as usize + len as usize];
             let started_ns = elapsed_ns(epoch);
-            if mirror {
-                // The adapter's copy into this crate's hash type, inside the timed lookup.
-                let owned: Vec<ContentHash> = hashes.to_vec();
-                black_box(backend.lookup(&owned));
-            } else {
-                black_box(backend.lookup(hashes));
+            match &lookup {
+                LaneLookup::AllShards => {
+                    if mirror {
+                        // The adapter's copy into this crate's hash type, inside the timed lookup.
+                        let owned: Vec<ContentHash> = hashes.to_vec();
+                        black_box(backend.lookup(&owned));
+                    } else {
+                        black_box(backend.lookup(hashes));
+                    }
+                    let finished_ns = elapsed_ns(epoch);
+                    completions.push(QueryCompletion {
+                        id,
+                        started_ns,
+                        finished_ns,
+                    });
+                }
+                LaneLookup::Shard { shard, fan, slots } => {
+                    partial.clear();
+                    if mirror {
+                        let owned: Vec<ContentHash> = hashes.to_vec();
+                        backend.lookup_shard(*shard, &owned, &mut partial);
+                    } else {
+                        backend.lookup_shard(*shard, hashes, &mut partial);
+                    }
+                    stats.lookups += 1;
+                    stats.with_holders += u64::from(!partial.is_empty());
+                    stats.holders += partial.len() as u64;
+                    let Some(slot) = slots.get(consumed) else {
+                        failure = Some("query_lane_fan_slot_overflow");
+                        break;
+                    };
+                    let mut parked = slot.parked.lock().unwrap_or_else(|e| e.into_inner());
+                    match parked.as_mut() {
+                        Some(earlier) if earlier.finished + 1 == *fan => {
+                            // Last to finish: merge the answers and complete the lookup.
+                            let mut merged = std::mem::take(&mut earlier.scores);
+                            let started_ns = started_ns.min(earlier.started_ns);
+                            *parked = None;
+                            drop(parked);
+                            merged.extend_from_slice(&partial);
+                            black_box(&merged);
+                            let finished_ns = elapsed_ns(epoch);
+                            completions.push(QueryCompletion {
+                                id,
+                                started_ns,
+                                finished_ns,
+                            });
+                            stats.merged += 1;
+                        }
+                        Some(earlier) => {
+                            earlier.finished += 1;
+                            earlier.started_ns = earlier.started_ns.min(started_ns);
+                            earlier.scores.extend_from_slice(&partial);
+                        }
+                        None => {
+                            // First to finish: hand the partial answer over (one small vector
+                            // allocated on this lane's socket, freed by the merging lane).
+                            *parked = Some(FanPartial {
+                                started_ns,
+                                scores: partial.clone(),
+                                finished: 1,
+                            });
+                        }
+                    }
+                }
             }
-            let finished_ns = elapsed_ns(epoch);
-            completions.push(QueryCompletion {
-                id,
-                started_ns,
-                finished_ns,
-            });
             consumed += 1;
         }
         if failure.is_some() {
@@ -797,11 +959,12 @@ fn query_lane_worker<B: ReplayBackend>(
             thread::park();
         }
     }
-    (
+    QueryLaneOutput {
         completions,
         failure,
-        thread_cpu_time_ns().saturating_sub(cpu_started),
-    )
+        cpu_ns: thread_cpu_time_ns().saturating_sub(cpu_started),
+        fan: stats,
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1093,8 +1256,9 @@ struct Shared {
 fn issue_queries(
     shared: &Shared,
     corpus: &Corpus,
-    dispatch: &[(u32, u32, u16)], // (id, deadline_group, lane)
+    dispatch: &[(u32, u32, u16)], // (id, deadline_group, lookup group)
     lanes: &[Arc<QueryLane>],
+    fan: usize, // lanes per lookup group: the lookup's shards under `--lookups per-shard`
     records: &mut Vec<(u32, IssueRecord)>,
 ) -> (u64, Option<&'static str>) {
     let cpu_started = thread_cpu_time_ns();
@@ -1113,17 +1277,22 @@ fn issue_queries(
         touched.clear();
         let group_start = i;
         while i < dispatch.len() && corpus.ops[dispatch[i].0 as usize].deadline_ns == deadline_ns {
-            let (id, _, lane) = dispatch[i];
-            let lane = lane as usize;
-            let Some(slot) = lanes[lane].slots.get(cursors[lane]) else {
-                failure = Some("issuer_query_lane_overflow");
+            let (id, _, target) = dispatch[i];
+            let first_lane = target as usize * fan;
+            for lane in first_lane..first_lane + fan {
+                let Some(slot) = lanes[lane].slots.get(cursors[lane]) else {
+                    failure = Some("issuer_query_lane_overflow");
+                    break;
+                };
+                slot.store(id, Ordering::Relaxed);
+                cursors[lane] += 1;
+                if !touched_flags[lane] {
+                    touched_flags[lane] = true;
+                    touched.push(lane);
+                }
+            }
+            if failure.is_some() {
                 break;
-            };
-            slot.store(id, Ordering::Relaxed);
-            cursors[lane] += 1;
-            if !touched_flags[lane] {
-                touched_flags[lane] = true;
-                touched.push(lane);
             }
             records.push((
                 id,
@@ -1235,6 +1404,32 @@ enum LaneMemory {
     Local,
 }
 
+/// Whether the corpus's lookups are issued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Queries {
+    /// Queries and events, the corpus as recorded.
+    On,
+    /// Events only: queries are dropped at dispatch, the deadline schedule is kept and the query
+    /// lanes stay idle; offered, issued and achieved rates and the kept-up verdict count event
+    /// block ops alone, so the row is a lane-cost discriminator and not comparable with mixed
+    /// rows (the JSON says `"queries": "off"` and `total_requests` is 0).
+    Off,
+}
+
+/// How a lookup is spread over the index's shards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Lookups {
+    /// One query lane walks every shard (the lane floats over all lane cores).
+    AllShards,
+    /// A lookup fans out to one query lane per shard, each floating over its shard's cores and
+    /// walking only its shard; the lane finishing last merges the partial answers. Worker sets
+    /// are disjoint across shards, so the merge is a concatenation and the answer is
+    /// `all-shards`'s. The remote half of a lookup becomes one hand-over of a small vector
+    /// instead of remote reads of the lines the local event lanes write. One shard: as
+    /// `all-shards`.
+    PerShard,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BackendKind {
     /// This crate's event-driven PositionalIndexer.
@@ -1274,6 +1469,14 @@ struct Args {
     /// counter on the lookup path; not for timing rows).
     #[arg(long)]
     count_shard_heads: bool,
+    /// Issue the corpus's lookups (`on`) or events only (`off`, a lane-cost discriminator whose
+    /// rates count event block ops alone).
+    #[arg(long, value_enum, default_value = "on")]
+    queries: Queries,
+    /// Spread each lookup over the shards: `all-shards` (one lane walks every shard) or
+    /// `per-shard` (one lane per shard on the shard's cores, merged by the last to finish).
+    #[arg(long, value_enum, default_value = "all-shards")]
+    lookups: Lookups,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
     /// reference window when they differ.
     #[arg(long, conflicts_with = "offered_block_ops_per_sec")]
@@ -1337,7 +1540,7 @@ fn main() -> anyhow::Result<()> {
         (Some(ms), _) => ms * 1_000_000,
         (None, Some(rate)) => {
             anyhow::ensure!(rate > 0.0, "--offered-block-ops-per-sec must be positive");
-            (corpus.totals.block_ops() as f64 / rate * 1e9).round() as u64
+            (corpus.totals.scheduled_block_ops(args.queries) as f64 / rate * 1e9).round() as u64
         }
         (None, None) => corpus.reference_window_ns,
     };
@@ -1477,7 +1680,7 @@ fn run<B: ReplayBackend>(
     }
     // The layout, first line of every run log, so the provenance shows it at a glance.
     println!(
-        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores), shards {}, lane memory {:?}, event lanes {}",
+        "layout: event issuers {} on {:?}, query issuers {} on {:?}, lanes {} event + {} query on {:?} ({} cores), shards {}, lane memory {:?}, event lanes {}, queries {:?}, lookups {:?}",
         issuer_threads,
         issuer_cpus,
         query_issuers,
@@ -1489,6 +1692,8 @@ fn run<B: ReplayBackend>(
         args.shards.max(1),
         args.lane_memory,
         if args.pin_event_lanes { "pinned one per core" } else { "floating" },
+        args.queries,
+        args.lookups,
     );
     if window_ns != corpus.reference_window_ns {
         let reference = corpus.reference_window_ns.max(1) as u128;
@@ -1498,6 +1703,18 @@ fn run<B: ReplayBackend>(
     }
     // Lane assignment and deadline groups, as Dynamo's prepare_open_loop_trial.
     let mirror = args.mirror_dynamo_costs;
+    // Lanes per lookup: one, or one per shard under `--lookups per-shard` (query lane
+    // `group * fan + shard` walks `shard` for lookup group `group`).
+    let fan = match args.lookups {
+        Lookups::AllShards => 1,
+        Lookups::PerShard => backend.lookup_shards().max(1),
+    };
+    anyhow::ensure!(
+        args.query_lanes.is_multiple_of(fan),
+        "--query-lanes {} is not a multiple of the {fan} shards a per-shard lookup fans out to",
+        args.query_lanes
+    );
+    let lookup_groups = args.query_lanes / fan;
     let mut lane_capacities = vec![0usize; args.query_lanes];
     let mut deadline_query_counts: Vec<u32> = Vec::new();
     let mut previous_deadline = None;
@@ -1513,13 +1730,18 @@ fn run<B: ReplayBackend>(
         }
         let group = (deadline_query_counts.len() - 1) as u32;
         if op.is_query() {
-            let lane = (op.worker as usize) % args.query_lanes;
-            lane_capacities[lane] += 1;
+            if args.queries == Queries::Off {
+                continue;
+            }
+            let target = (op.worker as usize) % lookup_groups;
+            for member in 0..fan {
+                lane_capacities[target * fan + member] += 1;
+            }
             deadline_query_counts[group as usize] += 1;
-            query_dispatch[lane * query_issuers / args.query_lanes].push((
+            query_dispatch[target * query_issuers / lookup_groups].push((
                 op.id,
                 group,
-                lane as u16,
+                target as u16,
             ));
         } else {
             let next = event_lane_of.len();
@@ -1597,7 +1819,11 @@ fn run<B: ReplayBackend>(
         .ops
         .iter()
         .filter(|op| op.is_query())
-        .take(WARMUP_QUERIES)
+        .take(if args.queries == Queries::On {
+            WARMUP_QUERIES
+        } else {
+            0
+        })
     {
         if let OpKind::Query { start, len } = op.kind {
             black_box(
@@ -1611,16 +1837,40 @@ fn run<B: ReplayBackend>(
         .iter()
         .map(|&capacity| Arc::new(QueryLane::new(capacity)))
         .collect();
+    // Under `--lookups per-shard`, the hand-over slots of every lookup group, one per published
+    // position (every member lane of a group receives the same ids in the same order).
+    let fan_slots: Vec<Arc<[FanSlot]>> = (0..lookup_groups)
+        .map(|group| {
+            let slots = if fan > 1 {
+                lane_capacities[group * fan]
+            } else {
+                0
+            };
+            (0..slots)
+                .map(|_| FanSlot::default())
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .collect();
     let mut query_threads = Vec::with_capacity(lanes.len());
-    for lane in &lanes {
-        let (backend, lane, corpus, cpus) = (
-            Arc::clone(&backend),
-            Arc::clone(lane),
-            Arc::clone(&corpus),
-            Arc::clone(&backend_cpus),
-        );
+    for (index, lane) in lanes.iter().enumerate() {
+        let (backend, lane, corpus) = (Arc::clone(&backend), Arc::clone(lane), Arc::clone(&corpus));
+        let (lookup, cpus) = if fan > 1 {
+            let shard = index % fan;
+            let cpus: Arc<[usize]> = backend
+                .shard_cpus(shard)
+                .map_or_else(|| Arc::clone(&backend_cpus), Arc::from);
+            let lookup = LaneLookup::Shard {
+                shard,
+                fan,
+                slots: Arc::clone(&fan_slots[index / fan]),
+            };
+            (lookup, cpus)
+        } else {
+            (LaneLookup::AllShards, Arc::clone(&backend_cpus))
+        };
         query_threads.push(thread::spawn(move || {
-            query_lane_worker(backend, lane, corpus, epoch, cpus, mirror)
+            query_lane_worker(backend, lane, corpus, epoch, cpus, mirror, lookup)
         }));
     }
     // Wait until every query lane has registered its parker.
@@ -1679,7 +1929,14 @@ fn run<B: ReplayBackend>(
                 start_ref.wait();
                 let mut records = Vec::with_capacity(dispatch.len());
                 let (cpu_ns, f) = if failure.is_none() {
-                    issue_queries(shared_ref, corpus_ref, dispatch, lanes_ref, &mut records)
+                    issue_queries(
+                        shared_ref,
+                        corpus_ref,
+                        dispatch,
+                        lanes_ref,
+                        fan,
+                        &mut records,
+                    )
                 } else {
                     (0, None)
                 };
@@ -1726,13 +1983,15 @@ fn run<B: ReplayBackend>(
     let mut failure_reasons: Vec<String> = Vec::new();
     let mut query_results = Vec::with_capacity(lanes.len());
     let mut query_lane_cpu_ns = 0u64;
-    for handle in query_threads {
-        let (completions, failure, cpu_ns) = handle.join().expect("query lane panicked");
-        if let Some(failure) = failure {
+    let mut fan_stats = vec![FanStats::default(); fan];
+    for (index, handle) in query_threads.into_iter().enumerate() {
+        let output = handle.join().expect("query lane panicked");
+        if let Some(failure) = output.failure {
             failure_reasons.push(failure.to_string());
         }
-        query_lane_cpu_ns += cpu_ns;
-        query_results.push(completions);
+        query_lane_cpu_ns += output.cpu_ns;
+        fan_stats[index % fan].add(&output.fan);
+        query_results.push(output.completions);
     }
     let (event_results, event_lane_cpu_ns): (Vec<Vec<EventCompletion>>, Vec<u64>) = event_threads
         .into_iter()
@@ -1758,14 +2017,22 @@ fn run<B: ReplayBackend>(
     // Completions by id, with the order checks Dynamo makes.
     let mut query_done: Vec<Option<QueryCompletion>> = vec![None; n];
     for (lane_idx, completions) in query_results.iter().enumerate() {
+        let group = lane_idx / fan;
         let expected: Vec<u32> = query_dispatch
             .iter()
             .flatten()
-            .filter(|(_, _, lane)| *lane as usize == lane_idx)
+            .filter(|(_, _, target)| *target as usize == group)
             .map(|(id, _, _)| *id)
             .collect();
         let actual: Vec<u32> = completions.iter().map(|c| c.id).collect();
-        if expected != actual {
+        let in_order = if fan == 1 {
+            expected == actual
+        } else {
+            // A member lane completes the lookups it merged, in publish order: a subsequence.
+            let mut remaining = expected.iter();
+            actual.iter().all(|id| remaining.any(|e| e == id))
+        };
+        if !in_order {
             failure_reasons.push(format!("query_lane_order_{lane_idx}"));
         }
         for c in completions {
@@ -1821,7 +2088,10 @@ fn run<B: ReplayBackend>(
     let (mut queued_queries_at_stop, mut outstanding_updates_at_stop) = (0usize, 0usize);
     for (id, record) in records.iter().enumerate() {
         if !record.accepted {
-            unissued += 1;
+            // Under `--queries off` the lookups are left out of the dispatch on purpose.
+            if args.queries == Queries::On || !corpus.ops[id].is_query() {
+                unissued += 1;
+            }
             continue;
         }
         let lag = record.accepted_ns.saturating_sub(record.scheduled_ns);
@@ -1881,8 +2151,12 @@ fn run<B: ReplayBackend>(
     let drain_ns = end_ns.saturating_sub(producer_stop_ns);
     let elapsed = end_ns.saturating_sub(start_ns).max(1);
     let totals = corpus.totals;
-    let total_logical_ops = totals.requests + totals.events();
-    let total_block_ops = totals.block_ops();
+    let (issued_requests, issued_request_blocks) = match args.queries {
+        Queries::On => (totals.requests, totals.request_blocks),
+        Queries::Off => (0, 0),
+    };
+    let total_logical_ops = issued_requests + totals.events();
+    let total_block_ops = totals.scheduled_block_ops(args.queries);
     let offered_s = window_ns.max(1) as f64 / 1e9;
     let achieved_s = elapsed as f64 / 1e9;
     let issue_s = issue_span_ns.max(1) as f64 / 1e9;
@@ -1912,6 +2186,23 @@ fn run<B: ReplayBackend>(
         "mirror_dynamo_costs": args.mirror_dynamo_costs,
         "shards": args.shards.max(1),
         "lane_memory": format!("{:?}", args.lane_memory).to_lowercase(),
+        "queries": format!("{:?}", args.queries).to_lowercase(),
+        "lookups": match args.lookups {
+            Lookups::AllShards => "all-shards",
+            Lookups::PerShard => "per-shard",
+        },
+        "lookup_fanout": (fan > 1).then(|| json!({
+            "fan": fan,
+            "groups": lookup_groups,
+            "shards": fan_stats.iter().enumerate().map(|(shard, s)| json!({
+                "shard": shard,
+                "cpus": backend.shard_cpus(shard),
+                "lookups": s.lookups,
+                "with_holders": s.with_holders,
+                "holders": s.holders,
+                "merged": s.merged,
+            })).collect::<Vec<_>>(),
+        })),
         "backend_report": backend.report(),
         "provenance": {
             "argv": std::env::args().collect::<Vec<_>>(),
@@ -1943,12 +2234,12 @@ fn run<B: ReplayBackend>(
         "query_issuer_threads": query_issuers,
         "query_issuer_cpus": query_cpus,
         "backend_cpus": backend_cpus.to_vec(),
-        "total_requests": totals.requests,
+        "total_requests": issued_requests,
         "total_events": totals.events(),
         "total_stored_events": totals.stored_events,
         "total_removed_events": totals.removed_events,
         "total_cleared_events": totals.cleared_events,
-        "total_request_blocks": totals.request_blocks,
+        "total_request_blocks": issued_request_blocks,
         "total_stored_blocks": totals.stored_blocks,
         "total_removed_blocks": totals.removed_blocks,
         "total_logical_ops": total_logical_ops,
@@ -2002,6 +2293,19 @@ fn run<B: ReplayBackend>(
         result["query_scheduled_to_finished"]["p99_ns"].as_u64().unwrap_or(0) as f64 / 1e3,
         drain_ns as f64 / 1e6,
     );
+    if fan > 1 {
+        let shards: Vec<String> = fan_stats
+            .iter()
+            .enumerate()
+            .map(|(shard, s)| {
+                format!(
+                    "shard {shard}: lookups {} with holders {} holders {} merged {}",
+                    s.lookups, s.with_holders, s.holders, s.merged
+                )
+            })
+            .collect();
+        println!("lookups per shard (fan-out {fan}): {}", shards.join("; "));
+    }
     if !result["failure_reasons"]
         .as_array()
         .is_some_and(Vec::is_empty)
