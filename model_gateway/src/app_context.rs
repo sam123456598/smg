@@ -807,6 +807,7 @@ impl AppContextBuilder {
                 config.kv_indexer_ttl_secs.unwrap_or(0),
                 config.kv_indexer_max_entries.unwrap_or(0),
             );
+            monitor.start_stats_task();
 
             // Inject monitor into PolicyRegistry — propagates to default_policy
             // and any other existing cache-aware policies.

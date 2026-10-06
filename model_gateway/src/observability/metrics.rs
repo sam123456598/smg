@@ -405,6 +405,43 @@ pub(crate) fn init_metrics() {
         "Live KV event batches held while a snapshot resync is in flight, by worker"
     );
     describe_gauge!(
+        "smg_kv_index_memberships",
+        "Blocks the KV index holds across a model's workers (a block two workers hold \
+         counts twice), by model; published every 30 s"
+    );
+    describe_gauge!(
+        "smg_kv_index_entries",
+        "Distinct entries in the KV index, by model: (position, content hash) pairs in \
+         the positional indexer, distinct blocks on a chain in the run index"
+    );
+    describe_gauge!(
+        "smg_kv_index_runs_live",
+        "Runs linked in the run index, by model (blocks_live over runs_live is the \
+         mean run length; a falling ratio under steady traffic is fragmentation)"
+    );
+    describe_gauge!(
+        "smg_kv_index_blocks_live",
+        "Content hashes held by the run index's live runs, by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_arena_bytes",
+        "Bytes the run index's word arena has handed out (hash arrays, child tables, \
+         free lists included), by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_arena_free_bytes",
+        "Bytes of the run index's word arena sitting in free lists, by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_slab_bytes",
+        "Bytes the run index's run slab holds from the allocator, by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_moved_hashes",
+        "Stores that moved a held engine hash to another place in the run index \
+         (cumulative), by model"
+    );
+    describe_gauge!(
         "smg_kv_index_blocks",
         "Blocks the positional index holds for a worker, as the index counts them; \
          set when a KV event batch is applied, when the worker's state is reset \
@@ -1735,6 +1772,28 @@ impl Metrics {
     /// from the lookup path, so routing reads nothing that writes.
     pub fn set_kv_index_blocks(worker_url: &str, blocks: usize) {
         gauge!("smg_kv_index_blocks", "worker" => intern_string(worker_url)).set(blocks as f64);
+    }
+
+    /// Publish a model's KV index size: memberships across workers and
+    /// distinct entries. Called from the monitor's periodic stats task, never
+    /// from the lookup path.
+    pub fn set_kv_index_size(model_id: &str, memberships: usize, entries: usize) {
+        let model = intern_string(model_id);
+        gauge!("smg_kv_index_memberships", "model" => model.clone()).set(memberships as f64);
+        gauge!("smg_kv_index_entries", "model" => model).set(entries as f64);
+    }
+
+    /// Publish the run index's shape and memory for a model, from its own
+    /// counters: live runs and blocks, arena and slab bytes, moved hashes.
+    pub fn set_kv_index_run_stats(model_id: &str, stats: &kv_index::RunIndexStats) {
+        let model = intern_string(model_id);
+        gauge!("smg_kv_index_runs_live", "model" => model.clone()).set(stats.runs_live as f64);
+        gauge!("smg_kv_index_blocks_live", "model" => model.clone()).set(stats.blocks_live as f64);
+        gauge!("smg_kv_index_arena_bytes", "model" => model.clone()).set(stats.arena_bytes as f64);
+        gauge!("smg_kv_index_arena_free_bytes", "model" => model.clone())
+            .set(stats.arena_free_bytes as f64);
+        gauge!("smg_kv_index_slab_bytes", "model" => model.clone()).set(stats.slab_bytes as f64);
+        gauge!("smg_kv_index_moved_hashes", "model" => model).set(stats.moved_hashes as f64);
     }
 
     // ========================================================================

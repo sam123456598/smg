@@ -53,6 +53,10 @@ const DEFAULT_JUMP_SIZE: usize = 64;
 /// policies' default eviction cadence).
 const PRUNE_INTERVAL_SECS: u64 = 30;
 
+/// Interval between publications of each model's index size and, for the run
+/// index, its shape and memory (`smg_kv_index_*` gauges by model).
+const STATS_INTERVAL_SECS: u64 = 30;
+
 /// Initial reconnection delay after stream failure.
 const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 
@@ -118,6 +122,8 @@ pub struct KvEventMonitor {
     /// Set once by [`start_prune_task`](Self::start_prune_task); sync mutex
     /// because it is touched only at startup, never on event paths.
     prune_task: parking_lot::Mutex<Option<PeriodicTask>>,
+    /// Periodic index-shape publication, held like the prune task.
+    stats_task: parking_lot::Mutex<Option<PeriodicTask>>,
     /// Where the load records on the event streams go (`KvEventBatch.load`):
     /// the worker monitor, which treats them as polls. Weak: the monitors
     /// are peers in the app context, neither owns the other.
@@ -232,6 +238,7 @@ impl KvEventMonitor {
             kind,
             jump_size,
             prune_task: parking_lot::Mutex::new(None),
+            stats_task: parking_lot::Mutex::new(None),
             load_sink: OnceLock::new(),
         }
     }
@@ -275,6 +282,32 @@ impl KvEventMonitor {
                 );
             }
         }
+    }
+
+    /// Publish every model's index size, and the run index's shape and
+    /// memory, as gauges: what a soak reads to tell fragmentation or growth
+    /// from load. `current_size` and `entry_count` are counter reads; the run
+    /// index's `stats` walks its run headers, which is why this runs on a
+    /// 30 s cadence and never on a request.
+    fn publish_stats(indexers: &DashMap<String, Arc<KvIndex>>) {
+        for entry in indexers {
+            let index = entry.value();
+            Metrics::set_kv_index_size(entry.key(), index.current_size(), index.entry_count());
+            if let Some(stats) = index.run_stats() {
+                Metrics::set_kv_index_run_stats(entry.key(), &stats);
+            }
+        }
+    }
+
+    /// Start the periodic index-shape publication. Like the prune task, it
+    /// shares only the indexer map, never the monitor, and stops when the
+    /// monitor drops.
+    pub fn start_stats_task(&self) {
+        let indexers = Arc::clone(&self.indexers);
+        let task = PeriodicTask::spawn(STATS_INTERVAL_SECS, "KvIndexStats", move || {
+            Self::publish_stats(&indexers);
+        });
+        *self.stats_task.lock() = Some(task);
     }
 
     /// Start the periodic indexer prune. No-op when both bounds are 0/unset.
@@ -2079,6 +2112,75 @@ mod tests {
 
         monitor.start_prune_task(60, 0);
         assert!(monitor.prune_task.lock().is_some());
+    }
+
+    /// The index-shape gauges come from the indexes' own counters, by model:
+    /// memberships and entries for both kinds, the run index's runs, blocks,
+    /// arena and slab bytes and moved hashes for the run kind.
+    #[test]
+    fn index_shape_gauges_follow_the_indexes() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn gauge(handle: &PrometheusHandle, name: &str, model: &str) -> Option<f64> {
+            let prefix = format!("{name}{{model=\"{model}\"}}");
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let monitor = KvEventMonitor::new(None);
+            for (model, kind) in [("pos", KvIndexKind::Positional), ("run", KvIndexKind::Run)] {
+                let index = Arc::new(KvIndex::new(kind, 8));
+                let worker = index.intern_worker("grpc://w1:9000").unwrap();
+                let mut held = WorkerBlocks::default();
+                let blocks: Vec<StoredBlock> = (1..=3u64)
+                    .map(|i| StoredBlock {
+                        seq_hash: SequenceHash(i),
+                        content_hash: ContentHash(100 + i),
+                    })
+                    .collect();
+                index
+                    .apply_stored(worker, &blocks, None, &mut held)
+                    .unwrap();
+                monitor.indexers.insert(model.to_string(), index);
+            }
+            KvEventMonitor::publish_stats(&monitor.indexers);
+            for model in ["pos", "run"] {
+                assert_eq!(
+                    gauge(&handle, "smg_kv_index_memberships", model),
+                    Some(3.0),
+                    "{model}"
+                );
+                assert_eq!(
+                    gauge(&handle, "smg_kv_index_entries", model),
+                    Some(3.0),
+                    "{model}"
+                );
+            }
+            assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "run"), Some(1.0));
+            assert_eq!(gauge(&handle, "smg_kv_index_blocks_live", "run"), Some(3.0));
+            assert_eq!(
+                gauge(&handle, "smg_kv_index_moved_hashes", "run"),
+                Some(0.0)
+            );
+            assert!(gauge(&handle, "smg_kv_index_arena_bytes", "run").is_some_and(|b| b > 0.0));
+            assert!(gauge(&handle, "smg_kv_index_slab_bytes", "run").is_some_and(|b| b > 0.0));
+            assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "pos"), None);
+        });
+    }
+
+    #[test]
+    fn start_stats_task_holds_the_task() {
+        let monitor = KvEventMonitor::new(None);
+        assert!(monitor.stats_task.lock().is_none());
+        monitor.start_stats_task();
+        assert!(monitor.stats_task.lock().is_some());
     }
 
     // -----------------------------------------------------------------------
