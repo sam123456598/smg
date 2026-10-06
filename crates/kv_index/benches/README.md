@@ -525,6 +525,43 @@ rows that follow. The published rows keep `--interleave=all` because it is Dynam
 process bound to its socket is the deployment-realistic setting on one socket; both are reported
 and neither system was changed for either.
 
+#### Kept-up points and 20-trial series under local memory
+
+Same harness, layout and binaries, `numactl --cpunodebind=0 --membind=0` throughout (19:50-21:00,
+other users' jobs on the host costing discards: an editor server at up to 28 cores, a
+configuration agent, a package proxy). Brackets as in the threshold search above (3 fresh
+processes per point, all three at 99% with a valid generator, geometric bisection to within 10%,
+verified ends, generator-invalid points marked); series as in the publication protocol (20 usable
+trials with interleaved same-binary controls, one hold per series, discards at half a core).
+
+| Indexer, harness | Keeps up at | Per lane core (M) | Fails at | Ratio | Trials at the failing rate (achieved / offered) | Lookup p50 / p99 (us) at the kept-up rate | Points |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Dynamo CRTC, Dynamo harness | 859.7M (372 ms) | 14.6 | 923.9M | 1.075 | 98.9%, 98.4%, 98.6% (1,067M: 93.6-95.4%) | 2.7 / 10 | 4 |
+| SMG `RunIndex`, Dynamo harness | 1,383.8M (231 ms) | 23.5 | 1,509.0M | 1.091 | 97.9%, 99.3%, 99.1% (2,134M: generator invalid in all three) | 1.2-1.3 / 3-4 | 5 |
+
+| System, harness | Load | Used / discarded | Kept up | Achieved median [95% CI] (M block ops/s) | Per lane core (M) | Lookup p50 [CI] (us) | Lookup p99 [CI] (us) | Subject minus control: achieved, p50, p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SMG `RunIndex`, Dynamo harness | sustained bracket (231 ms window, 1,384M offered) | 22 / 3 | 21 of 22 | 1,379.4 [1,378.2, 1,379.8] | 23.4 | 1.3 [1.3, 1.3] | 3 [3, 4] | -0.2 [-1.6, +1.5], +0.0 [+0.0, +0.1], +0.0 [-0.0, +0.1] |
+| control (same binary) (SMG `RunIndex`) | same | 20 / 5 | 20 of 20 | 1,379.6 [1,378.1, 1,380.4] | | 1.2 [1.2, 1.3] | 3 [3, 4] | |
+| Dynamo CRTC, Dynamo harness | sustained bracket (372 ms window, 860M offered) | 20 / 4 | 19 of 20 | 856.7 [856.2, 856.8] | 14.5 | 2.7 [2.7, 2.7] | 10 [10, 10] | +0.3 [-0.4, +1.0], +0.0 [-0.0, +0.0], +0.0 [-0.1, +0.1] |
+| control (same binary) (Dynamo CRTC) | same | 21 / 3 | 19 of 21 | 856.3 [855.8, 856.7] | | 2.7 [2.7, 2.7] | 10 [10, 10] | |
+| SMG `RunIndex`, Dynamo harness | 200 ms window (1.60B offered) | 21 / 0 | 1 of 21 | 1,564.3 [1,536.4, 1,568.1] | 26.5 | 1.2 [1.2, 1.2] | 3 [3, 4] | +15.4 [-16.1, +37.3], -0.0 [-0.0, +0.0], -0.0 [-0.1, +0.1] |
+| control (same binary) (SMG `RunIndex`) | same | 20 / 1 | 0 of 20 | 1,548.9 [1,527.1, 1,566.1] | | 1.2 [1.2, 1.3] | 4 [3, 4] | |
+| Dynamo CRTC, Dynamo harness | 200 ms window (1.60B offered) | 20 / 7 | 0 of 20 | 1,120.2 [1,109.0, 1,126.0] | 19.0 | 2.1 [2.1, 2.1] | 8 [8, 8] | -5.0 [-20.2, +10.6], -0.0 [-0.0, +0.0], -0.1 [-0.2, +0.1] |
+| control (same binary) (Dynamo CRTC) | same | 21 / 6 | 0 of 21 | 1,125.2 [1,112.6, 1,134.1] | | 2.1 [2.1, 2.1] | 8 [8, 8] | |
+
+Under local memory on one socket, in one binary and on the same 59 lane cores, the run index's
+kept-up point is 1,383.8M against the competitor's 859.7M (1.61x; 23.5 against 14.6M block ops/s
+per lane core) at lookup p99 3-4 us against 10 us, and at the 200 ms window the run index achieves
+1,564M (26.5M per core, p99 3 us, 97.7% of offered) against the competitor's 1,120M (19.0M per
+core, p99 8 us, 70%). Against the published interleaved rows on this layout, local memory moves the
+competitor's kept-up point from 682M to 860M (+26%) and the run index's from 1,062M to 1,384M
+(at least +30%); the ratio between the two systems is 1.56x interleaved and 1.61x local. The
+control pairs stay within one unit in the last digit for the sustained rows and within the
+intervals for the 200 ms rows. Dynamo's published method is `--interleave=all`; on one socket a
+process bound to its socket is the deployment-realistic setting; both are reported and neither
+system was changed for either.
+
 ## Plugging in a new index
 
 `ReplayBackend` is four slice-based methods plus a per-lane state type. The run-compressed index
