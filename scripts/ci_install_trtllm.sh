@@ -96,6 +96,10 @@ $RETRY 3 10 pip install --no-cache-dir --pre \
 python3 -c "from cuda.bindings import runtime; runtime.cudaIpcMemHandle_t().reserved"
 echo "cuda-bindings IPC handle canary OK"
 
+# pip only warns on an unknown extra, so import what the engine imports at startup.
+python3 -c "from smg_grpc_proto.generated import trtllm_service_pb2, trtllm_service_pb2_grpc"
+echo "smg-grpc-proto canary OK"
+
 # typer >= 0.26 leaks click.exceptions.Exit through its main on CLI exit, so
 # every `hf` invocation (model downloads) exits 1 even on success. The
 # transformers pulled by tensorrt-llm has an unbounded typer dependency.
