@@ -13,7 +13,9 @@
     Uses the KV index's overlap scoring from KvEventMonitor. Routes based
     on actual backend KV cache state. Selects the worker with the highest
     overlap count; LeastLoad breaks equal-affinity ties atomically.
-    Falls back to LeastLoad when no cache overlap exists.
+    Falls back to LeastLoad when no cache overlap exists. Over a pool larger
+    than 32 workers the decision reads the holders of the request's blocks
+    and a sample of 16 others, not the pool (see `FLEET_SAMPLE`).
 
     2. Approximate Token Tree (gRPC, no KV events)
     -------------------------------------------
@@ -74,14 +76,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use kv_index::{
     compute_request_content_hashes, request_prefix_hashes, salt::request_content_hashes_with_seed,
-    ContentHash, TenantId, TokenTree, Tree,
+    ContentHash, OverlapScores, TenantId, TokenTree, Tree,
 };
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
-#[cfg(test)]
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
@@ -109,6 +111,25 @@ use crate::{
 /// slice: a chat template's head is this long, shared by every holder, and
 /// recomputing it costs less than keeping a returned worker idle.
 const WARMUP_MISS_BLOCKS: f64 = 4.0;
+
+/// How many eligible workers an event-driven decision reads beside the
+/// holders of the request's blocks once the pool is larger than twice this:
+/// they are the miss path's choices, the spill targets, the rows an
+/// all-workers selection policy ranks, and the sample the count-pressure
+/// gate's fleet mean is taken from. Sixteen choices balance as a full scan
+/// does (two already do, the power of d choices), and cost the same at 128
+/// workers as at 10,000. A pool of at most twice this many workers is read
+/// whole, so nothing changes for a small fleet.
+const FLEET_SAMPLE: usize = 16;
+
+/// How long a pool table serves before a decision rebuilds it: a worker the
+/// index interned after the build gains affinity within this, and a worker
+/// that entered the warm-up window is sliced to within this.
+const POOL_TABLE_REFRESH_MS: u64 = 1_000;
+
+/// Pool tables kept at once: one per routing pool the policy sees (a model's
+/// regular pool, the PD legs' pools); past this the oldest goes.
+const POOL_TABLES_KEPT: usize = 8;
 
 /// Cache-aware routing policy
 ///
@@ -150,6 +171,12 @@ pub struct CacheAwarePolicy {
     /// Misses seen by the warm-up slice; every `period`th goes to a warming
     /// worker (see [`liveness::Warmup`]).
     warmup_misses: AtomicU64,
+    /// Each routing pool's workers by KV index id and position, built once
+    /// per pool snapshot (see [`PoolTable`]).
+    pool_tables: ArcSwap<Vec<Arc<PoolTable>>>,
+    /// Set while one decision rebuilds a pool table so the others keep
+    /// serving the one they have.
+    pool_table_building: AtomicBool,
     /// Model-scoped hash indexes for resolving tenant delta hashes.
     /// Outer key is the normalized model_id; inner maps hold
     /// `hash → reconstructable prefix/tokens` per tree kind.
@@ -420,6 +447,8 @@ impl CacheAwarePolicy {
             kv_monitor: RwLock::new(None),
             load_rx: RwLock::new(None),
             warmup_misses: AtomicU64::new(0),
+            pool_tables: ArcSwap::from_pointee(Vec::new()),
+            pool_table_building: AtomicBool::new(false),
             hash_index,
             populate_hash_index: AtomicBool::new(false),
             mesh_tree_sync: RwLock::new(None),
@@ -590,9 +619,7 @@ impl CacheAwarePolicy {
         // Both defaults are 1.0, above the maximum clamped utilization and
         // spread. CacheAware now polls loads for LeastLoad even at defaults,
         // so return before touching the snapshot or scanning the fleet.
-        if self.config.balance_token_usage_threshold >= 1.0
-            && self.config.overload_token_usage_threshold >= 1.0
-        {
+        if !self.kv_pressure_gate_configured() {
             return false;
         }
 
@@ -1150,6 +1177,129 @@ struct OverlapCandidate {
     effective_score: f64,
 }
 
+/// One routing pool's workers by their KV index ids, built once per pool
+/// snapshot and refreshed every [`POOL_TABLE_REFRESH_MS`]. The registry hands
+/// the policy the same slice until membership changes, so an overlap lookup's
+/// `index id -> blocks` result maps to slice positions through this table
+/// instead of a string lookup per healthy worker per request, and the warm-up
+/// slice reads the workers inside its window from it instead of scanning the
+/// pool on every thin miss.
+#[derive(Debug)]
+struct PoolTable {
+    /// Address and length of the slice the table was built from.
+    slice: (usize, usize),
+    /// Gateway clock at the build, for the refresh.
+    built_ms: u64,
+    /// Address of the worker at each position at the build: a pool rebuilt
+    /// at the same address with other workers fails this check per holder.
+    worker_at: Vec<usize>,
+    /// The index id of the worker at each position; `None` while it is not
+    /// interned.
+    id_at: Vec<Option<u32>>,
+    /// Index id -> position.
+    position_of: HashMap<u32, u32>,
+    /// Positions of the workers inside the warm-up window at the build
+    /// (admitted within it, index still thin); empty when every worker was
+    /// (a young fleet slices nothing).
+    warming: Vec<u32>,
+}
+
+impl PoolTable {
+    fn slice_key(workers: &[Arc<dyn Worker>]) -> (usize, usize) {
+        (workers.as_ptr() as usize, workers.len())
+    }
+
+    fn worker_address(worker: &Arc<dyn Worker>) -> usize {
+        Arc::as_ptr(worker).cast::<()>() as usize
+    }
+
+    /// One pass over the pool: the string lookup per worker happens here,
+    /// once per snapshot and refresh, not per request.
+    fn build(workers: &[Arc<dyn Worker>], indexer: &KvIndex, now_ms: u64) -> Self {
+        let warmup = liveness::warmup();
+        let mut worker_at = Vec::with_capacity(workers.len());
+        let mut id_at = Vec::with_capacity(workers.len());
+        let mut position_of = HashMap::with_capacity(workers.len());
+        let mut warming = Vec::new();
+        for (position, worker) in workers.iter().enumerate() {
+            worker_at.push(Self::worker_address(worker));
+            let id = indexer.worker_id(worker.url());
+            id_at.push(id);
+            if let Some(id) = id {
+                position_of.insert(id, position as u32);
+            }
+            if warmup.share > 0.0 {
+                let age = worker.admitted_age();
+                if age < warmup.secs {
+                    let grown = id.map(|id| worker.warmup_growth(indexer.worker_block_count(id)));
+                    if warmup.applies(age, grown) {
+                        warming.push(position as u32);
+                    }
+                }
+            }
+        }
+        if warming.len() == workers.len() {
+            warming.clear();
+        }
+        Self {
+            slice: Self::slice_key(workers),
+            built_ms: now_ms,
+            worker_at,
+            id_at,
+            position_of,
+            warming,
+        }
+    }
+
+    /// Whether the table was built from `workers` (the same slice).
+    fn describes(&self, workers: &[Arc<dyn Worker>]) -> bool {
+        self.slice == Self::slice_key(workers)
+    }
+
+    /// Whether the table is within its refresh period.
+    fn fresh(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.built_ms) < POOL_TABLE_REFRESH_MS
+    }
+
+    /// The position holding index worker `id`, when the worker there is
+    /// still the one the table was built from.
+    fn position(&self, id: u32, workers: &[Arc<dyn Worker>]) -> Option<usize> {
+        let position = *self.position_of.get(&id)? as usize;
+        let same_worker = workers
+            .get(position)
+            .is_some_and(|worker| Self::worker_address(worker) == self.worker_at[position]);
+        same_worker.then_some(position)
+    }
+}
+
+/// What the sampled decision made of a request.
+enum Sampled {
+    /// The event-driven decision over the holders and a sample of the pool:
+    /// the selection, or `None` when it declined every candidate.
+    Decided(Option<usize>),
+    /// Not a request for the sampled decision: the pool is small, the request
+    /// carries no tokens or has no event index, the configuration wants the
+    /// KV-pressure gate (a reading of the whole fleet), or the sample held no
+    /// eligible worker. The scan decides.
+    Scan,
+}
+
+/// Which holders a decision gathers from the overlap scores. A shared chat
+/// template puts a shallow overlap on most of a fleet, so the scores name
+/// nearly every worker; the decision must not pay per named worker.
+#[derive(Clone, Copy)]
+enum Gather {
+    /// The eligible holders of the deepest overlap only: what the exact
+    /// maximum-group decision reads (the default policy at temperature zero,
+    /// no decay in effect, no accounting). A tie wider than `cap` (a fleet
+    /// sharing a chat template's head, a prompt reaching no further) is a
+    /// uniform draw of `cap` of them: the expected-wait selector breaks the
+    /// tie among those, as a miss is placed among a sample of the pool.
+    TopGroup { cap: Option<usize> },
+    /// Every eligible holder in slice order, the `cap` deepest when set.
+    All { cap: Option<usize> },
+}
+
 /// Pressure-tuning inputs for [`CacheAwarePolicy::overlap_candidates`]: the two
 /// config knobs plus the immutable load snapshot captured from the load
 /// receiver at selection time, from which each worker's waiting-prefill
@@ -1158,90 +1308,22 @@ struct OverlapCandidate {
 /// receiver is wired; workers absent from the snapshot are never decayed.
 struct OverlapTuning<'a> {
     overlap_decay: f32,
-    /// Read by the test-only reference selector (`affinity_score_group`);
-    /// production selection carries the temperature inside the policy.
-    #[cfg_attr(not(test), expect(dead_code, reason = "test-only reference selector"))]
+    /// Zero means the exact maximum-overlap group; the policy carries the
+    /// temperature for its draw, the host reads it to know which holders to
+    /// gather (see [`CacheAwarePolicy::exact_maximum_decision`]).
     selection_temperature: f32,
     waiting_prefill_tokens: Option<&'a LoadSnapshot>,
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let request_text = info.request_text;
-        let request_tokens = info.tokens;
-
-        // Single O(workers) gather: read each worker once via routing_state()
-        // (status + load + processed + overload veto under one ArcSwap guard),
-        // replacing the former separate passes whose per-worker guard traffic
-        // dominated routing CPU at scale. Collects eligible indices, the load
-        // sum (for the per-request pressure gate). Final selection and credit
-        // are delegated atomically to LeastLoad after affinity is resolved.
-        let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
-        let mut load_sum = 0usize;
-        for (idx, worker) in workers.iter().enumerate() {
-            let state = worker.routing_state();
-            // The overload veto costs nothing here: `state` is the word this
-            // pass already loaded for health, circuit breaker and load.
-            if state.eligible() {
-                healthy_indices.push(idx);
-                load_sum += state.load;
-            }
+        // The event-driven decision over a large pool reads the holders of
+        // the request's blocks and a bounded sample of the rest; every other
+        // path, and a pool the sample would cover anyway, reads the pool.
+        if let Sampled::Decided(selected) = self.select_worker_sampled(workers, info) {
+            return selected;
         }
-
-        if healthy_indices.is_empty() {
-            return None;
-        }
-        let avg_load = load_sum as f64 / healthy_indices.len() as f64;
-
-        // Determine the model for this set of workers (router pre-filters by model)
-        // All workers should be from the same model
-        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
-
-        // Hash mode: TTL'd exact-match placement index; the radix trees are
-        // neither consulted nor populated.
-        if self.config.cache_index == CacheIndexKind::Hash {
-            return self.select_worker_hash(workers, info, &healthy_indices, avg_load, model_id);
-        }
-
-        // Abandon cache affinity fleet-wide only under backend KV pressure;
-        // request-count pressure is applied per request to the selected
-        // candidate inside each affinity path.
-        if self.is_kv_imbalanced(workers, &healthy_indices) {
-            return self.select_worker_fallback(workers, info, &healthy_indices, model_id);
-        }
-
-        // Cache-aware routing when balanced — three types (mutually exclusive):
-        //   1. Event-driven: KV index overlap scoring (gRPC + KV events)
-        //   2. Approximate token tree: TokenTree prefix matching (gRPC, no events)
-        //   3. Approximate string tree: Tree prefix matching (HTTP)
-        if let Some(tokens) = request_tokens {
-            // Event-driven mode re-hashes engine-reported blocks from their
-            // token ids on both sides, so it keys a namespace through the
-            // hash seed rather than a marker (see cache_namespace.rs); the
-            // approximate and hash modes below key under the marker.
-            if let Some(index) = self.event_index_for(model_id) {
-                self.select_worker_event_driven(
-                    workers,
-                    tokens,
-                    &healthy_indices,
-                    avg_load,
-                    &index,
-                    info,
-                )
-            } else {
-                self.select_worker_with_tokens(
-                    workers,
-                    tokens,
-                    &healthy_indices,
-                    avg_load,
-                    model_id,
-                    info,
-                )
-            }
-        } else {
-            let text = request_text.unwrap_or("");
-            self.select_worker_with_text(workers, text, &healthy_indices, avg_load, model_id, info)
-        }
+        self.select_worker_scanned(workers, info)
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
@@ -1330,6 +1412,237 @@ struct EventIndex<'a> {
 
 // Private helper methods for select_worker
 impl CacheAwarePolicy {
+    /// The decision over the whole pool: one eligibility read per worker,
+    /// then the hash, tree or event-driven path. The sampled decision covers
+    /// the event-driven path over a large pool; this is everything else.
+    fn select_worker_scanned(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let request_text = info.request_text;
+        let request_tokens = info.tokens;
+
+        // Single O(workers) gather: read each worker once via routing_state()
+        // (status + load + processed + overload veto under one ArcSwap guard),
+        // replacing the former separate passes whose per-worker guard traffic
+        // dominated routing CPU at scale. Collects eligible indices, the load
+        // sum (for the per-request pressure gate). Final selection and credit
+        // are delegated atomically to LeastLoad after affinity is resolved.
+        let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
+        let mut load_sum = 0usize;
+        for (idx, worker) in workers.iter().enumerate() {
+            let state = worker.routing_state();
+            // The overload veto costs nothing here: `state` is the word this
+            // pass already loaded for health, circuit breaker and load.
+            if state.eligible() {
+                healthy_indices.push(idx);
+                load_sum += state.load;
+            }
+        }
+
+        if healthy_indices.is_empty() {
+            return None;
+        }
+        let avg_load = load_sum as f64 / healthy_indices.len() as f64;
+
+        // Determine the model for this set of workers (router pre-filters by model)
+        // All workers should be from the same model
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+
+        // Hash mode: TTL'd exact-match placement index; the radix trees are
+        // neither consulted nor populated.
+        if self.config.cache_index == CacheIndexKind::Hash {
+            return self.select_worker_hash(workers, info, &healthy_indices, avg_load, model_id);
+        }
+
+        // Abandon cache affinity fleet-wide only under backend KV pressure;
+        // request-count pressure is applied per request to the selected
+        // candidate inside each affinity path.
+        if self.is_kv_imbalanced(workers, &healthy_indices) {
+            return self.select_worker_fallback(workers, info, &healthy_indices, model_id);
+        }
+
+        // Cache-aware routing when balanced — three types (mutually exclusive):
+        //   1. Event-driven: KV index overlap scoring (gRPC + KV events)
+        //   2. Approximate token tree: TokenTree prefix matching (gRPC, no events)
+        //   3. Approximate string tree: Tree prefix matching (HTTP)
+        if let Some(tokens) = request_tokens {
+            // Event-driven mode re-hashes engine-reported blocks from their
+            // token ids on both sides, so it keys a namespace through the
+            // hash seed rather than a marker (see cache_namespace.rs); the
+            // approximate and hash modes below key under the marker.
+            if let Some(index) = self.event_index_for(model_id) {
+                self.select_worker_event_driven(
+                    workers,
+                    tokens,
+                    &healthy_indices,
+                    avg_load,
+                    &index,
+                    info,
+                )
+            } else {
+                self.select_worker_with_tokens(
+                    workers,
+                    tokens,
+                    &healthy_indices,
+                    avg_load,
+                    model_id,
+                    info,
+                )
+            }
+        } else {
+            let text = request_text.unwrap_or("");
+            self.select_worker_with_text(workers, text, &healthy_indices, avg_load, model_id, info)
+        }
+    }
+
+    /// The event-driven decision for a pool larger than twice
+    /// [`FLEET_SAMPLE`]: eligibility is read for a uniform sample of the pool
+    /// (the miss path's choices, the spill targets, the count-pressure gate's
+    /// fleet mean) and for the holders the index names, never for the whole
+    /// pool. A sample without one eligible worker defers to the scan, which
+    /// finds any that remain.
+    fn select_worker_sampled(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Sampled {
+        let Some(tokens) = info.tokens else {
+            return Sampled::Scan;
+        };
+        if workers.len() <= 2 * FLEET_SAMPLE
+            || self.config.cache_index == CacheIndexKind::Hash
+            || self.kv_pressure_gate_configured()
+        {
+            return Sampled::Scan;
+        }
+        let mut sample = [0usize; FLEET_SAMPLE];
+        let mut sampled = 0usize;
+        let mut load_sum = 0usize;
+        let mut rng = rand::rng();
+        // Draws with replacement, repeats dropped: above twice the sample
+        // size a repeat costs a slot and nothing else.
+        for _ in 0..2 * FLEET_SAMPLE {
+            if sampled == FLEET_SAMPLE {
+                break;
+            }
+            let idx = rng.random_range(0..workers.len());
+            if sample[..sampled].contains(&idx) {
+                continue;
+            }
+            let state = workers[idx].routing_state();
+            if state.eligible() {
+                sample[sampled] = idx;
+                sampled += 1;
+                load_sum += state.load;
+            }
+        }
+        if sampled == 0 {
+            return Sampled::Scan;
+        }
+        let sample = &mut sample[..sampled];
+        sample.sort_unstable();
+        let avg_load = load_sum as f64 / sampled as f64;
+        let model_id = normalize_model_key(workers[sample[0]].model_id());
+        let Some(index) = self.event_index_for(model_id) else {
+            return Sampled::Scan;
+        };
+        Sampled::Decided(
+            self.select_worker_event_driven(workers, tokens, sample, avg_load, &index, info),
+        )
+    }
+
+    /// Whether the decision is the exact maximum-overlap group: the default
+    /// selection policy at temperature zero, no decay in effect and no
+    /// accounting. Then only the deepest holders are gathered; every other
+    /// configuration reads each holder.
+    fn exact_maximum_decision(&self, tuning: &OverlapTuning<'_>) -> bool {
+        self.selection.name() == cost::DEFAULT_POLICY
+            && tuning.selection_temperature <= 0.0
+            && self.accounting.is_none()
+            && (tuning.overlap_decay <= 0.0 || tuning.waiting_prefill_tokens.is_none())
+    }
+
+    /// Whether the KV-pressure gate is configured: it reads the whole
+    /// fleet's token usage, so the decision reads the pool.
+    fn kv_pressure_gate_configured(&self) -> bool {
+        self.config.balance_token_usage_threshold < 1.0
+            || self.config.overload_token_usage_threshold < 1.0
+    }
+
+    /// The pool table for `workers`: the one kept when it is fresh, a stale
+    /// one while another decision rebuilds, else built here and published.
+    fn pool_table(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        indexer: &KvIndex,
+        now_ms: u64,
+    ) -> Arc<PoolTable> {
+        {
+            let tables = self.pool_tables.load();
+            if let Some(table) = tables.iter().find(|table| table.describes(workers)) {
+                if table.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel) {
+                    return Arc::clone(table);
+                }
+            }
+        }
+        let table = Arc::new(PoolTable::build(workers, indexer, now_ms));
+        self.pool_tables.rcu(|tables| {
+            let mut next: Vec<Arc<PoolTable>> = tables
+                .iter()
+                .filter(|kept| kept.slice != table.slice)
+                .cloned()
+                .collect();
+            if next.len() >= POOL_TABLES_KEPT {
+                if let Some(oldest) = next
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, kept)| kept.built_ms)
+                    .map(|(position, _)| position)
+                {
+                    next.swap_remove(oldest);
+                }
+            }
+            next.push(Arc::clone(&table));
+            next
+        });
+        self.pool_table_building.store(false, Ordering::Release);
+        table
+    }
+
+    /// The union of two ascending position lists, ascending: the eligible
+    /// workers a decision read and the holders, which a sampled decision's
+    /// list need not contain.
+    fn merge_rows(eligible: &[usize], candidates: &[OverlapCandidate]) -> Vec<usize> {
+        let mut rows = Vec::with_capacity(eligible.len() + candidates.len());
+        let (mut i, mut j) = (0, 0);
+        loop {
+            let next = match (eligible.get(i), candidates.get(j)) {
+                (Some(&idx), Some(candidate)) if idx < candidate.idx => {
+                    i += 1;
+                    idx
+                }
+                (Some(&idx), Some(candidate)) if idx == candidate.idx => {
+                    i += 1;
+                    j += 1;
+                    idx
+                }
+                (_, Some(candidate)) => {
+                    j += 1;
+                    candidate.idx
+                }
+                (Some(&idx), None) => {
+                    i += 1;
+                    idx
+                }
+                (None, None) => break,
+            };
+            rows.push(next);
+        }
+        rows
+    }
+
     /// The event-driven index for this model: its indexer and block size.
     /// `None` when there is no monitor or indexer, or the indexer is empty
     /// (startup, reconnect), so routing falls through to the approximate
@@ -1445,42 +1758,49 @@ impl CacheAwarePolicy {
     /// least-loaded worker that became routable within the warm-up window and
     /// whose index is still thin, so a returned or new worker builds a cache
     /// instead of idling behind the fleet's affinity (on the GB300 fleet a
-    /// restarted worker went a minute without a request). With every worker
-    /// warming (a young fleet) nothing is sliced: a miss gets a load-balanced
-    /// pick anyway. The pick is credited through the expected-wait selector
-    /// like any other.
+    /// restarted worker went a minute without a request). The candidates are
+    /// the pool table's: the workers inside the window at its build, so a
+    /// settled fleet pays nothing here, and with every worker warming (a
+    /// young fleet) it lists none, a miss getting a load-balanced pick anyway.
+    /// The pick is credited through the expected-wait selector like any other.
     fn warmup_slice(
         &self,
         workers: &[Arc<dyn Worker>],
-        healthy_indices: &[usize],
+        table: &PoolTable,
         indexer: &KvIndex,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        if table.warming.is_empty() {
+            return None;
+        }
         let warmup = liveness::warmup();
         if warmup.share <= 0.0 {
             return None;
         }
-        let warming: Vec<usize> = healthy_indices
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                let worker = &workers[idx];
-                let age = worker.admitted_age();
-                if age >= warmup.secs {
-                    return false;
-                }
-                let grown = indexer
-                    .worker_id(worker.url())
-                    .map(|id| worker.warmup_growth(indexer.worker_block_count(id)));
-                warmup.applies(age, grown)
-            })
-            .collect();
-        // Nothing to slice when no worker is warming, or when every one is (a
-        // young fleet): the miss then takes the regular path, which is a
-        // load-balanced pick anyway.
-        if warming.is_empty() || warming.len() == healthy_indices.len() {
-            return None;
+        let mut pick: Option<(usize, usize)> = None;
+        for &position in &table.warming {
+            let idx = position as usize;
+            let Some(worker) = workers.get(idx) else {
+                continue;
+            };
+            let state = worker.routing_state();
+            if !state.eligible() {
+                continue;
+            }
+            let age = worker.admitted_age();
+            if age >= warmup.secs {
+                continue;
+            }
+            let grown =
+                table.id_at[idx].map(|id| worker.warmup_growth(indexer.worker_block_count(id)));
+            if !warmup.applies(age, grown) {
+                continue;
+            }
+            if pick.is_none_or(|(_, load)| state.load < load) {
+                pick = Some((idx, state.load));
+            }
         }
+        let (idx, _) = pick?;
         if !self
             .warmup_misses
             .fetch_add(1, Ordering::Relaxed)
@@ -1488,10 +1808,6 @@ impl CacheAwarePolicy {
         {
             return None;
         }
-        let idx = warming
-            .iter()
-            .copied()
-            .min_by_key(|&idx| workers[idx].load())?;
         self.select_expected_wait(workers, &[idx], info)
     }
 
@@ -1517,9 +1833,10 @@ impl CacheAwarePolicy {
             return self.select_expected_wait(workers, &safe_affinity, info);
         }
 
-        // A miss has no affinity candidates and is not a spill: every healthy
-        // worker participates. A true spill excludes other workers that trip
-        // the same gate, preventing a fallback from reselecting a hot holder.
+        // A miss has no affinity candidates and is not a spill: every
+        // eligible worker the decision read participates. A true spill
+        // excludes other workers that trip the same gate, preventing a
+        // fallback from reselecting a hot holder.
         if affinity_candidates.is_empty() {
             return self.select_expected_wait(workers, healthy_indices, info);
         }
@@ -1573,16 +1890,28 @@ impl CacheAwarePolicy {
         } else {
             None
         };
+        // With `all_workers` the rows are the eligible workers the decision
+        // read merged with the holders, in slice order (a sampled decision
+        // reads eligibility for a bounded sample of the pool beside the
+        // holders, so the two lists differ); otherwise the candidates are
+        // the rows and no list is built.
+        let all_rows: Vec<usize> = if wants_all {
+            Self::merge_rows(healthy_indices, candidates)
+        } else {
+            Vec::new()
+        };
         // The host's own expected-wait reading of each row the policy will
         // see, in the order the inputs are built below.
         let expected: Vec<ExpectedWaitView> = if needs.expected_wait {
-            let rows: Vec<usize> = if wants_all {
-                healthy_indices.to_vec()
+            let candidate_rows: Vec<usize>;
+            let rows: &[usize] = if wants_all {
+                &all_rows
             } else {
-                candidates.iter().map(|candidate| candidate.idx).collect()
+                candidate_rows = candidates.iter().map(|candidate| candidate.idx).collect();
+                &candidate_rows
             };
             self.load_scorer
-                .expected_waits(workers, &rows, loads.as_deref())
+                .expected_waits(workers, rows, loads.as_deref())
         } else {
             Vec::new()
         };
@@ -1647,9 +1976,10 @@ impl CacheAwarePolicy {
             }
         };
         let mut inputs: Vec<CandidateInputs<'_>> = if wants_all {
-            // Candidates follow healthy order, so one merge pass pairs them.
+            // Rows and candidates are both in slice order, so one merge pass
+            // pairs them.
             let mut next = candidates.iter().peekable();
-            healthy_indices
+            all_rows
                 .iter()
                 .map(|&idx| {
                     let (raw, effective) = next
@@ -1834,13 +2164,28 @@ impl CacheAwarePolicy {
             }
             None => compute_request_content_hashes(tokens, block_size),
         };
+        let table = self.pool_table(workers, indexer, liveness::now_ms());
+        // Over a sampled pool the candidates read are bounded as the pool
+        // is: a tie among the deepest holders is drawn from, and an
+        // all-workers policy ranks the sample and the deepest holders; a
+        // shallow shared prefix is not a reason to read a thousand workers.
+        let cap = (workers.len() > 2 * FLEET_SAMPLE).then_some(FLEET_SAMPLE);
+        let gather = if self.exact_maximum_decision(&tuning) {
+            Gather::TopGroup { cap }
+        } else {
+            let wants_all = self.selection.needs().all_workers || self.accounting.is_some();
+            Gather::All {
+                cap: cap.filter(|_| wants_all),
+            }
+        };
         let candidates = Self::overlap_candidates_for_hashes(
             workers,
             &content_hashes,
-            healthy_indices,
+            &table,
             indexer,
             block_size,
             &tuning,
+            gather,
         );
         // Chain hashes are computed only for policies (or accounting) keyed
         // on prefixes; the default decision never pays for them.
@@ -1873,7 +2218,7 @@ impl CacheAwarePolicy {
             || best_overlap / request.request_blocks as f64
                 <= f64::from(self.config.cache_threshold);
         if thin_overlap {
-            if let Some(idx) = self.warmup_slice(workers, healthy_indices, indexer, info) {
+            if let Some(idx) = self.warmup_slice(workers, &table, indexer, info) {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
                 debug!(
                     worker = workers[idx].url(),
@@ -1922,12 +2267,13 @@ impl CacheAwarePolicy {
 
     /// Build positive-overlap candidates for event-driven routing.
     ///
-    /// Returns each healthy worker with a positive, optionally decayed overlap
-    /// score. This helper neither selects nor credits a worker:
+    /// Returns each eligible worker with a positive, optionally decayed
+    /// overlap score. This helper neither selects nor credits a worker:
     /// `affinity_score_group` chooses the effective-score group (exact maximum
     /// at temperature zero; a softmax-sampled group otherwise), and
     /// `select_final_from_affinity` uses LeastLoad to choose and credit one
-    /// final worker from that group. An empty result means no full-block overlap.
+    /// final worker from that group. An empty result means no full-block
+    /// overlap. The tests name the eligible set themselves.
     #[cfg(test)]
     fn overlap_candidates(
         workers: &[Arc<dyn Worker>],
@@ -1938,54 +2284,38 @@ impl CacheAwarePolicy {
         tuning: &OverlapTuning<'_>,
     ) -> Vec<OverlapCandidate> {
         let content_hashes = compute_request_content_hashes(tokens, block_size);
-        Self::overlap_candidates_for_hashes(
+        let table = PoolTable::build(workers, indexer, liveness::now_ms());
+        let mut candidates = Self::overlap_holders(
             workers,
             &content_hashes,
-            healthy_indices,
+            &table,
             indexer,
-            block_size,
-            tuning,
-        )
+            Gather::All { cap: None },
+        );
+        candidates.retain(|candidate| healthy_indices.contains(&candidate.idx));
+        if !candidates.is_empty() {
+            Self::apply_overlap_decay(
+                workers,
+                &mut candidates,
+                content_hashes.len(),
+                block_size,
+                tuning,
+            );
+        }
+        candidates
     }
 
     /// `overlap_candidates` over already-computed block hashes.
     fn overlap_candidates_for_hashes(
         workers: &[Arc<dyn Worker>],
         content_hashes: &[ContentHash],
-        healthy_indices: &[usize],
+        table: &PoolTable,
         indexer: &KvIndex,
         block_size: usize,
         tuning: &OverlapTuning<'_>,
+        gather: Gather,
     ) -> Vec<OverlapCandidate> {
-        if content_hashes.is_empty() {
-            return Vec::new();
-        }
-
-        let started = Instant::now();
-        let overlap = indexer.find_matches(content_hashes, false);
-        Metrics::record_kv_index_lookup(indexer.name(), started.elapsed().as_secs_f64());
-        if overlap.scores.is_empty() {
-            return Vec::new();
-        }
-
-        // Gather the positive-overlap candidates once; both selection modes
-        // and the decay's fleet-floor computation need the full set.
-        let mut candidates: Vec<OverlapCandidate> = Vec::new();
-        for &idx in healthy_indices {
-            let Some(score) = indexer
-                .worker_id(workers[idx].url())
-                .and_then(|id| overlap.scores.get(&id))
-                .copied()
-                .filter(|&s| s > 0)
-            else {
-                continue;
-            };
-            candidates.push(OverlapCandidate {
-                idx,
-                raw_score: f64::from(score),
-                effective_score: f64::from(score),
-            });
-        }
+        let mut candidates = Self::overlap_holders(workers, content_hashes, table, indexer, gather);
         if candidates.is_empty() {
             return candidates;
         }
@@ -1998,6 +2328,152 @@ impl CacheAwarePolicy {
             tuning,
         );
 
+        candidates
+    }
+
+    /// The eligible holders of the request's blocks with their undecayed
+    /// overlap, in slice order: the index names them by id, the pool table
+    /// places them, and eligibility is read for them alone, so the cost
+    /// follows the holders gathered and not the pool.
+    fn overlap_holders(
+        workers: &[Arc<dyn Worker>],
+        content_hashes: &[ContentHash],
+        table: &PoolTable,
+        indexer: &KvIndex,
+        gather: Gather,
+    ) -> Vec<OverlapCandidate> {
+        if content_hashes.is_empty() {
+            return Vec::new();
+        }
+
+        let started = Instant::now();
+        let overlap = indexer.find_matches(content_hashes, false);
+        Metrics::record_kv_index_lookup(indexer.name(), started.elapsed().as_secs_f64());
+        if overlap.scores.is_empty() {
+            return Vec::new();
+        }
+
+        let mut candidates = match gather {
+            Gather::TopGroup { cap } => Self::top_group(workers, table, &overlap, cap),
+            Gather::All { cap } => Self::all_holders(workers, table, &overlap, cap),
+        };
+        // Downstream reads candidates in slice order: the all-workers merge
+        // in `resolve_selection` and the tie-breaks.
+        candidates.sort_unstable_by_key(|candidate| candidate.idx);
+        candidates
+    }
+
+    /// The eligible holders of the deepest overlap: one pass over the
+    /// scores for the depth, one to place and read those holders. When none
+    /// of them is in this pool and routable (a PD leg's pool sharing the
+    /// model's index with the other leg, a holder down), the full gather
+    /// decides, so the result is always the deepest group a scan of the pool
+    /// would have found.
+    fn top_group(
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        overlap: &OverlapScores,
+        cap: Option<usize>,
+    ) -> Vec<OverlapCandidate> {
+        let deepest = overlap.scores.values().copied().max().unwrap_or(0);
+        if deepest == 0 {
+            return Vec::new();
+        }
+        let group = Self::holders_at(workers, table, overlap, deepest, cap);
+        if !group.is_empty() {
+            return group;
+        }
+        let mut all = Self::all_holders(workers, table, overlap, None);
+        let best = all
+            .iter()
+            .map(|candidate| candidate.raw_score)
+            .fold(0.0_f64, f64::max);
+        all.retain(|candidate| candidate.raw_score == best);
+        Self::draw(&mut all, cap);
+        all
+    }
+
+    /// The eligible holders in this pool whose overlap is exactly `depth`
+    /// blocks; `cap` of the tied holders, drawn uniformly, when they are more.
+    fn holders_at(
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        overlap: &OverlapScores,
+        depth: u32,
+        cap: Option<usize>,
+    ) -> Vec<OverlapCandidate> {
+        let mut tied: Vec<u32> = overlap
+            .scores
+            .iter()
+            .filter(|(_, &score)| score == depth)
+            .map(|(&id, _)| id)
+            .collect();
+        Self::draw(&mut tied, cap);
+        let mut group = Vec::with_capacity(tied.len());
+        for id in tied {
+            let Some(idx) = table.position(id, workers) else {
+                continue;
+            };
+            if !workers[idx].routing_state().eligible() {
+                continue;
+            }
+            group.push(OverlapCandidate {
+                idx,
+                raw_score: f64::from(depth),
+                effective_score: f64::from(depth),
+            });
+        }
+        group
+    }
+
+    /// Keep a uniform draw of `cap` items when there are more.
+    fn draw<T>(items: &mut Vec<T>, cap: Option<usize>) {
+        let Some(cap) = cap else {
+            return;
+        };
+        if items.len() <= cap {
+            return;
+        }
+        let mut rng = rand::rng();
+        for i in 0..cap {
+            let j = rng.random_range(i..items.len());
+            items.swap(i, j);
+        }
+        items.truncate(cap);
+    }
+
+    /// Every eligible holder in this pool with a positive overlap; the `cap`
+    /// deepest of them when set.
+    fn all_holders(
+        workers: &[Arc<dyn Worker>],
+        table: &PoolTable,
+        overlap: &OverlapScores,
+        cap: Option<usize>,
+    ) -> Vec<OverlapCandidate> {
+        let mut candidates: Vec<OverlapCandidate> = Vec::with_capacity(overlap.scores.len());
+        for (&id, &score) in &overlap.scores {
+            if score == 0 {
+                continue;
+            }
+            let Some(idx) = table.position(id, workers) else {
+                continue;
+            };
+            if !workers[idx].routing_state().eligible() {
+                continue;
+            }
+            candidates.push(OverlapCandidate {
+                idx,
+                raw_score: f64::from(score),
+                effective_score: f64::from(score),
+            });
+        }
+        if let Some(cap) = cap {
+            if candidates.len() > cap {
+                candidates
+                    .select_nth_unstable_by(cap - 1, |a, b| b.raw_score.total_cmp(&a.raw_score));
+                candidates.truncate(cap);
+            }
+        }
         candidates
     }
 
@@ -6538,5 +7014,235 @@ mod tests {
         assert_eq!(route(namespace("tenant-a")), 0, "same namespace hits w1");
         assert_eq!(route(namespace("tenant-b")), 1, "another salt misses");
         assert_eq!(route(None), 1, "a plain request misses salted blocks");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pool tables and the sampled decision over a large pool
+    // -----------------------------------------------------------------------
+
+    /// `count` workers, all interned in an event index that holds `chunks`
+    /// for the worker at `holder`, behind a policy built from `config`.
+    fn large_pool(
+        count: usize,
+        holder: usize,
+        chunks: &[&[u32]],
+        config: CacheAwareConfig,
+    ) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let workers = make_workers(&refs);
+        let indexer = setup_indexer_with_blocks(&urls[holder], chunks, 4);
+        for (i, url) in urls.iter().enumerate() {
+            if i != holder {
+                indexer.intern_worker(url).unwrap();
+            }
+        }
+        let policy = CacheAwarePolicy::with_config(config);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        monitor.set_block_size("unknown", 4);
+        policy.set_kv_event_monitor(Some(monitor));
+        (policy, workers)
+    }
+
+    fn tokens_info(tokens: &[u32]) -> SelectWorkerInfo<'_> {
+        SelectWorkerInfo {
+            tokens: Some(tokens),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_large_pool_routes_to_the_holder_the_index_names() {
+        let (policy, workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+        for _ in 0..8 {
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
+                .unwrap();
+            assert_eq!(
+                idx, 37,
+                "the holder sits outside any sample of {FLEET_SAMPLE}; the index places it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_pool_miss_finds_the_one_eligible_worker_the_sample_missed() {
+        let (policy, workers) = large_pool(40, 0, &[&[1, 2, 3, 4]], test_config());
+        for worker in &workers[..39] {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        let idx = policy.select_worker(&workers, &tokens_info(&[9, 9, 9, 9, 8, 8, 8, 8]));
+        assert_eq!(idx, Some(39));
+    }
+
+    #[test]
+    fn a_large_pool_miss_spreads_over_the_pool() {
+        let (policy, workers) = large_pool(40, 0, &[&[1, 2, 3, 4]], test_config());
+        let mut picked = HashSet::new();
+        for turn in 0..200u32 {
+            let tokens = [turn + 100, 9, 9, 9, 8, 8, 8, 8];
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&tokens))
+                .unwrap();
+            picked.insert(idx);
+            policy.on_request_complete(workers[idx].url(), true);
+        }
+        assert!(
+            picked.len() > 2 * FLEET_SAMPLE,
+            "200 misses reached {} workers; a fresh sample per decision reaches the pool",
+            picked.len()
+        );
+    }
+
+    #[test]
+    fn an_all_workers_policy_ranks_the_holder_beside_the_sample() {
+        let config = CacheAwareConfig {
+            selection_policy: Some("cache-aware-balanced".to_string()),
+            ..test_config()
+        };
+        let (policy, workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], config);
+        for _ in 0..8 {
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
+                .unwrap();
+            assert_eq!(idx, 37);
+            policy.on_request_complete(workers[idx].url(), true);
+        }
+    }
+
+    #[test]
+    fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]], 4);
+        let w3 = indexer.worker_id("http://w3:8000").unwrap();
+        let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
+        assert!(table.describes(&workers));
+        assert!(table.fresh(liveness::now_ms()));
+        assert_eq!(table.position(w3, &workers), Some(2));
+        assert_eq!(table.id_at, vec![None, None, Some(w3)]);
+        assert_eq!(
+            table.position(w3 + 100, &workers),
+            None,
+            "an id never interned"
+        );
+        // The same url behind a new worker object at the same position: the
+        // table was built from the old one and says so.
+        let mut swapped = workers.clone();
+        swapped[2] = make_workers(&["http://w3:8000"]).remove(0);
+        assert_eq!(table.position(w3, &swapped), None);
+        // Every worker was admitted just now: a young fleet lists nothing to slice.
+        assert!(table.warming.is_empty());
+        assert!(!table.fresh(liveness::now_ms() + POOL_TABLE_REFRESH_MS));
+    }
+
+    /// `count` workers that all hold the shared block `[1, 2, 3, 4]` (a chat
+    /// template's head), the one at `deep` also `[5, 6, 7, 8]`.
+    fn shared_prefix_pool(
+        count: usize,
+        deep: usize,
+        config: CacheAwareConfig,
+    ) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let workers = make_workers(&refs);
+        let indexer = Arc::new(KvIndex::positional(4));
+        for (i, url) in urls.iter().enumerate() {
+            let id = indexer.intern_worker(url).unwrap();
+            let mut wb = WorkerBlocks::default();
+            let mut blocks = vec![StoredBlock {
+                seq_hash: SequenceHash(1),
+                content_hash: compute_content_hash(&[1, 2, 3, 4]),
+            }];
+            if i == deep {
+                blocks.push(StoredBlock {
+                    seq_hash: SequenceHash(2),
+                    content_hash: compute_content_hash(&[5, 6, 7, 8]),
+                });
+            }
+            indexer.apply_stored(id, &blocks, None, &mut wb).unwrap();
+        }
+        let policy = CacheAwarePolicy::with_config(config);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        monitor.set_block_size("unknown", 4);
+        policy.set_kv_event_monitor(Some(monitor));
+        (policy, workers)
+    }
+
+    #[test]
+    fn the_default_decision_takes_the_deepest_holder_among_a_fleet_sharing_the_head() {
+        let (policy, workers) = shared_prefix_pool(64, 50, test_config());
+        for _ in 0..4 {
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
+                .unwrap();
+            assert_eq!(idx, 50);
+        }
+        // The deepest holder down: the decision falls to the holders of the
+        // head, never to a worker without the blocks.
+        workers[50].set_status(WorkerStatus::NotReady);
+        let idx = policy
+            .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
+            .unwrap();
+        assert_ne!(idx, 50);
+        assert!(workers[idx].is_healthy());
+    }
+
+    #[test]
+    fn a_fleet_wide_tie_is_drawn_from_not_scored_whole() {
+        let (policy, workers) = shared_prefix_pool(64, 50, test_config());
+        let mut picked = HashSet::new();
+        for _ in 0..200 {
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4]))
+                .unwrap();
+            picked.insert(idx);
+            policy.on_request_complete(workers[idx].url(), true);
+        }
+        assert!(
+            picked.len() > 2 * FLEET_SAMPLE,
+            "200 decisions on a head every worker holds reached {} workers",
+            picked.len()
+        );
+    }
+
+    #[test]
+    fn an_all_workers_policy_over_a_sampled_pool_keeps_the_deepest_holder() {
+        let config = CacheAwareConfig {
+            selection_policy: Some("cache-aware-balanced".to_string()),
+            ..test_config()
+        };
+        let (policy, workers) = shared_prefix_pool(64, 50, config);
+        for _ in 0..4 {
+            let idx = policy
+                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
+                .unwrap();
+            assert_eq!(idx, 50);
+            policy.on_request_complete(workers[idx].url(), true);
+        }
+    }
+
+    #[test]
+    fn merge_rows_unions_the_eligible_sample_with_the_holders_in_slice_order() {
+        let candidates: Vec<OverlapCandidate> = [3usize, 7, 20]
+            .iter()
+            .map(|&idx| OverlapCandidate {
+                idx,
+                raw_score: 1.0,
+                effective_score: 1.0,
+            })
+            .collect();
+        assert_eq!(
+            CacheAwarePolicy::merge_rows(&[1, 3, 9, 30], &candidates),
+            vec![1, 3, 7, 9, 20, 30]
+        );
+        assert_eq!(
+            CacheAwarePolicy::merge_rows(&[], &candidates),
+            vec![3, 7, 20]
+        );
+        assert_eq!(CacheAwarePolicy::merge_rows(&[2, 4], &[]), vec![2, 4]);
     }
 }
