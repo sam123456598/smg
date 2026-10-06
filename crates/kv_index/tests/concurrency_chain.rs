@@ -124,6 +124,21 @@ struct Lane<'a> {
 }
 
 impl Lane<'_> {
+    /// The index credits this worker with exactly the blocks its lane map names. A holding the
+    /// index drops behind the map's back (or keeps after the map forgot it) shows here, at the
+    /// step that caused it, not at the end state or at a later store under the block.
+    fn check_count(&self, when: &str) {
+        let credited = self.index.worker_block_count(self.worker);
+        assert!(
+            credited == self.map.len(),
+            "lane {} worker {} step {}: the index credits {credited} blocks, the lane map names {} ({when})",
+            self.lane,
+            self.worker,
+            self.steps,
+            self.map.len()
+        );
+    }
+
     fn record(&mut self, event: Event) {
         let seq = self.clock.fetch_add(1, Ordering::Relaxed);
         self.record_at(seq, event);
@@ -165,6 +180,7 @@ impl Lane<'_> {
             blocks: blocks[start..].to_vec(),
             parent,
         });
+        self.check_count("after a store");
     }
 
     /// Remove a contiguous range of the blocks this lane holds on a pool chain.
@@ -189,6 +205,7 @@ impl Lane<'_> {
         self.index
             .apply_removed(self.worker, &hashes, &mut self.map);
         self.record(Event::Removed(hashes));
+        self.check_count("after a removal");
     }
 
     fn step(&mut self) {
@@ -219,6 +236,7 @@ impl Lane<'_> {
             985..=989 => {
                 self.index.apply_cleared(self.worker, &mut self.map);
                 self.record(Event::Cleared);
+                self.check_count("after a clear");
             }
             _ => self.replace_worker(),
         }
@@ -235,6 +253,7 @@ impl Lane<'_> {
         self.name_counter += 1;
         let name = format!("lane-{}-{}", self.lane, self.name_counter);
         self.worker = self.index.intern_worker(&name).expect("worker slot");
+        self.check_count("after a worker replacement");
     }
 }
 
@@ -445,6 +464,13 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
         reader_lookups.load(Ordering::Relaxed)
     );
 
+    // Every engine hash here is a prefix hash of its chain, so a block has one place and no
+    // hash ever moves: a moved-hash count is a re-store taken for a move.
+    assert_eq!(
+        index.stats().moved_hashes,
+        0,
+        "the index released holdings for hashes it took as moved"
+    );
     let produced = index.debug_blocks();
     let expected = reference.blocks();
     let missing: Vec<_> = expected.difference(&produced).take(5).collect();

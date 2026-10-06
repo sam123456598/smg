@@ -120,6 +120,16 @@ thread_local! {
         const { std::cell::RefCell::new([0; MAX_PARTIAL]) };
 }
 
+/// One step of [`ChainIndex::hop`] along a block's forwarding chain.
+enum Hop {
+    /// The place forwards on: the next place and the generation its run must have.
+    Next(BlockRef, u32),
+    /// The place stands; the run's generation.
+    Here(u32),
+    /// Nobody holds the block any more.
+    Gone,
+}
+
 /// Where one of a worker's blocks lives: the run and the offset of the block within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockRef {
@@ -1661,14 +1671,17 @@ impl ChainIndex {
         }
     }
 
-    /// Follow the forwarding records to where a block lives now, without a lock: `(place,
-    /// generation of its run)`, or `None` when the block is not held any more (its run died, or
-    /// it was forwarded to nowhere).
-    fn resolve(&self, mut at: BlockRef) -> Option<(BlockRef, u32)> {
-        let mut expected: Option<u32> = None;
+    /// One step along a block's forwarding chain, read under the run's version: the next place
+    /// and the generation it must have, the place standing (with the run's generation), or the
+    /// block gone (a dead or reused run, a `GONE` suffix). A split publishes its shorter length
+    /// and its forwarding record under one lock but in two steps, so a reader that meets an
+    /// offset at or past the length without a record waits for the lock once and reads again;
+    /// after that the record is there, or the reference was stale.
+    fn hop(&self, at: BlockRef, expected: Option<u32>) -> Hop {
+        let mut waited = false;
         loop {
             if at.run == GONE {
-                return None;
+                return Hop::Gone;
             }
             let run = self.slab.run(at.run);
             let (window, version) = run.snapshot();
@@ -1676,18 +1689,59 @@ impl ChainIndex {
             if expected.is_some_and(|wanted| wanted != generation)
                 || (at.run != ROOT && window.len == 0)
             {
-                return None;
+                return Hop::Gone;
             }
             let hop = self.arena.forwards_find(window.forwards, at.offset);
             if !run.confirm(version) {
                 continue;
             }
             match hop {
-                Some((next, next_generation)) => {
-                    at = next;
-                    expected = Some(next_generation);
+                Some((next, next_generation)) => return Hop::Next(next, next_generation),
+                None if at.run != ROOT && at.offset >= window.len => {
+                    if waited {
+                        return Hop::Gone;
+                    }
+                    drop(run.meta.lock());
+                    waited = true;
                 }
-                None => return Some((at, generation)),
+                None => return Hop::Here(generation),
+            }
+        }
+    }
+
+    /// Where a block recorded at `at` lives now, with the generation of the run: the end of its
+    /// forwarding chain. `None` when nobody holds it any more.
+    fn resolve(&self, mut at: BlockRef) -> Option<(BlockRef, u32)> {
+        let mut expected: Option<u32> = None;
+        loop {
+            match self.hop(at, expected) {
+                Hop::Next(next, generation) => {
+                    at = next;
+                    expected = Some(generation);
+                }
+                Hop::Here(generation) => return Some((at, generation)),
+                Hop::Gone => return None,
+            }
+        }
+    }
+
+    /// Whether `to` is `from` or a place `from` has forwarded to since: the places one block has
+    /// had. Forwarding records only accumulate while their runs live (a prefix outlives its
+    /// suffix, being its parent), so the answer does not depend on when it is read, unlike the
+    /// ends of two chains resolved one after the other.
+    fn forwards_to(&self, from: BlockRef, to: BlockRef) -> bool {
+        let mut at = from;
+        let mut expected: Option<u32> = None;
+        loop {
+            if at == to {
+                return true;
+            }
+            match self.hop(at, expected) {
+                Hop::Next(next, generation) => {
+                    at = next;
+                    expected = Some(generation);
+                }
+                Hop::Here(_) | Hop::Gone => return false,
             }
         }
     }
@@ -2221,11 +2275,31 @@ impl ChainIndex {
         let walk = tick();
         let outcome = self.store_walk_locked(worker, blocks, origin, map, &mut pending);
         lap(self.counter_slot(1), walk);
+        self.write_placements(worker, blocks, pending, map);
+        outcome
+    }
+
+    /// The lane map writes of one store, after the run locks are released. A block the engine
+    /// names by a hash this worker already holds elsewhere (a store that moves the hash, as a
+    /// store without its parent followed by the whole chain does) keeps one place per hash: the
+    /// old membership is released. A re-store of the same block at the same place is not a
+    /// move, and "the same place" is read through the forwarding records: the placement was
+    /// recorded under the run's lock, and splits by other lanes land freely between that and
+    /// this write, so the recorded place and the map's old entry may both be behind the block's
+    /// current place by any number of splits. A block that did not move has its new place on
+    /// the forwarding chain from its old one, and that stays true however many splits follow
+    /// (`forwards_to`); comparing the two places resolved to their ends instead raced with a
+    /// split between the two reads, took the block for a moved hash, and released the worker's
+    /// holding at its real place while the map kept the entry (lookups then scored the worker
+    /// short, and a store under the block as parent found no parent).
+    fn write_placements(
+        &self,
+        worker: u32,
+        blocks: &[StoredBlock],
+        pending: Vec<Placed>,
+        map: &mut ChainBlockMap,
+    ) {
         let writes = tick();
-        // A block the engine names by a hash this worker already holds elsewhere (a store that
-        // moves the hash, as a store without its parent followed by the whole chain does) keeps
-        // one place per hash: the old membership is released below. A re-store of the same
-        // block at the same place, forwarded or not, is not a move.
         let mut moved: Vec<BlockRef> = Vec::new();
         for placed in pending {
             let first = BlockRef {
@@ -2241,7 +2315,7 @@ impl ChainIndex {
                 range.iter().map(|stored| stored.seq_hash),
                 first,
                 |old, new| {
-                    if self.resolve(old).map(|(place, _)| place) != Some(new) {
+                    if !self.forwards_to(old, new) {
                         moved.push(old);
                     }
                 },
@@ -2253,7 +2327,6 @@ impl ChainIndex {
             let work = group_by_run(moved);
             self.apply_removals(worker, work);
         }
-        outcome
     }
 
     /// The timer slot for a phase: stores 0-2 (resolve, walk, map), removals 3-5 (map, group,
@@ -3935,6 +4008,81 @@ mod tests {
         assert_eq!(index.debug_blocks(), reference.blocks());
     }
 
+    /// A split by another lane can land between a store's placement, recorded under the run's
+    /// lock, and its lane-map write. The write then meets a recorded place that forwards to the
+    /// suffix, exactly as the map's old entry for the block does: not a move, nothing released.
+    /// Driven through the write phase directly, with the placement recorded before the split
+    /// (a hole another holder opens; a divergence hangs a child and splits nothing).
+    #[test]
+    fn a_placement_recorded_before_a_split_is_not_a_move() {
+        let index = ChainIndex::with_max_workers(8);
+        let a = index.intern_worker("a").expect("id");
+        let b = index.intern_worker("b").expect("id");
+        let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
+        let chain: Vec<ContentHash> = (0..8).map(|p| content(26, p)).collect();
+        let blocks = blocks_of(&chain);
+        index.apply_stored(a, &blocks, None, &mut ma).expect("a");
+        index.apply_stored(b, &blocks, None, &mut mb).expect("b");
+        let first = ma.get(blocks[0].seq_hash).expect("mapped");
+        // b drops block 1: a hole, the run is split at 2. a's map keeps its entries in the
+        // original run's coordinates, forwarded to the suffix that holds blocks 2..8 now.
+        index.apply_removed(b, &[blocks[1].seq_hash], &mut mb);
+        let (suffix, _) = index
+            .resolve(BlockRef {
+                run: first.run,
+                offset: 2,
+            })
+            .expect("forwarded");
+        assert_ne!(suffix.run, first.run);
+        assert_eq!(suffix.offset, 0);
+        // What a's re-store of the chain records at this point: blocks 0..2 in the prefix,
+        // blocks 2..8 in the suffix.
+        let pending = vec![
+            Placed {
+                run: first.run,
+                offset: 0,
+                start: 0,
+                count: 2,
+                conflicts: 0,
+            },
+            Placed {
+                run: suffix.run,
+                offset: 0,
+                start: 2,
+                count: 6,
+                conflicts: 0,
+            },
+        ];
+        // Before the write lands, b drops block 4: the suffix is split at 3.
+        index.apply_removed(b, &[blocks[4].seq_hash], &mut mb);
+        assert_ne!(
+            index
+                .resolve(BlockRef {
+                    run: suffix.run,
+                    offset: 3,
+                })
+                .expect("forwarded again")
+                .0
+                .run,
+            suffix.run
+        );
+        index.write_placements(a, &blocks, pending, &mut ma);
+        assert_eq!(index.stats().moved_hashes, 0);
+        assert_eq!(index.worker_block_count(a), 8);
+        assert_eq!(ma.len(), 8);
+        assert_eq!(scores(&index, &chain), vec![(a, 8), (b, 1)]);
+        // The entries resolve to places that credit a: a store under block 6 finds its parent.
+        index
+            .apply_stored(a, &blocks[7..], Some(blocks[6].seq_hash), &mut ma)
+            .expect("a tail");
+        assert_eq!(index.worker_block_count(a), 8);
+        let mut reference = ReferenceIndexer::new();
+        reference.apply_stored(a, &blocks, None).expect("ref a");
+        reference.apply_stored(b, &blocks, None).expect("ref b");
+        reference.apply_removed(b, &[blocks[1].seq_hash]);
+        reference.apply_removed(b, &[blocks[4].seq_hash]);
+        assert_eq!(index.debug_blocks(), reference.blocks());
+    }
     /// `is_empty` follows the blocks: false from the first store, true again once every block
     /// is removed, cleared or taken with its worker.
     #[test]
