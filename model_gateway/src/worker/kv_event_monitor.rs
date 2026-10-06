@@ -25,7 +25,7 @@ use kv_index::{
 };
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheLocality,
-    KvCacheTier, KvEventBatch,
+    KvCacheTier, KvEventBatch, KvSnapshotChunk,
 };
 use tokio::{
     sync::{oneshot, Mutex, Semaphore},
@@ -132,6 +132,16 @@ struct WorkerSubscription {
 struct WorkerStreamState {
     ranks: HashMap<i32, RankState>,
     index: WorkerIndexState,
+    /// A relay snapshot whose chunks are still arriving on the stream.
+    snapshot: Option<SnapshotProgress>,
+}
+
+/// Where an in-band relay snapshot stands (`KvSnapshotChunk`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotProgress {
+    count: u32,
+    applied: u32,
+    blocks: u64,
 }
 
 impl WorkerStreamState {
@@ -155,6 +165,21 @@ impl WorkerStreamState {
             .values()
             .filter(|rank| rank.is_degraded())
             .count()
+    }
+
+    /// The stream ended with a snapshot still arriving: what was applied is
+    /// a partial live set, so the next subscription asks from zero (and gets
+    /// a whole snapshot) instead of resuming after the last chunk's stamp.
+    /// Returns whether a snapshot was abandoned.
+    fn abandon_snapshot(&mut self) -> bool {
+        let Some(progress) = self.snapshot.take() else {
+            return false;
+        };
+        for cursor in self.ranks.values_mut() {
+            cursor.reset();
+        }
+        debug_assert!(progress.applied < progress.count);
+        true
     }
 }
 
@@ -744,6 +769,13 @@ impl KvEventMonitor {
                 }
             };
 
+            if state.abandon_snapshot() {
+                warn!(
+                    worker_url = %worker_url,
+                    "KV event stream ended during a relay snapshot; the next subscription \
+                     starts over from zero"
+                );
+            }
             match stream_result {
                 StreamResult::Ended => {
                     info!(
@@ -867,6 +899,11 @@ impl KvEventMonitor {
         state: &mut WorkerStreamState,
         on_batch: &mut impl FnMut(&KvEventBatch),
     ) -> BatchOutcome {
+        if let Some(chunk) = &batch.snapshot {
+            return Self::admit_snapshot_chunk(
+                batch, chunk, worker_url, worker_id, indexer, state, on_batch,
+            );
+        }
         let rank = batch.dp_rank.unwrap_or(0);
         let seq = batch.sequence_number;
         let clears = batch.events.iter().any(|event| {
@@ -949,6 +986,77 @@ impl KvEventMonitor {
         BatchOutcome::Applied
     }
 
+    /// A chunk of a relay state snapshot (`KvSnapshotChunk`): the live set the
+    /// relay recorded, replacing the worker's state. Chunk 0 clears the worker
+    /// and every cursor and counts a `snapshot` resync; every chunk is applied
+    /// outside the admission rules and moves its rank's cursor to its stamp,
+    /// which the relay chose so that live events continue after the last one.
+    fn admit_snapshot_chunk(
+        batch: &KvEventBatch,
+        chunk: &KvSnapshotChunk,
+        worker_url: &str,
+        worker_id: u32,
+        indexer: &PositionalIndexer,
+        state: &mut WorkerStreamState,
+        on_batch: &mut impl FnMut(&KvEventBatch),
+    ) -> BatchOutcome {
+        let rank = batch.dp_rank.unwrap_or(0);
+        if chunk.index == 0 || state.snapshot.is_none() {
+            if chunk.index != 0 {
+                warn!(
+                    worker_url = %worker_url,
+                    rank,
+                    index = chunk.index,
+                    "KV event relay snapshot arrived without its first chunk; taking it as a resync"
+                );
+            }
+            info!(
+                worker_url = %worker_url,
+                rank,
+                chunks = chunk.count,
+                blocks = chunk.blocks,
+                through = batch.sequence_number + u64::from(chunk.count.saturating_sub(chunk.index + 1)),
+                "KV event relay served a state snapshot; replacing the worker's index state"
+            );
+            Self::apply_cleared(worker_id, indexer, &mut state.index);
+            for cursor in state.ranks.values_mut() {
+                cursor.reset();
+            }
+            Metrics::record_kv_event_resync(worker_url, ResyncReason::Snapshot.as_str());
+            state.snapshot = Some(SnapshotProgress {
+                count: chunk.count.max(1),
+                applied: 0,
+                blocks: chunk.blocks,
+            });
+        }
+        state
+            .ranks
+            .entry(rank)
+            .or_default()
+            .resync_to(batch.sequence_number);
+        on_batch(batch);
+        for event in &batch.events {
+            Self::apply_event(event, worker_id, indexer, &mut state.index);
+        }
+        Self::record_lag(worker_url, batch.timestamp);
+        Metrics::record_kv_event_batch(worker_url, "snapshot");
+        if let Some(progress) = &mut state.snapshot {
+            progress.applied += 1;
+            if progress.applied >= progress.count {
+                info!(
+                    worker_url = %worker_url,
+                    chunks = progress.count,
+                    blocks = progress.blocks,
+                    through = batch.sequence_number,
+                    "KV event relay snapshot applied; continuing with live events"
+                );
+                state.snapshot = None;
+                Metrics::set_kv_event_degraded_ranks(worker_url, state.degraded_ranks());
+            }
+        }
+        BatchOutcome::Applied
+    }
+
     /// One rank's publisher lost its history (a restart, or an unreplayable
     /// gap too large to keep): the worker's pooled index state goes with it,
     /// and the other ranks' cursors start over so their next batch is taken
@@ -980,6 +1088,7 @@ impl KvEventMonitor {
         for cursor in state.ranks.values_mut() {
             cursor.reset();
         }
+        state.snapshot = None;
         Metrics::record_kv_event_resync(worker_url, reason.as_str());
         Metrics::set_kv_event_degraded_ranks(worker_url, 0);
         Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
@@ -2181,7 +2290,7 @@ mod tests {
 
     use kv_index::ReferenceIndexer;
 
-    use super::super::kv_event_recovery::RESTART_WINDOW;
+    use super::super::kv_event_recovery::{Cursor, RESTART_WINDOW};
 
     /// Token ids for engine block `id`: distinct content per id.
     fn tokens_for(id: i64) -> Vec<u32> {
@@ -2231,6 +2340,7 @@ mod tests {
             timestamp: 0.0,
             events,
             dp_rank: rank,
+            snapshot: None,
         }
     }
 
@@ -2676,6 +2786,198 @@ mod tests {
         );
         sim.assert_matches_reference();
         assert_eq!(sim.reference.worker_block_count(sim.worker), 1);
+    }
+
+    /// The chunks a relay sends for a live set, stamped up to `through`:
+    /// chunk 0 begins with the clear, every chunk is marked.
+    fn snapshot_chunks(
+        through: u64,
+        rank: Option<i32>,
+        stores_per_chunk: &[Vec<KvCacheEvent>],
+        blocks: u64,
+    ) -> Vec<KvEventBatch> {
+        let count = stores_per_chunk.len() as u32;
+        stores_per_chunk
+            .iter()
+            .enumerate()
+            .map(|(index, stores)| {
+                let mut events = Vec::new();
+                if index == 0 {
+                    events.push(cleared());
+                }
+                events.extend(stores.iter().cloned());
+                KvEventBatch {
+                    sequence_number: through + 1 - u64::from(count) + index as u64,
+                    timestamp: 0.0,
+                    events,
+                    dp_rank: rank,
+                    snapshot: Some(KvSnapshotChunk {
+                        index: index as u32,
+                        count,
+                        blocks,
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    fn index_blocks(sim: &Sim) -> BTreeSet<(u32, usize, ContentHash, SequenceHash)> {
+        sim.indexer.debug_blocks().into_iter().collect()
+    }
+
+    /// A gateway that starts after the relay's history rolled receives the
+    /// live set as a snapshot: applied as one `snapshot` resync, it leaves
+    /// the index equal to the one that saw the whole stream (and to the
+    /// reference), and the live stream continues from the cut with nothing
+    /// skipped or repeated.
+    #[test]
+    fn a_relay_snapshot_is_applied_as_a_resync_and_rebuilds_the_live_set() {
+        let mut seen = Sim::new();
+        seen.deliver(&batch(1, None, vec![stored(None, &[1, 2, 3])]));
+        seen.deliver(&batch(2, None, vec![stored(Some(3), &[4, 5])]));
+        seen.deliver(&batch(3, None, vec![stored(None, &[10])]));
+        seen.deliver(&batch(4, None, vec![removed(&[5, 10])]));
+        seen.deliver(&batch(5, None, vec![stored(Some(2), &[6])]));
+        seen.assert_matches_reference();
+
+        // Live set at the cut (sequence 5): 1, 2, 3, 4 and the branch 6.
+        let chunks = snapshot_chunks(
+            5,
+            None,
+            &[
+                vec![stored(None, &[1, 2, 3])],
+                vec![stored(Some(3), &[4]), stored(Some(2), &[6])],
+            ],
+            5,
+        );
+        let mut fresh = Sim::new();
+        for chunk in &chunks {
+            assert_eq!(fresh.feed(chunk), BatchOutcome::Applied);
+        }
+        assert!(fresh.state.snapshot.is_none(), "both chunks arrived");
+        assert_eq!(fresh.state.ranks[&0].cursor(), Cursor::Live(5));
+        assert_eq!(fresh.state.resume_sequence(), 5);
+        assert_eq!(
+            index_blocks(&fresh),
+            index_blocks(&seen),
+            "index after the snapshot"
+        );
+        assert_eq!(
+            index_blocks(&fresh),
+            seen.reference.blocks(),
+            "against the reference"
+        );
+
+        // The cut's own sequence is behind the cursor; the next one applies.
+        assert_eq!(
+            fresh.feed(&batch(5, None, vec![stored(None, &[99])])),
+            BatchOutcome::Skipped
+        );
+        let live = batch(6, None, vec![stored(Some(6), &[7]), removed(&[4])]);
+        assert_eq!(fresh.feed(&live), BatchOutcome::Applied);
+        assert_eq!(seen.deliver(&live), BatchOutcome::Applied);
+        seen.assert_matches_reference();
+        assert_eq!(
+            index_blocks(&fresh),
+            index_blocks(&seen),
+            "index after the live batch"
+        );
+        assert_eq!(seen.reference.worker_block_count(seen.worker), 5);
+    }
+
+    /// The snapshot lists a block once per physical copy the engine still
+    /// holds, so the copy counts after it match a gateway that saw every
+    /// store and removal: the same removals evict the same blocks.
+    #[test]
+    fn a_relay_snapshot_carries_the_copies_the_engine_still_holds() {
+        let mut seen = Sim::new();
+        seen.feed(&batch(1, None, vec![stored(None, &[1, 2])]));
+        // A second copy of 1 and of 2, one copy of 1 removed since.
+        seen.feed(&batch(
+            2,
+            None,
+            vec![stored(None, &[1]), stored(Some(1), &[2])],
+        ));
+        seen.feed(&batch(3, None, vec![removed(&[1])]));
+        let chunks = snapshot_chunks(
+            3,
+            None,
+            &[vec![stored(None, &[1, 2]), stored(Some(1), &[2])]],
+            3,
+        );
+        let mut fresh = Sim::new();
+        assert_eq!(fresh.feed(&chunks[0]), BatchOutcome::Applied);
+        assert_eq!(index_blocks(&fresh), index_blocks(&seen));
+        for (seq, hashes) in [(4, &[1][..]), (5, &[2][..]), (6, &[2][..])] {
+            let removal = batch(seq, None, vec![removed(hashes)]);
+            assert_eq!(fresh.feed(&removal), BatchOutcome::Applied);
+            assert_eq!(seen.feed(&removal), BatchOutcome::Applied);
+            assert_eq!(index_blocks(&fresh), index_blocks(&seen), "after {seq}");
+        }
+        assert!(index_blocks(&fresh).is_empty(), "every copy is gone");
+    }
+
+    /// A snapshot chunk is a resync wherever the rank's cursor stands: the
+    /// gap and duplicate rules do not apply to it, the worker's old blocks
+    /// go, the cursor moves to the chunk's stamp.
+    #[test]
+    fn a_snapshot_replaces_whatever_the_rank_held_and_moves_its_cursor() {
+        let mut sim = Sim::new();
+        sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+        sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+        assert_eq!(
+            sim.feed(&batch(9, None, vec![stored(None, &[9])])),
+            BatchOutcome::Gap {
+                expected: 3,
+                received: 9
+            }
+        );
+        // The relay's answer to the resubscription: its window had rolled.
+        let chunks = snapshot_chunks(40, None, &[vec![stored(None, &[7, 8])]], 2);
+        assert_eq!(sim.feed(&chunks[0]), BatchOutcome::Applied);
+        sim.reference_apply(&chunks[0]);
+        sim.assert_matches_reference();
+        assert_eq!(sim.state.ranks[&0].cursor(), Cursor::Live(40));
+        assert!(sim.state.ranks[&0].replay_pending().is_none());
+        assert!(!sim.state.ranks[&0].is_degraded());
+        assert_eq!(sim.reference.worker_block_count(sim.worker), 2);
+        let next = batch(41, None, vec![removed(&[7])]);
+        assert_eq!(sim.deliver(&next), BatchOutcome::Applied);
+        sim.assert_matches_reference();
+        assert_eq!(sim.reference.worker_block_count(sim.worker), 1);
+    }
+
+    /// A stream that ends with chunks still owed leaves a partial live set:
+    /// the cursors are forgotten so the next subscription asks from zero and
+    /// gets a whole snapshot; a complete one leaves nothing to abandon.
+    #[test]
+    fn a_stream_that_ends_mid_snapshot_starts_the_next_subscription_from_zero() {
+        let mut sim = Sim::new();
+        let chunks = snapshot_chunks(
+            10,
+            None,
+            &[vec![stored(None, &[1])], vec![stored(Some(1), &[2])]],
+            2,
+        );
+        assert_eq!(sim.feed(&chunks[0]), BatchOutcome::Applied);
+        assert_eq!(
+            sim.state.snapshot,
+            Some(SnapshotProgress {
+                count: 2,
+                applied: 1,
+                blocks: 2
+            })
+        );
+        assert_eq!(sim.state.resume_sequence(), 9);
+        assert!(sim.state.abandon_snapshot());
+        assert_eq!(sim.state.resume_sequence(), 0);
+        assert!(!sim.state.abandon_snapshot());
+        for chunk in &chunks {
+            assert_eq!(sim.feed(chunk), BatchOutcome::Applied);
+        }
+        assert!(sim.state.snapshot.is_none());
+        assert_eq!(sim.state.resume_sequence(), 10);
+        assert!(!sim.state.abandon_snapshot());
     }
 
     #[test]

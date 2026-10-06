@@ -23,7 +23,7 @@ consequences shape the gateway's rules:
 
 | Server | `start_sequence_number != 0` | History gone | Snapshot | Ranks |
 |---|---|---|---|---|
-| Rust `engine_servicer` relay (vLLM, SGLang, TokenSpeed) | served from the relay's bounded history when the cursor is inside the window (the last `SMG_KV_EVENT_HISTORY_BATCHES` batches, 10,000 by default, within `SMG_KV_EVENT_HISTORY_BYTES`, 256 MiB), then live; `OUT_OF_RANGE` below the window, beyond the newest sequence, or before the relay's own start; a cursor of 0 gets the whole window when it is complete from the publisher's first batch, else live only | `DATA_LOSS` on a publisher restart (its sequence going backwards on the relay's socket); the relay's own gaps are filled from the engine's replay socket, and what the replay cannot give is a hole in the window that a resume skips, so the gateway settles it once instead of looping | none | relays rank 0 only |
+| Rust `engine_servicer` relay (vLLM, SGLang, TokenSpeed) | served from the relay's bounded history when the cursor is inside the window (the last `SMG_KV_EVENT_HISTORY_BATCHES` batches, 10,000 by default, within `SMG_KV_EVENT_HISTORY_BYTES`, 256 MiB), then live; `OUT_OF_RANGE` below the window, beyond the newest sequence, or before the relay's own start, and the gateway clears and resubscribes from zero; a cursor of 0 gets the whole window when it is complete from the publisher's first batch, else the **state snapshot** below (the window rolled, has a hole, or the relay started after the publisher), then live; live only before anything was relayed | `DATA_LOSS` on a publisher restart (its sequence going backwards on the relay's socket); the relay's own gaps are filled from the engine's replay socket, and what the replay cannot give is a hole in the window that a resume skips, so the gateway settles it once instead of looping | in band, from the relay's record of the engine's live blocks (`crates/engine_servicer/src/kv_state.rs`, one entry per live rank, tier and hash, folded from the stream it relays): batches marked `KvEventBatch.snapshot` (`KvSnapshotChunk {index, count, blocks}`), chunk 0 beginning with `AllBlocksCleared`, then every live block as `Stored` events with the original store's fields, one event per physical copy, parents before children, cut atomically at the relay's cursor under the lock that admits batches and stamped with consecutive sequence numbers ending at that cursor, so live events continue at cursor + 1 with no gap and no duplicate | relays rank 0 only |
 | Python servicers (SGLang, vLLM) | replay when the engine offers one; `OUT_OF_RANGE` when it cannot honour a non-zero start | `DATA_LOSS` on a publisher restart or an unverifiable replay | none ("zero starts live rebuilding") | every DP rank, `dp_rank` set, a cursor per rank |
 | `mock-worker --engine realistic` | replays its buffer `> cursor`, then live | never signalled (the publisher-restart fault hook keeps the stream up) | none | rank 0 |
 
@@ -49,7 +49,8 @@ mix, and nothing about blocks is tracked twice.
 | `<= last` otherwise | duplicate (replay overlap): skip |
 | `> last + 1`, no replay pending | **gap**: remember `expected = last + 1`, reconnect with the cursor; the batch is not applied |
 | `> last + 1`, replay pending | **unrecoverable gap**: the server skipped ahead anyway. `missed <= 1024`: keep the blocks, mark the rank degraded (an engine still holds most of them and never re-sends stores); more: clear the worker. Apply, cursor = `seq` |
-| snapshot in flight | hold in the rank's tail (bounded at 1,024 batches; overflow forces another snapshot) |
+| batch marked `KvSnapshotChunk` (in-band relay snapshot) | **snapshot**: chunk 0 clears the worker's index state and every cursor and counts the resync; every chunk is applied outside the rules above and sets its rank's cursor to its stamp, so the live batch after the last chunk is `last + 1`; a stream that ends before the last chunk forgets the cursors, and the next subscription asks from zero for a whole snapshot |
+| snapshot in flight (out of band; no servicer sends one today) | hold in the rank's tail (bounded at 1,024 batches; overflow forces another snapshot) |
 
 A restart on one rank clears the whole worker because the pooled copies cannot be attributed to a
 rank; the other ranks' cursors start over so their next batch is taken as a first one instead of
@@ -61,15 +62,19 @@ and until its stream is back the blocks it stores are invisible to routing, beca
 resume after the cursor and never resend them.
 
 Every decision is a metric: `smg_kv_event_batches_total{disposition}` (applied, stale,
-tail_overflow), `smg_kv_event_gaps_total{outcome}` (replay_requested, unrecovered_kept,
+tail_overflow, snapshot), `smg_kv_event_gaps_total{outcome}` (replay_requested, unrecovered_kept,
 unrecovered_cleared), `smg_kv_event_missed_batches_total`, `smg_kv_event_resyncs_total{reason}`
-(out_of_range, data_loss, publisher_restart, gap_cleared), `smg_kv_event_lag_seconds` (publisher
-stamp to apply), `smg_kv_event_degraded_ranks`, `smg_kv_event_tail_depth`.
+(out_of_range, data_loss, publisher_restart, gap_cleared, snapshot), `smg_kv_event_lag_seconds`
+(publisher stamp to apply), `smg_kv_event_degraded_ranks`, `smg_kv_event_tail_depth`.
 
-What the gateway still cannot do without server help: learn which blocks changed during an
-unreplayable gap, replace a worker's state atomically, tell a restarted publisher that kept its
-cache from one that lost it, or know a worker's resident blocks after a gateway restart. All of
-these need an epoch or a snapshot.
+A gateway restart, or a gateway started after the engines warmed up, now learns a worker's
+resident blocks from the Rust relay whatever the age of the stream: the full history while the
+window still starts at the publisher's first batch, the state snapshot once it has rolled (before
+this, a fresh gateway behind a rolled window routed on `event_miss` for the whole run: 1,935 of
+1,950 selections on the GB300 fleet while the engines served 56% of them from cache, see
+`gpu-harness-e69487f8.md` section 4). What the gateway still cannot do without more server help:
+learn which blocks changed during an unreplayable gap, or tell a restarted publisher that kept its
+cache from one that lost it; both need an epoch.
 
 ## Liveness beside the health check
 
@@ -118,8 +123,9 @@ req/s per process or runs closed-loop. The 12 and 20 s restarts seen earlier wer
 measured on uncontended cores; the control plane is not the bottleneck at this scale. Two
 observations stand: nothing persists worker registrations across a restart, so an operator (or
 service discovery) must re-register, and the KV event subscriptions start over with no cursor, so
-the index knows a worker's blocks only as the engine re-reports them (the mock replays its buffer;
-real engines do not).
+the index knows a worker's blocks only as its servicer hands them over (the mock replays its
+buffer; the Rust relay serves its history or its state snapshot; the Python bridge, which relays
+per call and keeps nothing between calls, serves live events only).
 
 ## Fault drills
 
@@ -200,32 +206,41 @@ message SubscribeKvEventsRequest {
 }
 ```
 
-### 3. Snapshots on the stream
+### 3. Snapshots on the stream (implemented 2026-10-05, Rust relay and gateway)
 
 ```proto
 message KvEventBatch {
   ...
-  // New: this batch is part of a snapshot of the rank's resident blocks, not a live event.
-  // The first snapshot batch is preceded by a Cleared event; snapshot batches carry Stored
-  // events in parent order; the batch with snapshot_complete = true carries the sequence
-  // number of the last live event the snapshot includes (its watermark). Live events resume
-  // after it with sequence_number = watermark + 1.
-  optional bool snapshot = 7;
-  optional bool snapshot_complete = 8;
+  KvSnapshotChunk snapshot = 7;   // set on every chunk of a relay state snapshot
+}
+message KvSnapshotChunk {
+  uint32 index = 1;   // 0-based chunk position
+  uint32 count = 2;   // chunks in the snapshot
+  uint64 blocks = 3;  // live blocks in the whole snapshot, physical copies counted
 }
 ```
 
-A snapshot is produced from the engine's own view (SGLang's radix cache, vLLM's block pool via
-the KV-event replay buffer plus the connector's resident set) so it is a consistent cut at the
-watermark. If the server cannot build one, it answers `FAILED_PRECONDITION` with a message and the
-gateway falls back to today's live rebuild, marked degraded.
+The relay builds the snapshot from its own record of the stream it relays (one entry per live
+rank, tier and engine hash, with the parent, tokens, LoRA id, cache level, extra keys and the
+store's tier, medium, group, locality, ownership, session and namespace; copies per block capped
+at 8 like the gateway's counter), not from the engine, so it costs the engine nothing and needs
+no engine API; it is exact for everything the relay saw, and a hole in the relay's window (a gap
+the engine's replay could not fill) leaves it as inexact as the live stream was. The cut is
+atomic: the entries are collected (an `Arc` clone each) under the lock that admits batches,
+together with the relay's cursor; ordering, run merging and encoding happen outside the lock as
+the subscriber polls, so a slow snapshot reader never holds the publisher task. A 676k-block
+collection takes the lock for about 10 ms on the development host (`a_676k_block_snapshot_...`
+test prints the figure and the live latency another subscriber saw meanwhile).
 
-Gateway behaviour with this in place (already coded, behind `RankState::begin_snapshot` /
-`finish_snapshot`): on a gap the server cannot replay, request a snapshot; hold live batches in the
-bounded tail while it streams (a tail overflow restarts the snapshot); replace the worker's blocks
-atomically when the snapshot completes (needs `PositionalIndexer::replace_worker`, a swap of the
-block map and index entries under one guard, to be added in the indexer workstream); then apply
-the tail from the watermark.
+Differences from the proposal above: the marker is a message with the chunk's position and the
+block total instead of two flags; chunk 0 carries the `AllBlocksCleared` itself; the chunks are
+stamped `cursor - count + 1 ..= cursor` (consecutive, so the gateway's existing per-rank cursor
+takes them without a special case and a gateway that predates the marker still applies them in
+order); a snapshot is served only to a subscription from zero, a stale cursor below the window
+stays `OUT_OF_RANGE` and gets the snapshot on the resubscription from zero (one round trip more,
+no capability negotiation, no loop for an older gateway); the gateway's tail buffer is not
+involved because the stream is ordered. Nothing is returned for an impossible snapshot: the
+relay always has a record (empty at worst, which is a snapshot of one clear).
 
 ### 4. Capabilities
 
@@ -238,13 +253,17 @@ failed round trip and exposes them as metrics.
 
 - Done on the Rust relay: a non-zero cursor it cannot honour is `OUT_OF_RANGE`, and one
   subscription per engine keeps a bounded history (the engines' `buffer_steps`, 10,000, within a
-  byte budget) that serves resumes before live events. Its counters are logged with every gap,
-  restart and refusal (the servicer has no metrics endpoint): `relayed`, `undecodable_batches`,
-  `served_from_history`, `out_of_range`, `publisher_gaps`, `gap_batches_recovered`,
-  `gap_batches_lost`, `publisher_restarts`, `subscribers_lagged`. Read them next to the gateway's
-  `smg_kv_event_gaps_total{outcome}` and `smg_kv_event_resyncs_total{reason}`: a drop drill should
-  show `publisher_gaps` and `gap_batches_recovered` on the relay and `replay_requested` with no
-  `unrecovered` outcome on the gateway; a restart drill `publisher_restarts` on the relay and
-  `data_loss` or `publisher_restart` on the gateway.
+  byte budget) that serves resumes before live events, and the live-block record that serves the
+  state snapshot. Its counters are logged with every gap, restart and refusal (the servicer has no
+  metrics endpoint): `relayed`, `undecodable_batches`, `served_from_history`, `served_snapshots`,
+  `out_of_range`, `publisher_gaps`, `gap_batches_recovered`, `gap_batches_lost`,
+  `publisher_restarts`, `subscribers_lagged`; a served snapshot logs one info line with the cut,
+  the block and entry counts and the microseconds the lock was held. Read them next to the
+  gateway's `smg_kv_event_gaps_total{outcome}` and `smg_kv_event_resyncs_total{reason}`: a drop
+  drill should show `publisher_gaps` and `gap_batches_recovered` on the relay and
+  `replay_requested` with no `unrecovered` outcome on the gateway; a restart drill
+  `publisher_restarts` on the relay and `data_loss` or `publisher_restart` on the gateway; a fresh
+  gateway on warm engines `served_from_history` or `served_snapshots` on every relay and, for the
+  latter, one `snapshot` resync per worker on the gateway and no `event_miss` flood.
 - The SGLang servicer should request replays in chunks below libzmq's send high-water mark so a
   long replay is not truncated into a second gap.

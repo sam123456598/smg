@@ -813,6 +813,7 @@ impl Normalizer {
             timestamp: batch.ts,
             events,
             dp_rank: batch.dp_rank,
+            snapshot: None,
         }
     }
 

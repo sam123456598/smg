@@ -2214,10 +2214,12 @@ dependencies = [
 name = "engine-servicer"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "engine-zmq-adapter",
  "engine-zmq-client",
+ "flate2",
  "futures",
  "kv-index",
  "llm-tokenizer",

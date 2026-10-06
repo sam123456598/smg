@@ -15,7 +15,11 @@ a replay that cannot be verified (history truncated, timeout, malformed) and
 a publisher restart (its counter starts over) end the stream with
 ``DATA_LOSS``, which the gateway answers by clearing the worker and
 resubscribing from zero. A non-zero ``start_sequence_number`` is refused with
-``OUT_OF_RANGE`` for the same reason: the relay's numbering is per call.
+``OUT_OF_RANGE`` for the same reason: the relay's numbering is per call. A
+zero cursor is live only: nothing is kept between calls, so there is no
+history and no state snapshot to serve (the Rust relay in
+``crates/engine_servicer`` keeps both for the servicer's lifetime and serves a
+``KvSnapshotChunk`` snapshot once its history window has rolled).
 
 Decoding is lenient, as the engines evolve their events by adding optional
 keys: batches are ``[ts, events, rank]``, events are tagged maps (``type``) or

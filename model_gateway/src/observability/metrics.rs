@@ -338,7 +338,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_kv_event_batches_total",
-        "KV event batches by worker and disposition (applied, stale, tail_overflow)"
+        "KV event batches by worker and disposition (applied, stale, tail_overflow, snapshot)"
     );
     describe_counter!(
         "smg_kv_event_gaps_total",
@@ -352,7 +352,7 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_kv_event_resyncs_total",
         "KV event rank resyncs by worker and reason (out_of_range, data_loss, \
-         publisher_restart, gap_cleared)"
+         publisher_restart, gap_cleared, snapshot)"
     );
     describe_histogram!(
         "smg_kv_event_lag_seconds",

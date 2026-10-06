@@ -1728,6 +1728,7 @@ impl SchedulerState {
                 timestamp: unix_seconds(),
                 events: kv,
                 dp_rank: Some(0),
+                snapshot: None,
             })
         };
 

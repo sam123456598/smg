@@ -14,6 +14,8 @@
 //! The engines' ZMQ KV-cache event publishers are relayed by [`kv_events`]
 //! after [`kv_wire`] normalizes them; that module documents the per-engine
 //! hash folding rule and the one-for-one forwarding of stores and removals.
+//! [`kv_state`] keeps the engine's live blocks from that stream, the state
+//! snapshot a subscriber receives once the relay's history has rolled.
 
 pub mod engine_hash;
 mod engine_link;
@@ -21,6 +23,7 @@ mod error;
 mod health;
 mod kv_events;
 mod kv_history;
+pub mod kv_state;
 pub mod kv_wire;
 mod load_tracker;
 mod proto_json;

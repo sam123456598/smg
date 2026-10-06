@@ -202,6 +202,7 @@ mod tests {
                 })
                 .collect(),
             dp_rank: None,
+            snapshot: None,
         })
     }
 

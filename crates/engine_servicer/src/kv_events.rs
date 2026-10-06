@@ -2,10 +2,12 @@
 //! gRPC streams through one [`KvEventRelay`] per engine.
 //!
 //! The relay subscribes to the publisher once, for the servicer's lifetime,
-//! and keeps what it relays in a bounded [`History`] (the last
+//! keeps what it relays in a bounded [`History`] (the last
 //! `SMG_KV_EVENT_HISTORY_BATCHES` batches, 10,000 by default like the
 //! engines' own `buffer_steps`, within `SMG_KV_EVENT_HISTORY_BYTES`, 256 MiB
-//! by default). A `SubscribeKvEvents` call is served from it:
+//! by default) and folds every batch into a record of the engine's live
+//! blocks per rank ([`LiveState`]). A `SubscribeKvEvents` call is served
+//! from them:
 //!
 //! - `start_sequence_number` is the last sequence the gateway applied. Inside
 //!   the window, the batches after it come first, then live events; below
@@ -16,8 +18,18 @@
 //!   `OUT_OF_RANGE` too.
 //! - zero means no cursor. When the window holds every batch the publisher
 //!   ever numbered (it starts at 0, nothing lost or evicted) the subscriber
-//!   gets all of it, which is the publisher's whole state; otherwise live
-//!   events only.
+//!   gets all of it, which is the publisher's whole state. Once the window no
+//!   longer starts there (it rolled past its caps, has a hole, or the relay
+//!   started after the publisher) the subscriber gets a state snapshot
+//!   instead: the live blocks as the relay recorded them, cut at the last
+//!   relayed sequence under the same lock that admits batches, sent as
+//!   chunks marked `KvSnapshotChunk` with consecutive sequence numbers
+//!   ending at that cut (chunk 0 begins with `AllBlocksCleared`, the stores
+//!   follow parents first), then live events from the next sequence: no
+//!   gap, no duplicate. The gateway applies the chunks as a `snapshot`
+//!   resync. A stale cursor below the window stays `OUT_OF_RANGE`: the
+//!   gateway clears, resubscribes from zero and receives the snapshot. Before
+//!   anything was relayed, zero is live only.
 //!
 //! The publisher's own sequence numbers are kept. A sequence the relay did
 //! not receive is asked of the engine's replay socket (vLLM's and SGLang's
@@ -50,7 +62,7 @@ use std::{
     collections::VecDeque,
     ops::RangeInclusive,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use engine_zmq_client::codec::TrailingTolerant;
@@ -66,6 +78,7 @@ use zeromq::{
 
 use crate::{
     kv_history::{History, Window},
+    kv_state::{LiveState, Snapshot, SnapshotChunks},
     kv_wire::{low64_big_endian, Normalizer, WireBatch, WireEvent},
     BoxStream,
 };
@@ -176,6 +189,8 @@ pub struct RelayCounts {
     pub undecodable_batches: u64,
     /// Subscriptions whose first batches came from the history.
     pub served_from_history: u64,
+    /// Subscriptions that began with a state snapshot.
+    pub served_snapshots: u64,
     /// Subscriptions refused because their cursor was outside the window.
     pub out_of_range: u64,
     /// Sequence gaps seen on the publisher's socket.
@@ -193,6 +208,9 @@ pub struct RelayCounts {
 /// The state the publisher task and the subscribers share.
 struct Shared {
     history: History,
+    /// The engine's live blocks as the relayed stream describes them,
+    /// current through `cursor`.
+    state: LiveState,
     /// The last sequence relayed in this incarnation, or none yet.
     cursor: Option<u64>,
     /// The first sequence relayed in this incarnation: the relay holds
@@ -271,6 +289,7 @@ impl Shared {
     fn restart(&mut self) -> u64 {
         self.generation += 1;
         self.history.clear();
+        self.state.clear();
         self.cursor = None;
         self.started_at = None;
         self.counts.publisher_restarts += 1;
@@ -316,6 +335,8 @@ impl Drop for KvEventRelay {
             window = shared.history.len(),
             holes = shared.history.holes(),
             bytes = shared.history.bytes(),
+            live_blocks = shared.state.blocks(),
+            live_entries = shared.state.entries(),
             "KV event relay closed"
         );
     }
@@ -327,6 +348,7 @@ impl KvEventRelay {
         Arc::new(Self {
             shared: Arc::new(Mutex::new(Shared {
                 history: History::new(config.history_batches, config.history_bytes),
+                state: LiveState::new(),
                 cursor: None,
                 started_at: None,
                 generation: 0,
@@ -359,6 +381,24 @@ impl KvEventRelay {
         lock(&self.shared).counts.clone()
     }
 
+    /// Record `batches` as relayed without a publisher: the history, the
+    /// live state and the cursor as [`Relaying::relay`] would leave them.
+    #[cfg(test)]
+    fn preload(&self, batches: impl IntoIterator<Item = common::KvEventBatch>) {
+        let mut shared = lock(&self.shared);
+        for batch in batches {
+            let sequence = batch.sequence_number;
+            let batch = Arc::new(batch);
+            shared.history.push(sequence, Arc::clone(&batch));
+            shared.state.apply(&batch);
+            if shared.started_at.is_none() {
+                shared.started_at = Some(sequence);
+            }
+            shared.cursor = Some(sequence);
+            shared.counts.relayed += 1;
+        }
+    }
+
     /// Subscribe to the publisher if not yet subscribed. Called by
     /// [`Self::subscribe`]; needs a Tokio runtime.
     pub fn start(&self) {
@@ -377,8 +417,9 @@ impl KvEventRelay {
         *task = Some(handle);
     }
 
-    /// Handle one `SubscribeKvEvents` call: the history after the cursor,
-    /// then live events; see the module docs for the cursor rules.
+    /// Handle one `SubscribeKvEvents` call: the history after the cursor, or
+    /// a state snapshot, then live events; see the module docs for the
+    /// cursor rules.
     pub fn subscribe(
         &self,
         request: common::SubscribeKvEventsRequest,
@@ -388,7 +429,7 @@ impl KvEventRelay {
         // the two is missed; the subscriber skips what it already replayed.
         let rx = self.live.subscribe();
         let cursor = request.start_sequence_number;
-        let (replay, last_sent) = {
+        let serve = {
             let mut shared = lock(&self.shared);
             if let Some(error) = &shared.failed {
                 return Err(Status::internal(format!(
@@ -399,15 +440,37 @@ impl KvEventRelay {
             if cursor == 0 {
                 if shared.history.complete_from_start() {
                     shared.counts.served_from_history += 1;
-                    (shared.history.all(), None)
+                    Serve::History {
+                        batches: shared.history.all(),
+                        last_sent: None,
+                    }
+                } else if let Some(through) = shared.cursor {
+                    // The window no longer reaches back to the publisher's
+                    // first batch: the live set as of `through`, taken under
+                    // the guard that admits batches, so every later batch
+                    // reaches this subscriber through the live channel.
+                    let started = Instant::now();
+                    let snapshot = shared.state.snapshot();
+                    let collected = started.elapsed();
+                    shared.counts.served_snapshots += 1;
+                    Serve::Snapshot {
+                        snapshot,
+                        through,
+                        collected,
+                        oldest: shared.history.oldest(),
+                        holes: shared.history.holes(),
+                    }
                 } else {
-                    (Vec::new(), None)
+                    Serve::Live
                 }
             } else {
                 match shared.history.after(cursor) {
                     Ok(batches) => {
                         shared.counts.served_from_history += 1;
-                        (batches, Some(cursor))
+                        Serve::History {
+                            batches,
+                            last_sent: Some(cursor),
+                        }
                     }
                     Err(window) => {
                         shared.counts.out_of_range += 1;
@@ -426,7 +489,7 @@ impl KvEventRelay {
                                 _ => format!(
                                     "SubscribeKvEvents: the relay for {endpoint} keeps history \
                                      from sequence {oldest}, after cursor {cursor}; resubscribe \
-                                     from zero"
+                                     from zero for a state snapshot"
                                 ),
                             },
                             Window::Ahead { newest } => format!(
@@ -446,15 +509,49 @@ impl KvEventRelay {
                 }
             }
         };
-        if !replay.is_empty() {
-            debug!(
-                endpoint = %self.config.endpoint,
-                cursor,
-                batches = replay.len(),
-                "SubscribeKvEvents: serving from history"
-            );
-        }
+        let (replay, last_sent, snapshot) = match serve {
+            Serve::History { batches, last_sent } => {
+                if !batches.is_empty() {
+                    debug!(
+                        endpoint = %self.config.endpoint,
+                        cursor,
+                        batches = batches.len(),
+                        "SubscribeKvEvents: serving from history"
+                    );
+                }
+                (batches, last_sent, SnapshotPhase::None)
+            }
+            Serve::Snapshot {
+                snapshot,
+                through,
+                collected,
+                oldest,
+                holes,
+            } => {
+                info!(
+                    endpoint = %self.config.endpoint,
+                    through,
+                    blocks = snapshot.blocks,
+                    entries = snapshot.entries(),
+                    ranks = snapshot.ranks.len(),
+                    collected_us = u64::try_from(collected.as_micros()).unwrap_or(u64::MAX),
+                    oldest,
+                    holes,
+                    "SubscribeKvEvents: the history no longer starts at the publisher's first \
+                     batch; serving a state snapshot"
+                );
+                let timestamp = unix_seconds();
+                // Ordering and sizing the chunks is a pass over every live
+                // block: off the runtime's workers, and off the lock.
+                let ordering = tokio::task::spawn_blocking(move || {
+                    SnapshotChunks::new(snapshot, through, timestamp)
+                });
+                (Vec::new(), Some(through), SnapshotPhase::Ordering(ordering))
+            }
+            Serve::Live => (Vec::new(), None, SnapshotPhase::None),
+        };
         let subscriber = Subscriber {
+            snapshot,
             replay: replay.into(),
             rx,
             last_sent,
@@ -469,11 +566,44 @@ impl KvEventRelay {
     }
 }
 
+/// What a subscription begins with, decided under the relay's lock.
+enum Serve {
+    History {
+        batches: Vec<Arc<common::KvEventBatch>>,
+        last_sent: Option<u64>,
+    },
+    Snapshot {
+        snapshot: Snapshot,
+        through: u64,
+        collected: Duration,
+        oldest: Option<u64>,
+        holes: usize,
+    },
+    Live,
+}
+
+/// Where a subscription's snapshot stands.
+enum SnapshotPhase {
+    None,
+    /// Being ordered and sized on the blocking pool; awaited at the first poll.
+    Ordering(tokio::task::JoinHandle<SnapshotChunks>),
+    Serving(SnapshotChunks),
+}
+
+/// Seconds since the Unix epoch, the way the engines stamp their batches.
+fn unix_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 type Item = Result<common::KvEventBatch, Status>;
 
-/// One `SubscribeKvEvents` stream: what it still owes from the history, then
-/// the live channel, deduplicated by sequence.
+/// One `SubscribeKvEvents` stream: the snapshot it owes, what it still owes
+/// from the history, then the live channel, deduplicated by sequence.
 struct Subscriber {
+    snapshot: SnapshotPhase,
     replay: VecDeque<Arc<common::KvEventBatch>>,
     rx: broadcast::Receiver<Live>,
     last_sent: Option<u64>,
@@ -488,6 +618,37 @@ impl Subscriber {
             return None;
         }
         loop {
+            match &mut self.snapshot {
+                SnapshotPhase::Ordering(ordering) => {
+                    let chunks = match ordering.await {
+                        Ok(chunks) => chunks,
+                        Err(error) => {
+                            self.done = true;
+                            return Some(Err(Status::internal(format!(
+                                "SubscribeKvEvents: the snapshot of {} could not be ordered: \
+                                 {error}",
+                                self.endpoint
+                            ))));
+                        }
+                    };
+                    debug!(
+                        endpoint = %self.endpoint,
+                        chunks = chunks.chunk_count(),
+                        blocks = chunks.blocks(),
+                        through = chunks.through(),
+                        "SubscribeKvEvents: snapshot ordered"
+                    );
+                    self.snapshot = SnapshotPhase::Serving(chunks);
+                    continue;
+                }
+                SnapshotPhase::Serving(chunks) => {
+                    if let Some(chunk) = chunks.next_chunk() {
+                        return Some(Ok(chunk));
+                    }
+                    self.snapshot = SnapshotPhase::None;
+                }
+                SnapshotPhase::None => {}
+            }
             if let Some(batch) = self.replay.pop_front() {
                 self.last_sent = Some(batch.sequence_number);
                 return Some(Ok((*batch).clone()));
@@ -659,6 +820,7 @@ impl Relaying<'_> {
         {
             let mut shared = lock(self.shared);
             shared.history.push(sequence, Arc::clone(&batch));
+            shared.state.apply(&batch);
             if shared.started_at.is_none() {
                 shared.started_at = Some(sequence);
             }
@@ -860,7 +1022,7 @@ pub(crate) mod golden {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use futures::StreamExt;
     use smg_grpc_client::common_proto::{kv_cache_event, KvCacheLocality, KvCacheTier};
@@ -1232,7 +1394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_subscriber_without_a_cursor_gets_the_whole_history_or_live_only() {
+    async fn a_subscriber_without_a_cursor_gets_the_whole_history_or_a_snapshot() {
         let mut lab = start_lab(100, false).await;
         lab.prime().await;
         let batch2 = golden::bytes(golden::BATCH2);
@@ -1248,7 +1410,8 @@ mod tests {
         assert_eq!(read(&mut stream).await.sequence_number, 3);
 
         // A relay that joined after the publisher's first batches has an
-        // incomplete window: live only.
+        // incomplete window: what it knows of the state, as a snapshot cut
+        // at its newest sequence, then live.
         let mut late = start_lab(100, false).await;
         for _ in 0..250 {
             late.publish(5, &batch2).await;
@@ -1258,13 +1421,27 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(late.relay.counts().relayed, 1, "the relay saw sequence 5");
-        let mut live = late.subscribe(0).expect("live");
+        let mut stream = late.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut stream).await;
+        assert_eq!(chunk.sequence_number, 5, "cut at the newest sequence");
+        assert_eq!(
+            chunk.snapshot,
+            Some(common::KvSnapshotChunk {
+                index: 0,
+                count: 1,
+                blocks: 1
+            })
+        );
+        assert_eq!(chunk.dp_rank, Some(1));
+        assert!(is_cleared(&chunk.events[0]));
+        assert_eq!(stored_hashes(&chunk), vec![(Some(41), vec![42])]);
         late.publish(6, &batch2).await;
         assert_eq!(
-            read(&mut live).await.sequence_number,
+            read(&mut stream).await.sequence_number,
             6,
-            "nothing from before"
+            "live from the next sequence"
         );
+        assert_eq!(late.relay.counts().served_snapshots, 1);
     }
 
     #[tokio::test]
@@ -1342,7 +1519,17 @@ mod tests {
         assert_eq!(read(&mut from_before).await.sequence_number, 4);
         let mut from_inside = lab.subscribe(2).expect("served");
         assert_eq!(read(&mut from_inside).await.sequence_number, 4);
-        let mut no_cursor = lab.subscribe(0).expect("live only: the window has a hole");
+        // The window has a hole, so it is not the publisher's whole state: a
+        // subscriber without a cursor gets the snapshot (both copies of block
+        // 42, from sequences 1 and 4) cut at 4, then live.
+        let mut no_cursor = lab.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut no_cursor).await;
+        assert_eq!(chunk.sequence_number, 4);
+        assert_eq!(chunk.snapshot.as_ref().map(|chunk| chunk.blocks), Some(2));
+        assert_eq!(
+            stored_hashes(&chunk),
+            vec![(Some(41), vec![42]), (Some(41), vec![42])]
+        );
         lab.publish(5, &batch2).await;
         assert_eq!(read(&mut no_cursor).await.sequence_number, 5);
     }
@@ -1432,6 +1619,7 @@ mod tests {
     fn restart_rules_read_the_same_on_every_wire() {
         let mut shared = Shared {
             history: History::new(10, usize::MAX),
+            state: LiveState::new(),
             cursor: Some(500),
             started_at: Some(0),
             generation: 0,
@@ -1514,7 +1702,12 @@ mod tests {
         let status = read_error(&mut stream).await;
         assert_eq!(status.code(), tonic::Code::DataLoss);
         assert_eq!(lab.relay.counts().publisher_restarts, 1);
-        let mut fresh = lab.subscribe(0).expect("live");
+        // The new incarnation began at 2 with the clear: nothing is live, and
+        // a fresh subscriber is told so by a snapshot of one clear, cut at 2.
+        let mut fresh = lab.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut fresh).await;
+        assert_eq!((chunk.sequence_number, chunk.events.len()), (2, 1));
+        assert!(is_cleared(&chunk.events[0]));
         lab.publish(3, &batch2).await;
         assert_eq!(read(&mut fresh).await.sequence_number, 3);
     }
@@ -1537,8 +1730,13 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::DataLoss);
         read_end(&mut stream).await;
         // The new incarnation started at 1, not 0: its window is not complete
-        // from the publisher's first batch, so a fresh subscriber goes live.
-        let mut fresh = lab.subscribe(0).expect("live");
+        // from the publisher's first batch, so a fresh subscriber gets the
+        // new incarnation's state as a snapshot (the restart emptied the old
+        // one), then live.
+        let mut fresh = lab.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut fresh).await;
+        assert_eq!(chunk.sequence_number, 1);
+        assert_eq!(stored_hashes(&chunk), vec![(Some(41), vec![42])]);
         lab.publish(2, &batch2).await;
         assert_eq!(read(&mut fresh).await.sequence_number, 2);
         let mut resumed = lab.subscribe(1).expect("inside the new window");
@@ -1575,7 +1773,11 @@ mod tests {
         // Nothing is missing between cursor 4 and the relay's start.
         let mut resumed = late.subscribe(4).expect("nothing missed");
         assert_eq!(read(&mut resumed).await.sequence_number, 5);
-        let mut fresh = late.subscribe(0).expect("live");
+        // From zero: what the relay knows, as a snapshot cut at 5, then live.
+        let mut fresh = late.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut fresh).await;
+        assert_eq!(chunk.sequence_number, 5);
+        assert_eq!(stored_hashes(&chunk), vec![(Some(41), vec![42])]);
         late.publish(6, &batch2).await;
         assert_eq!(read(&mut fresh).await.sequence_number, 6);
         assert_eq!(read(&mut resumed).await.sequence_number, 6);
@@ -1602,5 +1804,313 @@ mod tests {
         .await
         .expect("the publisher notices in time");
         assert!(disconnected);
+    }
+    /// A publisher batch on rank 0 with one `BlockStored`: `hashes` chained
+    /// from `parent`, two tokens per block, stamped `ts`.
+    fn store_payload(ts: f64, hashes: &[i64], parent: Option<i64>) -> Vec<u8> {
+        let tokens: Vec<u32> = (0..hashes.len() as u32 * 2).collect();
+        let batch = serde_json::json!([ts, [{
+            "type": "BlockStored",
+            "block_hashes": hashes,
+            "parent_block_hash": parent,
+            "token_ids": tokens,
+            "block_size": 2,
+            "lora_id": null,
+            "medium": "GPU",
+        }], 0]);
+        rmp_serde::to_vec_named(&batch).expect("encodes")
+    }
+
+    fn remove_payload(hashes: &[i64]) -> Vec<u8> {
+        let batch = serde_json::json!([1700000003.0, [{
+            "type": "BlockRemoved",
+            "block_hashes": hashes,
+            "medium": "GPU",
+        }], 0]);
+        rmp_serde::to_vec_named(&batch).expect("encodes")
+    }
+
+    fn is_cleared(event: &common::KvCacheEvent) -> bool {
+        matches!(event.data, Some(kv_cache_event::Data::Cleared(_)))
+    }
+
+    /// `(parent, hashes)` of every stored event of a batch, in order.
+    fn stored_hashes(batch: &common::KvEventBatch) -> Vec<(Option<i64>, Vec<i64>)> {
+        batch
+            .events
+            .iter()
+            .filter_map(|event| match &event.data {
+                Some(kv_cache_event::Data::Stored(stored)) => Some((
+                    stored.parent_block_hash,
+                    stored.blocks.iter().map(|block| block.block_hash).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Once the window has rolled, a subscriber without a cursor gets the
+    /// live set as a snapshot cut at the newest sequence, then live events
+    /// from the next one; a batch published between the subscription and
+    /// the first poll follows the snapshot, once.
+    #[tokio::test]
+    async fn after_the_window_rolled_a_subscriber_without_a_cursor_gets_a_snapshot_then_live() {
+        let mut lab = start_lab(3, false).await;
+        lab.prime().await; // sequence 0: BATCH1, whose clear leaves nothing live
+        lab.publish(1, &store_payload(1.0, &[10, 11], None)).await;
+        lab.publish(2, &store_payload(2.0, &[12], Some(11))).await;
+        lab.publish(3, &store_payload(3.0, &[20], None)).await;
+        lab.publish(4, &remove_payload(&[20])).await;
+        lab.publish(5, &store_payload(5.0, &[21, 22], None)).await;
+        lab.wait_relayed(6).await;
+        let mut stream = lab.subscribe(0).expect("a snapshot");
+        // Published before the first poll: must follow the snapshot.
+        lab.publish(6, &store_payload(6.0, &[30], Some(22))).await;
+        lab.wait_relayed(7).await;
+        let chunk = read(&mut stream).await;
+        assert_eq!(chunk.sequence_number, 5, "stamped at the cut");
+        assert_eq!(
+            chunk.snapshot,
+            Some(common::KvSnapshotChunk {
+                index: 0,
+                count: 1,
+                blocks: 5
+            })
+        );
+        assert_eq!(chunk.dp_rank, Some(0));
+        assert!(is_cleared(&chunk.events[0]));
+        assert_eq!(
+            stored_hashes(&chunk),
+            vec![(None, vec![10, 11, 12]), (None, vec![21, 22])],
+            "the live set as the engine stored it, chains merged"
+        );
+        let live = read(&mut stream).await;
+        assert_eq!((live.sequence_number, live.snapshot), (6, None));
+        assert_eq!(stored_hashes(&live), vec![(Some(22), vec![30])]);
+        lab.publish(7, &store_payload(7.0, &[31], Some(30))).await;
+        assert_eq!(read(&mut stream).await.sequence_number, 7);
+        let counts = lab.relay.counts();
+        assert_eq!(
+            (counts.served_snapshots, counts.served_from_history),
+            (1, 0)
+        );
+    }
+
+    /// A cursor below the window is still refused, and the resubscription
+    /// from zero the gateway answers with gets the snapshot.
+    #[tokio::test]
+    async fn a_stale_cursor_below_the_window_is_refused_and_zero_gets_the_snapshot() {
+        let mut lab = start_lab(2, false).await;
+        lab.prime().await;
+        for seq in 1..=4 {
+            lab.publish(seq, &store_payload(seq as f64, &[seq as i64 * 10], None))
+                .await;
+        }
+        lab.wait_relayed(5).await;
+        // The window is 3..=4; cursor 1 wants 2, gone.
+        let status = refused(lab.subscribe(1));
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+        assert!(
+            status
+                .message()
+                .contains("resubscribe from zero for a state snapshot"),
+            "{}",
+            status.message()
+        );
+        let mut stream = lab.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut stream).await;
+        assert_eq!(chunk.sequence_number, 4);
+        assert_eq!(chunk.snapshot.as_ref().map(|chunk| chunk.blocks), Some(4));
+        assert_eq!(
+            stored_hashes(&chunk),
+            vec![
+                (None, vec![10]),
+                (None, vec![20]),
+                (None, vec![30]),
+                (None, vec![40])
+            ]
+        );
+        lab.publish(5, &store_payload(5.0, &[50], None)).await;
+        assert_eq!(read(&mut stream).await.sequence_number, 5);
+        let counts = lab.relay.counts();
+        assert_eq!((counts.out_of_range, counts.served_snapshots), (1, 1));
+    }
+
+    /// A relayed batch of `blocks` chained device blocks of 16 tokens on rank 0.
+    fn synthetic_batch(seq: u64, blocks: i64) -> common::KvEventBatch {
+        let first = seq as i64 * blocks + 1;
+        common::KvEventBatch {
+            sequence_number: seq,
+            timestamp: 1.0,
+            events: vec![common::KvCacheEvent {
+                event_id: seq,
+                data: Some(kv_cache_event::Data::Stored(common::KvBlocksStored {
+                    blocks: (first..first + blocks)
+                        .map(|hash| common::KvBlock {
+                            block_hash: hash,
+                            token_ids: (0..16).map(|i| hash as u32 ^ i).collect(),
+                            block_size: 16,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    parent_block_hash: None,
+                    tier: Some(KvCacheTier::Device as i32),
+                    medium: Some("GPU".to_string()),
+                    ..Default::default()
+                })),
+            }],
+            dp_rank: Some(0),
+            snapshot: None,
+        }
+    }
+
+    fn unix_now() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs_f64()
+    }
+
+    /// Publish `sequences` one at a time, each stamped with its publish time
+    /// and read back on `live` before the next: the relay's latency per
+    /// batch in milliseconds.
+    async fn publish_timed(
+        lab: &mut Lab,
+        sequences: std::ops::Range<u64>,
+        live: &mut BoxStream<common::KvEventBatch>,
+    ) -> Vec<f64> {
+        let mut latencies = Vec::with_capacity((sequences.end - sequences.start) as usize);
+        for seq in sequences {
+            lab.publish(seq, &store_payload(unix_now(), &[-(seq as i64)], None))
+                .await;
+            let batch = read(live).await;
+            assert_eq!(batch.sequence_number, seq);
+            latencies.push((unix_now() - batch.timestamp) * 1e3);
+        }
+        latencies
+    }
+
+    /// The GB300 workers' pool (676k blocks) behind a rolled window: the
+    /// snapshot is cut atomically at the relay's cursor while live batches
+    /// stream through to another subscriber, which sees no stall beyond the
+    /// one pass under the lock; the snapshot subscriber, not read until the
+    /// cut is long past, gets every chunk and then the live stream from the
+    /// cut, nothing twice and nothing missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the measured pause is this test's report; read it with --nocapture"
+    )]
+    async fn a_676k_block_snapshot_is_cut_atomically_and_does_not_stall_the_live_stream() {
+        const BATCHES: u64 = 10_564;
+        const PER_BATCH: i64 = 64;
+        let mut lab = start_lab(50, false).await;
+        lab.relay
+            .preload((0..BATCHES).map(|seq| synthetic_batch(seq, PER_BATCH)));
+        let preloaded = BATCHES * PER_BATCH as u64;
+        let last = BATCHES - 1;
+        let mut live = lab.subscribe(last).expect("at the newest sequence");
+        // The SUB connects asynchronously: publish the next sequence until it lands.
+        let next = last + 1;
+        for _ in 0..250 {
+            lab.publish(next, &store_payload(unix_now(), &[-1], None))
+                .await;
+            if lab.relay.counts().relayed > BATCHES {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(read(&mut live).await.sequence_number, next);
+        let control = publish_timed(&mut lab, next + 1..next + 201, &mut live).await;
+
+        // The snapshot is taken while live batches keep flowing to `live`.
+        let relay = Arc::clone(&lab.relay);
+        let taking = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let stream = relay.subscribe(common::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+            });
+            (stream, started.elapsed())
+        });
+        let during = publish_timed(&mut lab, next + 201..next + 1_201, &mut live).await;
+        let (snapshot, subscribe_took) = taking.await.expect("the subscribe call ran");
+        let mut snapshot = snapshot.expect("a snapshot");
+        let max = |values: &[f64]| values.iter().copied().fold(0.0f64, f64::max);
+        let median = |values: &[f64]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        };
+        eprintln!(
+            "676k snapshot: subscribe call (lock held for the collection) {subscribe_took:?}; \
+             live latency ms: control median {:.3} max {:.3}, during median {:.3} max {:.3}",
+            median(&control),
+            max(&control),
+            median(&during),
+            max(&during)
+        );
+        assert!(
+            subscribe_took < Duration::from_secs(2),
+            "{subscribe_took:?}"
+        );
+        assert!(
+            max(&during) < 2_000.0,
+            "a live batch waited {:.1} ms on the snapshot",
+            max(&during)
+        );
+
+        // Not read until now: the chunks come whole, then live from the cut.
+        let mut chunks = Vec::new();
+        let first_live = loop {
+            let batch = read(&mut snapshot).await;
+            if batch.snapshot.is_none() {
+                break batch;
+            }
+            chunks.push(batch);
+        };
+        let through = chunks.last().expect("chunks").sequence_number;
+        assert!(
+            (next..next + 1_201).contains(&through),
+            "the cut fell inside the timed publishes: {through}"
+        );
+        let blocks_at_cut = preloaded + (through - last);
+        let count = u32::try_from(chunks.len()).unwrap();
+        assert_eq!(
+            count as usize,
+            (blocks_at_cut as usize).div_ceil(crate::kv_state::CHUNK_BLOCKS)
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                chunk.sequence_number,
+                through + 1 - u64::from(count) + index as u64,
+                "stamps are consecutive up to the cut"
+            );
+            let marker = chunk.snapshot.as_ref().unwrap();
+            assert_eq!((marker.index, marker.count), (index as u32, count));
+            // Every live batch up to the cut stored one block: the state and
+            // the cut agree, so the collection and the cursor were one guard.
+            assert_eq!(marker.blocks, blocks_at_cut);
+        }
+        assert!(is_cleared(&chunks[0].events[0]));
+        let emitted: usize = chunks
+            .iter()
+            .map(|chunk| {
+                stored_hashes(chunk)
+                    .iter()
+                    .map(|(_, hashes)| hashes.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(emitted as u64, blocks_at_cut);
+        assert_eq!(
+            first_live.sequence_number,
+            through + 1,
+            "live continues right after the cut"
+        );
+        let mut expected = through + 2;
+        while expected < next + 1_201 {
+            assert_eq!(read(&mut snapshot).await.sequence_number, expected);
+            expected += 1;
+        }
     }
 }

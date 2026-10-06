@@ -21,11 +21,21 @@
 //!   stores for them), a large one clears it, mirroring the servicers' own
 //!   `OUT_OF_RANGE` / `DATA_LOSS` signal.
 //!
+//! The Rust relay serves a state snapshot in band: once its history no longer
+//! starts at the publisher's first batch, a subscription from zero begins with
+//! chunks marked `KvSnapshotChunk` (chunk 0 carries the engine's clear, the
+//! stores follow parents first) stamped with consecutive sequence numbers
+//! ending at the sequence the state was cut at, and live events continue
+//! from the next one. The monitor applies the chunks as a `snapshot` resync
+//! outside the admission rules above and sets the rank's cursor to each
+//! chunk's stamp ([`RankState::resync_to`]); nothing is buffered because the
+//! stream is ordered.
+//!
 //! The tail buffer serves a snapshot resync delivered on a side channel: live
 //! batches arriving while the snapshot is in flight are held, bounded, and
-//! applied in order after it. Today's servicers send snapshots on the same
-//! stream (or not at all), so the monitor never enters that mode; the logic is
-//! here, tested, for the protocol in `crates/kv_index/docs/recovery-protocol.md`.
+//! applied in order after it. No servicer sends one out of band today, so the
+//! monitor never enters that mode; the logic is here, tested, for the
+//! protocol in `crates/kv_index/docs/recovery-protocol.md`.
 
 use std::collections::VecDeque;
 
@@ -89,6 +99,9 @@ pub(crate) enum ResyncReason {
     DataLoss,
     PublisherRestart,
     GapCleared,
+    /// The relay served a state snapshot in place of the history it no longer
+    /// had: the worker's state is replaced by the live set it carries.
+    Snapshot,
 }
 
 impl ResyncReason {
@@ -98,6 +111,7 @@ impl ResyncReason {
             Self::DataLoss => "data_loss",
             Self::PublisherRestart => "publisher_restart",
             Self::GapCleared => "gap_cleared",
+            Self::Snapshot => "snapshot",
         }
     }
 }
@@ -276,6 +290,18 @@ impl RankState {
         Some(out)
     }
 
+    /// A snapshot chunk stamped `seq` was applied: the cursor stands there,
+    /// whatever it was, and nothing is pending or degraded any more.
+    pub(crate) fn resync_to(&mut self, seq: u64) {
+        self.cursor = Cursor::Live(seq);
+        self.replay = None;
+        self.degraded = false;
+        self.fresh = false;
+        self.tail.clear();
+        self.snapshot_inflight = false;
+        self.tail_overflowed = false;
+    }
+
     /// The server declared its history gone (`OUT_OF_RANGE` / `DATA_LOSS`) or
     /// the subscriber decided to drop the rank: forget the cursor so the next
     /// stream is taken from wherever it starts.
@@ -299,6 +325,7 @@ mod tests {
             timestamp: 0.0,
             events: vec![],
             dp_rank: None,
+            snapshot: None,
         }
     }
 
@@ -451,6 +478,24 @@ mod tests {
         assert_eq!(rank.admit(1, false), Admission::Apply);
         // A clear at or above the cursor is an ordinary event.
         assert_eq!(rank.admit(2, true), Admission::Apply);
+    }
+
+    #[test]
+    fn a_snapshot_chunk_moves_the_cursor_wherever_it_is_stamped() {
+        let mut rank = RankState::default();
+        for seq in 1..=5 {
+            rank.admit(seq, false);
+        }
+        assert_eq!(rank.admit(9, false), Admission::Replay { expected: 6 });
+        rank.resync_to(40);
+        assert_eq!(rank.cursor(), Cursor::Live(40));
+        assert!(rank.replay_pending().is_none());
+        assert_eq!(rank.admit(41, false), Admission::Apply);
+        // Below the cursor as well: a stale cursor is replaced, not restarted.
+        rank.reconnected();
+        rank.resync_to(3);
+        assert_eq!(rank.admit(4, false), Admission::Apply);
+        assert_eq!(rank.resume_from(), 4);
     }
 
     #[test]

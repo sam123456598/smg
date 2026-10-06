@@ -26,6 +26,31 @@ message KvEventBatch {
   double timestamp = 2;
   repeated KvCacheEvent events = 3;
   optional int32 dp_rank = 4;
+  // Set when this batch is one chunk of a relay state snapshot rather than a
+  // batch the publisher sent (see KvSnapshotChunk). Fields 5 and 6 are left
+  // for the publisher-epoch proposal in crates/kv_index/docs/recovery-protocol.md.
+  KvSnapshotChunk snapshot = 7;
+}
+
+// One chunk of a state snapshot. A relay that keeps a bounded history serves a
+// subscriber without a usable cursor (start_sequence_number 0 once the history
+// no longer reaches back to the publisher's first batch) the engine's live
+// blocks as it recorded them from the stream, instead of live events only. The
+// `count` chunks of one snapshot carry consecutive sequence numbers ending at
+// the sequence the state was taken at, so live events continue after the last
+// chunk with no gap and no duplicate. Chunk 0 begins with an AllBlocksCleared
+// for the rank; the Stored events that follow list every live block, one event
+// per physical copy, parents before children, with the fields the original
+// store carried. Synthesized events have event_id 0. A subscriber applies the
+// chunks as a resync of the worker's state and sets its cursor to each chunk's
+// sequence number.
+message KvSnapshotChunk {
+  // 0-based position of this chunk in the snapshot.
+  uint32 index = 1;
+  // Chunks in the snapshot.
+  uint32 count = 2;
+  // Live blocks in the whole snapshot, physical copies counted.
+  uint64 blocks = 3;
 }
 
 message KvCacheEvent {
