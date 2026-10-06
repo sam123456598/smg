@@ -124,7 +124,10 @@ jobs:
           persist-credentials: false
 
       # The plain fixture tree, as the tests read it: each model's manifest,
-      # its table of sets, and the sets as JSON Lines.
+      # its table of sets, and the sets as JSON Lines. `--locked` runs the
+      # command on the package versions bellwether locked at the pinned
+      # commit, and fails if its lock file is out of date, instead of
+      # resolving anew against PyPI.
       - name: Install uv
         if: steps.pin.outputs.available == 'true'
         uses: astral-sh/setup-uv@v7
@@ -134,7 +137,7 @@ jobs:
 
       - name: Unpack the fixtures
         if: steps.pin.outputs.available == 'true'
-        run: uv run --project .bellwether bellwether unpack --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
+        run: uv run --locked --project .bellwether bellwether unpack --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
 
       # This job builds three test targets and nothing else, so it keeps its
       # own cache entry instead of racing the full builds for theirs.
@@ -146,10 +149,11 @@ jobs:
 
       # The tests fetch each model's tokenizer files from Hugging Face once, at
       # the revision its manifest pins, into these directories. Which files
-      # are there depends on the manifests and on the list each test asks for,
-      # so the key is the hash of both: moving the pin to a commit with the
-      # same models stores nothing new, and a test that asks for one more file
-      # gets a new entry that starts from the old one.
+      # are there depends on the manifests the tests read (the unpacked copy)
+      # and on the list each test asks for, so the key is the hash of both:
+      # moving the pin to a commit with the same models stores nothing new,
+      # and a test that asks for one more file gets a new entry that starts
+      # from the old one.
       - name: Cache tokenizer files
         if: steps.pin.outputs.available == 'true'
         uses: actions/cache@v6
@@ -157,7 +161,7 @@ jobs:
           path: |
             crates/tokenizer/.tokenizer_cache/bellwether
             model_gateway/.tokenizer_cache/bellwether
-          key: bellwether-tokenizers-${{ hashFiles('.bellwether/fixtures/*/manifest.toml', 'model_gateway/tests/bellwether_*.rs', 'crates/tokenizer/tests/bellwether_*.rs') }}
+          key: bellwether-tokenizers-${{ hashFiles('.bellwether/fixtures-plain/*/manifest.toml', 'model_gateway/tests/bellwether_*.rs', 'crates/tokenizer/tests/bellwether_*.rs') }}
           restore-keys: |
             bellwether-tokenizers-
 
