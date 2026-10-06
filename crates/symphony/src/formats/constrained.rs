@@ -1,4 +1,4 @@
-//! Constrained: the output a grammar forced for the request's `tool_choice`, with no markers at all.
+//! Constrained: the output a grammar forced for the request's `tool_choice`, without markers.
 //!
 //! When a request names one function (`tool_choice: {"type": "function", ...}`), the gateway
 //! constrains the engine to that function's parameter schema, and the whole output is the arguments
@@ -13,24 +13,24 @@
 //! the first byte of the value, named by the request (its `source` is empty, since no output byte
 //! names it), and its argument fragments are the output's bytes for as long as they keep the
 //! arguments a valid JSON prefix; from the first byte that does not, the bytes come back as
-//! `Malformed` with `InvalidArguments`. Once the value is whole, the whitespace after it is dropped,
-//! and from the first byte that is not whitespace everything to the end is `Malformed` with
-//! `Other`. The call ends when the output ends, whole or not, so a value cut
-//! short is a call with what arrived, as the assembler does for an object that never closed.
+//! `Malformed` with `InvalidArguments`. Once the value is whole, the whitespace after it is
+//! dropped, and from the first byte that is not whitespace everything to the end is `Malformed`
+//! with `Other`. The call ends when the output ends, whole or not, so a value cut short is a call
+//! with what arrived, as the assembler does for an object that never closed.
 //!
 //! Required: the list's brackets and commas are `Dropped { Wrapper }`, the whitespace between them
-//! `Dropped { Whitespace }`, and each object goes to an [`Assembler`], which emits the call's events
-//! and says where the object ended. An output that does not begin with a list, bytes where a call,
-//! a comma or the list's end should be, and bytes after the list that are not whitespace come back
-//! as `Malformed` with `Other`, from the first such byte to the end. A list cut short ends with what
-//! arrived: the assembler closes a started call, and an object that never named a call comes back
-//! as `Malformed`.
+//! `Dropped { Whitespace }`, and each object goes to an [`Assembler`], which emits the call's
+//! events and says where the object ended. An output that does not begin with a list, bytes where a
+//! call, a comma or the list's end should be, and bytes after the list that are not whitespace come
+//! back as `Malformed` with `Other`, from the first such byte to the end. A list cut short ends
+//! with what arrived: the assembler closes a started call, and an object that never named a call
+//! comes back as `Malformed`.
 //!
 //! Every byte of the output lands in exactly one event; every text event carries its token count
 //! from the [`Ledger`]; call ids are `call_<index>`, as in every format until the id scheme is
 //! decided; the engine's finish reason is kept, with `tool_calls` counting the calls that started.
-//! Reasoning cannot occur, since the grammar leaves no room for it, and the prompt is accepted first
-//! in the lifecycle and otherwise ignored.
+//! Reasoning cannot occur, since the grammar leaves no room for it, and the prompt is accepted
+//! first in the lifecycle and otherwise ignored.
 
 use super::finish_reason;
 use crate::{

@@ -114,7 +114,8 @@ const REQUIRED_OUTPUTS: &[&str] = &[
     "",
     "[]",
     "[{\"name\": \"f\", \"parameters\": {}}]",
-    "[{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}, {\"name\": \"get_time\", \"parameters\": {\"zone\": \"CET\"}}]",
+    "[{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}, \
+     {\"name\": \"get_time\", \"parameters\": {\"zone\": \"CET\"}}]",
     " [ {\"name\": \"f\", \"parameters\": {\"a\": 1}} , {\"name\": \"g\", \"parameters\": {}} ] \n",
     "[{\"name\": \"f\", \"parameters\": {\"a\": [1,",
     "[{\"parameters\": {}, \"name\": \"f\"}]",
