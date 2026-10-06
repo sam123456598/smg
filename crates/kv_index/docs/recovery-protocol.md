@@ -174,6 +174,22 @@ is): with a trickle of unique prompts at 10 req/s after the restart, the returne
 first request 0.3 s into the trickle, on the first slice decision; the run made 20 slice decisions
 in all, and the returned worker applied 2,707 batches in the remaining 80 s.
 
+**Thin workers (added 2026-10-06).** The age rule alone left a worker idle for good once a resync
+had emptied its index while its engine kept its cache: after a publisher restart in the soaks (s5,
+s6) every prompt still had an overlap on some other worker, the affinity stage never produced a
+miss, and the slice did not apply because a publisher restart is not a re-admission (a worker that
+restarts with an empty cache is caught instead by the policy's KV-imbalance gate, its usage being
+zero against a full fleet). The slice now serves a worker that is thin: admitted within
+`--worker-warmup-secs`, or, whatever its age, holding less than `--worker-warmup-thin-ratio` (a half)
+of the fleet's level (the median index size over the healthy workers) or nothing, once the fleet's
+level is at least `--worker-warmup-blocks` (a cache worth catching up to). A thin worker stays
+eligible until its index has grown by the warm-up blocks since it became thin; the growth baseline
+restarts whenever the index count drops, so a resync after a publisher restart, an `OUT_OF_RANGE` or
+`DATA_LOSS` resubscription, or an engine that comes back empty all open a warm-up without a
+re-admission. A thin worker is served even in a young fleet; workers warming only because they are
+young are served only when the fleet is not all young. A few blocks of overlap count as a head only
+when they are under half of the request, so a short request cached whole stays with its holder.
+
 **Gateway restart.** Measured in phases with the fleet re-registered by the drill: `/health` up
 in 0.3 to 1.4 s, eight registrations accepted within 0.1 s of that, the first worker routable at
 0.6 to 1.9 s, the whole fleet at 0.7 to 2.2 s (0.7 s on the evening run), whether the load generator is capped at 5 or 40
@@ -269,6 +285,8 @@ mock's dump is its engine keys while the index keeps content hashes, and a gatew
 proposed, not started (section 6 below). The fleet's steady cached/oracle ratio is 0.974 in every
 run; the recovery checks return to that value, and the gap to 0.98 is the workload's (eight fixed
 prompts whose first visit on each worker is a miss the oracle counts), not a recovery matter.
+The publisher-restart rows' hit/oracle after the fault (79 to 80 % against 85 to 88 % in the
+earlier passes) is the drill's own trickle, whose tails are new by construction, not the slice.
 
 Binaries (built from the pushed head c719dea6; the loop head moved to ce53d732 before this table was
 written with changes to `kv_index`, the mock and the documents only, so the gateway under test is
@@ -290,7 +308,7 @@ every log under `~/smg-perf/results/chaos-*-20261005-21{29..46}*/`, verdicts in 
 | gateway restarted under load (SIGKILL, fleet re-registered) | direct | serving again <= 10 s; p99 over the run spanning the restart <= 2x the steady p99 + 0.5 s; no hung stream | PASS: serving again 0.8 s (`/health` 0.4 s, registrations 0.5 s, first worker 0.6 s); p99 0.58 -> 0.64 s (load capped at 40 req/s per generator) | `/health`, `/workers` |
 | 20 event batches dropped on the wire | direct | gap detected (`replay_requested` >= 1); batches apply after | PASS: gap seen 0.6 s after the drop, replayed by the engine (20 missed, recovered); 738 batches applied after | `smg_kv_event_gaps_total{outcome="replay_requested"}`, `smg_kv_event_missed_batches_total` |
 | publisher delayed 1.5 s for 10 s | direct | mean apply lag over the window >= 0.75 s; batches apply | PASS: mean lag 1.49 s over 267 batches | `smg_kv_event_lag_seconds` |
-| publisher restarted (cache kept, sequence back to 1) | direct | a resync counted after the fault (baseline before arming it); batches apply after; **and** the worker is routed to again within 10 s and its applied counter keeps climbing (added 2026-10-06 after the soaks) | FAIL as of fe58b2a2, request success only: `publisher_restart` resync 0.2 s after the restart and 14 batches applied after it, but the soaks (s5, s6) showed the emptied worker never routed to again (its index empty, every prompt holds an overlap elsewhere, and the warm-up slice keys on admission) and its applied counter frozen while the mock kept publishing; both under repair in the recovery lane | `smg_kv_event_resyncs_total{reason="publisher_restart"}`, engine admission count, `smg_kv_event_batches_total{disposition="applied"}` |
+| publisher restarted (cache kept, sequence back to 1) | direct | a resync counted after the fault (baseline before arming it); batches apply after; **and** the worker is routed to again within 10 s and its applied counter keeps climbing (added 2026-10-06 after the soaks) | FAIL as of fe58b2a2, request success only: `publisher_restart` resync 0.2 s after the restart and 14 batches applied after it, but the soaks (s5, s6) showed the emptied worker never routed to again (its index empty, every prompt holds an overlap elsewhere, and the warm-up slice keyed on admission); the frozen applied counter was that starvation, not an ingestion loss (hand reproduction: the new generation's batches apply, +20 of 20, then the engine publishes nothing because nothing is routed to it). PASS with the thinness rule (leap/recovery-p1 127ba04f, gateway sha256 f96791c60a43766828ba29a8182e19fb5b96bccf51e09775c8a117afedf030a4, mock as above; 04:25, `chaos-restart-publisher-20261006-042500`): resync 0.2 s; the emptied worker routed to again 0.3 s into a trickle of requests sharing a four-block head with the fleet's holders (34 requests to it, 39 slice decisions), its applied counter up by 170 after the clear, its index regrown from 10 to 1,043 blocks (a quarter of the fleet's 4,207: the slice stops at the warm-up blocks by design, affinity to its own blocks takes over) | `smg_kv_event_resyncs_total{reason="publisher_restart"}`, engine admission count, `smg_kv_event_batches_total{disposition="applied"}`, `smg_cache_aware_policy_branch_total{branch="warmup_slice"}` |
 | engine frozen 8 s (SIGSTOP, then SIGCONT) | direct | no hung stream; back after SIGCONT; RSS growth < 512 MB | PASS: back 0.0 s after SIGCONT; slowest 2.05 s; RSS +46 MB over the stall | `/workers`, `smg_kv_event_lag_seconds` |
 | engine CPU-starved 15 s (eight busy loops on its two cores) | direct | no hung stream; slowest < 60 s; healthy after the hogs; RSS growth < 512 MB | PASS: healthy 0.0 s after the hogs stopped; slowest 0.70 s; RSS +58 MB | `/workers` |
 | overload, 512 streams (8x the harness's 64) | direct | no hung stream; slowest < 60 s; RSS growth < 1,024 MB | PASS: p99 1.39 s, slowest 1.45 s, RSS +96 MB | load generator, RSS |
@@ -298,7 +316,7 @@ every log under `~/smg-perf/results/chaos-*-20261005-21{29..46}*/`, verdicts in 
 | gap beyond the relay's window (100 batches; the first gateway's link to the busiest relay cut 15 s while a second gateway keeps the engine publishing) | relay | a `snapshot` resync after the cut; nothing settled as unrecovered; no degraded rank; index within 1 % <= 10 s and equal once the load is over | PASS: out of routing 2.0 s into the cut, back 0.0 s after the heal; the cursor lay below the window: `OUT_OF_RANGE`, resubscription from zero, snapshot resync 17.3 s after the cut (15 s of blackhole plus the reconnect), one chunk; index within 1 % 0.4 s later and equal once the load was over; no unrecovered gap, no degraded rank | `smg_kv_event_resyncs_total{reason="out_of_range"}` then `{reason="snapshot"}`, `smg_kv_event_gaps_total`, `smg_kv_index_blocks` |
 | 20 event batches dropped on the wire | relay | relay `publisher_gaps` >= 1 with `gap_batches_lost` 0; gateway unrecovered 0; applied batches keep growing | PASS: the relay saw the gap 0.6 s after it was armed and refilled it from the engine's replay (recovered 21, lost 0); the gateway saw no gap (`replay_requested` 0, unrecovered 0, missed 0); 865 batches applied after | relay counters, `smg_kv_event_gaps_total` |
 | publisher delayed 1.5 s for 10 s | relay | mean apply lag over the window >= 0.75 s; batches apply | PASS: mean lag 1.48 s over 420 batches | `smg_kv_event_lag_seconds` |
-| publisher restarted (cache kept) | relay | a resync counted after the fault; batches apply after; the worker routed to again within 10 s | FAIL as of fe58b2a2 for the same reason, request success only: the relay reads the restart on the next batch and ends the stream with `DATA_LOSS`, `data_loss` resync 0.2 s after the restart, 12 batches applied after it, none stale; routing back to the emptied worker is the open P1 | `smg_kv_event_resyncs_total{reason="data_loss"}` |
+| publisher restarted (cache kept) | relay | a resync counted after the fault; batches apply after; the worker routed to again within 10 s | FAIL as of fe58b2a2 for the same reason, request success only: the relay reads the restart on the next batch and ends the stream with `DATA_LOSS`, `data_loss` resync 0.2 s after the restart, 12 batches applied after it, none stale. PASS with the thinness rule (127ba04f, wheel from fe58b2a2 as above; 04:26, `chaos-restart-publisher-20261006-042612`): `data_loss` resync 0.2 s; routed to again 0.3 s into the shared-head trickle (34 requests, 39 slice decisions), applied up by 168 after the clear, index regrown from 16 to 1,073 blocks (0.24 of the fleet's 4,494) | `smg_kv_event_resyncs_total{reason="data_loss"}`, `smg_cache_aware_policy_branch_total{branch="warmup_slice"}` |
 
 Re-run of the relay gateway-restart row on the servicer lane's ec2121b7 (the relay replays from
 zero when its first batch is past sequence 1): still FAIL for the other half of the race, four
