@@ -186,13 +186,6 @@ impl ProviderProfile {
     }
 }
 
-/// Whether a model id names the canonical DeepSeek V4.1 Flash checkpoint,
-/// whose renderer defaults differ from V4's. The gateway's V4.1-only request
-/// framing uses this too, so both sides agree on which ids get V4.1 thinking.
-pub fn is_deepseek_v41_flash(model: &str) -> bool {
-    deepseek::is_v41_model(model)
-}
-
 /// Case-insensitive ASCII prefix test that does not allocate.
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     s.get(..prefix.len())

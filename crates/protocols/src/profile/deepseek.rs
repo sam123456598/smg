@@ -25,7 +25,7 @@ pub(super) fn matches_model(segment: &str) -> bool {
     .any(|model| segment.eq_ignore_ascii_case(model))
 }
 
-pub(super) fn is_v41_model(model: &str) -> bool {
+fn is_v41_model(model: &str) -> bool {
     model
         .split('/')
         .any(|segment| segment.eq_ignore_ascii_case("deepseek-v4.1-flash"))
