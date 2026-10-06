@@ -320,11 +320,14 @@ series with interleaved controls (`bisect-dynamo-head2b20q[-localmem]`,
 | local (`cpunodebind=0 membind=0`) | 924.0M (346 ms) | 992.9M (97.4%, 96.6%, 98.0%) | 918.1 [916.1, 919.4] | 15.5 | 16 of 22 (3 discarded) | 2.7 [2.7, 2.7] / 9.9 [9.9, 10.0] | 917.9 [914.5, 918.9], 12 of 20 |
 
 These are the competitor's top-of-stack rows: 744.5M interleaved against the 682.2M published for
-`50bdb355f8` (+9%), 924.0M local against 859.7M (+7%), lookups unchanged. Whether the gain is the
-head's chunked idle drain or the quieter host than the earlier brackets had is settled by the
-measured `50bdb355f8` binary at these same points in the same session (`competitor-head/newpoints-*`,
-reported with the rows); the two systems' same-binary ratio with local memory becomes 1,383.8M
-against 924.0M = 1.50x at p99 3-4 against 10 us.
+`50bdb355f8` (+9%), 924.0M local against 859.7M (+7%), lookups unchanged. The gain is the host, not
+the head: the measured `50bdb355f8` binary and the new one, interleaved at these points half an
+hour later (`competitor-head/newpoints-*`), read 99.0/98.6/98.3% against 97.9/96.5/98.0% at 744.5M
+and 99.5/98.2/99.4% against 99.4/99.4/98.8% at 924.0M, indistinguishable within trial noise and
+both below the points' own series medians, so the two heads are one system at this protocol's
+resolution and the row to cite for either is the 20-trial series above (kept up 13 of 20 and 16
+of 22, the shortfalls being the editor server). The two systems' same-binary ratio with local
+memory is 1,383.8M against 924.0M = 1.50x at p99 3-4 against 10 us.
 
 ## Scaled layout: equal backend cores and same-binary rows
 
