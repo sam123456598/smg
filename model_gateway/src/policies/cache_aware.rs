@@ -1819,6 +1819,8 @@ impl CacheAwarePolicy {
             return None;
         }
         let mut pick: Option<(usize, usize)> = None;
+        let mut tied = 0u32;
+        let mut rng = rand::rng();
         for &position in &table.warming {
             let idx = position as usize;
             let Some(worker) = workers.get(idx) else {
@@ -1838,8 +1840,20 @@ impl CacheAwarePolicy {
             ) {
                 continue;
             }
-            if pick.is_none_or(|(_, load)| state.load < load) {
-                pick = Some((idx, state.load));
+            match pick {
+                Some((_, load)) if state.load > load => {}
+                Some((_, load)) if state.load == load => {
+                    // Equal loads draw uniformly: an idle warming fleet must
+                    // not hand every slice to its lowest position.
+                    tied += 1;
+                    if rng.random_range(0..=tied) == 0 {
+                        pick = Some((idx, state.load));
+                    }
+                }
+                _ => {
+                    pick = Some((idx, state.load));
+                    tied = 0;
+                }
             }
         }
         let (idx, _) = pick?;

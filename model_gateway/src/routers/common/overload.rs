@@ -19,6 +19,7 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderValue},
     response::Response,
 };
+use rand::RngExt;
 use tracing::debug;
 
 use crate::{
@@ -98,10 +99,12 @@ pub fn fallback_if_all_overloaded(
     if !all_overloaded(candidates) {
         return None;
     }
-    let worker = candidates
-        .iter()
-        .filter(|w| w.is_healthy() && w.circuit_breaker_can_execute() && w.stall_reason().is_none())
-        .min_by_key(|w| w.load())?;
+    let worker = least_loaded_uniform(
+        candidates.iter().filter(|w| {
+            w.is_healthy() && w.circuit_breaker_can_execute() && w.stall_reason().is_none()
+        }),
+        &mut rand::rng(),
+    )?;
     Metrics::record_worker_overload_fallback(stage);
     debug!(
         branch = BRANCH_ALL_OVERLOADED_FALLBACK,
@@ -179,6 +182,35 @@ fn shed(branch: &'static str, stage: &'static str, worker: &str, message: String
     );
     mark_non_retryable(&mut response);
     response
+}
+
+/// The least-loaded of `candidates`; one of them drawn uniformly when
+/// several share the lowest load, so a fleet whose workers are all equally
+/// loaded does not send every fallback to the first of them.
+pub(crate) fn least_loaded_uniform<'a, R: RngExt>(
+    candidates: impl Iterator<Item = &'a Arc<dyn Worker>>,
+    rng: &mut R,
+) -> Option<&'a Arc<dyn Worker>> {
+    let mut best: Option<(&'a Arc<dyn Worker>, usize)> = None;
+    let mut tied = 0u32;
+    for worker in candidates {
+        let load = worker.load();
+        match best {
+            Some((_, best_load)) if load > best_load => {}
+            Some((_, best_load)) if load == best_load => {
+                // The k-th tied worker replaces the pick with probability 1/k.
+                tied += 1;
+                if rng.random_range(0..=tied) == 0 {
+                    best = Some((worker, load));
+                }
+            }
+            _ => {
+                best = Some((worker, load));
+                tied = 0;
+            }
+        }
+    }
+    best.map(|(worker, _)| worker)
 }
 
 #[cfg(test)]
@@ -300,6 +332,31 @@ mod tests {
     /// The steering default: an all-overloaded pool routes to its least-loaded
     /// routable worker; a pool with an eligible worker left is not touched,
     /// and a worker that is also unhealthy is never the fallback.
+    #[test]
+    fn equally_loaded_workers_share_the_fallback_and_a_lighter_one_wins() {
+        use rand::{rngs::StdRng, SeedableRng};
+        let pool: Vec<Arc<dyn Worker>> = (0..128)
+            .map(|i| worker(&format!("http://127.0.0.1:{}", 20000 + i), "m"))
+            .collect();
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut hits = vec![0usize; pool.len()];
+        for _ in 0..1000 {
+            let picked = least_loaded_uniform(pool.iter(), &mut rng).expect("a worker");
+            hits[pool.iter().position(|w| Arc::ptr_eq(w, picked)).unwrap()] += 1;
+        }
+        assert!(hits.iter().all(|&h| h >= 1), "{hits:?}");
+        assert!(*hits.iter().max().unwrap() <= 24, "{hits:?}");
+        for (i, w) in pool.iter().enumerate() {
+            if i != 5 {
+                w.increment_load();
+            }
+        }
+        for _ in 0..100 {
+            let picked = least_loaded_uniform(pool.iter(), &mut rng).expect("a worker");
+            assert!(Arc::ptr_eq(picked, &pool[5]));
+        }
+    }
+
     #[test]
     fn all_overloaded_falls_back_to_the_least_loaded_routable_worker() {
         let a = worker("http://127.0.0.1:9831", "m");

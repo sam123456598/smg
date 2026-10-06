@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use axum::{http::HeaderMap, response::Response};
+use rand::RngExt;
 use tracing::{debug, warn};
 
 use crate::{
@@ -354,23 +355,34 @@ fn relaxed_pair(
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
     };
+    // Equal loads draw uniformly (partner and pair alike), so an equally
+    // loaded leg does not send every fallback to its first pair.
+    let mut rng = rand::rng();
     let mut best: Option<(Arc<dyn Worker>, Arc<dyn Worker>)> = None;
+    let mut tied = 0u32;
     for (i, prefill) in pairs.prefill.iter().enumerate() {
         if !routable(prefill) {
             continue;
         }
-        let Some(decode) = pairs.partners[i]
-            .iter()
-            .filter(|d| routable(d))
-            .min_by_key(|d| d.load())
-        else {
+        let Some(decode) = overload::least_loaded_uniform(
+            pairs.partners[i].iter().filter(|d| routable(d)),
+            &mut rng,
+        ) else {
             continue;
         };
-        if best
-            .as_ref()
-            .is_none_or(|(p, d)| (prefill.load(), decode.load()) < (p.load(), d.load()))
-        {
-            best = Some((Arc::clone(prefill), Arc::clone(decode)));
+        let loads = (prefill.load(), decode.load());
+        match best.as_ref().map(|(p, d)| (p.load(), d.load())) {
+            Some(best_loads) if loads > best_loads => {}
+            Some(best_loads) if loads == best_loads => {
+                tied += 1;
+                if rng.random_range(0..=tied) == 0 {
+                    best = Some((Arc::clone(prefill), Arc::clone(decode)));
+                }
+            }
+            _ => {
+                best = Some((Arc::clone(prefill), Arc::clone(decode)));
+                tied = 0;
+            }
         }
     }
     let (prefill, decode) = best?;

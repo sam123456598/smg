@@ -1,11 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
-use rand::RngExt;
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -19,6 +19,13 @@ use crate::worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worke
 /// (a dark fleet is scored by its live in-flight count instead) would
 /// otherwise accumulate them without end; past this the oldest are dropped.
 const SINCE_POLL_DISPATCHES_KEPT: usize = 8_192;
+
+/// Expected waits within this of the minimum are one tie and are drawn from
+/// uniformly. Idle workers with identical reports score exactly equal, but a
+/// report's throughput or a KV digit sets two otherwise identical workers a
+/// few nanoseconds apart, and an exact-equality tie then hands every request
+/// to the lower index: a cold fleet never spreads that way.
+const TIE_EPSILON_SECS: f64 = 1e-6;
 
 /// Since-poll dispatch tally for one worker: the token-work and request count
 /// of the dispatches no report has reflected yet, with each dispatch's
@@ -146,6 +153,9 @@ pub struct LeastLoadPolicy {
     default_throughput: f64,
     /// Per-worker waiting-queue cap; `0` disables the veto.
     max_waiting_requests: u32,
+    /// Seeded source for the tie draw when set (tests reproduce a selection
+    /// sequence with it); the thread's generator otherwise.
+    tie_rng: Option<Mutex<StdRng>>,
 }
 
 /// One worker's expected-wait reading for a selection policy (see
@@ -213,6 +223,24 @@ impl LeastLoadPolicy {
                 DEFAULT_THROUGHPUT
             },
             max_waiting_requests,
+            tie_rng: None,
+        }
+    }
+
+    /// Draw ties from a seeded generator instead of the thread's.
+    pub fn with_tie_break_seed(mut self, seed: u64) -> Self {
+        self.tie_rng = Some(Mutex::new(StdRng::seed_from_u64(seed)));
+        self
+    }
+
+    /// Uniform draw in `0..n`: the reservoir step of the argmin's tie-break.
+    fn tie_draw(&self, n: u32) -> u32 {
+        match &self.tie_rng {
+            Some(rng) => rng
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .random_range(0..n),
+            None => rand::rng().random_range(0..n),
         }
     }
 
@@ -523,24 +551,25 @@ impl LeastLoadPolicy {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let inputs = self.score_inputs(workers, candidates, loads, complete_snapshot, &inflight);
 
-        // Argmin with reservoir tie-breaking: equal-score workers (the common
-        // idle/homogeneous case scores exactly equal) are sampled uniformly
-        // instead of first-index-wins, which herded ties onto one worker.
-        let mut rng = rand::rng();
+        // Argmin with reservoir tie-breaking: workers within
+        // `TIE_EPSILON_SECS` of the minimum (the common idle/homogeneous case
+        // scores equal to the digit) are sampled uniformly instead of
+        // first-index-wins, which herded ties onto one worker.
         let mut best = first;
         let mut best_score = self.score(&workers[best], &inputs);
         let mut tied = 1u32;
         for &idx in rest {
             let s = self.score(&workers[idx], &inputs);
-            if s < best_score {
+            if s < best_score - TIE_EPSILON_SECS {
                 best = idx;
                 best_score = s;
                 tied = 1;
-            } else if s == best_score {
+            } else if (s - best_score).abs() <= TIE_EPSILON_SECS {
                 // Keep each tying candidate with probability 1/k so the final
                 // pick is uniform over all ties without collecting them.
                 tied += 1;
-                if rng.random_range(0..tied) == 0 {
+                best_score = best_score.min(s);
+                if self.tie_draw(tied) == 0 {
                     best = idx;
                 }
             }
@@ -721,6 +750,71 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    #[test]
+    fn a_cold_fleet_of_128_spreads_a_thousand_misses() {
+        // No report anywhere: every worker scores its live in-flight count,
+        // zero for all, so the whole fleet ties on every request.
+        let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..128).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let info = SelectWorkerInfo::default();
+        let mut hits = vec![0usize; workers.len()];
+        for _ in 0..1000 {
+            hits[policy.select_worker(&workers, &info).unwrap()] += 1;
+        }
+        let mean = 1000.0 / workers.len() as f64;
+        assert!(
+            hits.iter().all(|&h| h >= 1),
+            "a worker never chosen: {hits:?}"
+        );
+        let max = *hits.iter().max().unwrap();
+        assert!(
+            max as f64 <= 3.0 * mean,
+            "max {max} over a mean of {mean:.1}: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn a_strictly_cheaper_worker_wins_every_time() {
+        let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..128).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        for (i, worker) in workers.iter().enumerate() {
+            if i != 77 {
+                worker.increment_load();
+            }
+        }
+        let info = SelectWorkerInfo::default();
+        for _ in 0..1000 {
+            assert_eq!(policy.select_worker(&workers, &info), Some(77));
+        }
+    }
+
+    #[test]
+    fn scores_within_epsilon_of_the_minimum_tie() {
+        // Four idle workers whose reports differ by a KV digit far below the
+        // epsilon; an exact-equality tie handed everything to the first.
+        let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..4).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let mut loads = HashMap::new();
+        for (i, worker) in workers.iter().enumerate() {
+            loads.insert(
+                worker.url().to_string(),
+                make_load(0, i as f64 * 1e-9, 100.0),
+            );
+        }
+        policy.update_loads(&loads);
+        let info = SelectWorkerInfo::default();
+        let mut hits = [0usize; 4];
+        for _ in 0..400 {
+            hits[policy.select_worker(&workers, &info).unwrap()] += 1;
+            // Release the winner's credit so every pick sees the same four scores.
+            policy.update_loads(&loads);
+        }
+        assert!(hits.iter().all(|&h| h >= 50), "{hits:?}");
     }
 
     #[test]
