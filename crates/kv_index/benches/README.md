@@ -309,7 +309,7 @@ latencies (p50 3.2-3.6, p99 13-15 us); the first-pass failure and the lower brac
 host's foreign load during those minutes (results: `competitor-head/`, `bisect-dynamo-head2b20`,
 `protocol/dynamo-sustained-head2b20`).
 
-Quiet-host rows for the new head (02:15-02:56 on 2026-10-06, host load 16-22, the editor server
+Quiet-host rows for the new head (02:15-02:56 on 2026-10-06, host load 16-22, another user's editor server
 still present and costing discards), competitor layout, brackets with verified ends and 20-trial
 series with interleaved controls (`bisect-dynamo-head2b20q[-localmem]`,
 `protocol/dynamo-sustained-head2b20q[-localmem]`):
@@ -326,10 +326,10 @@ hour later (`competitor-head/newpoints-*`), read 99.0/98.6/98.3% against 97.9/96
 and 99.5/98.2/99.4% against 99.4/99.4/98.8% at 924.0M, indistinguishable within trial noise and
 both below the points' own series medians, so the two heads are one system at this protocol's
 resolution and the row to cite for either is the 20-trial series above (kept up 13 of 20 and 16
-of 22, the shortfalls being the editor server).
+of 22, the shortfalls being another user's editor server).
 
 The chain index (formerly the run index) re-measured in the same conditions (06:52-07:28 on 2026-10-06, competitor layout,
-the same harness build as the local-memory rows, kv-index `9f9c7c04`; the editor server closed,
+the same harness build as the local-memory rows, kv-index `9f9c7c04`; that editor server closed,
 the soaks running from 07:00; `bisect-dynrun-quiet[-localmem]`, `protocol/dynrun-sustained-quiet[-localmem]`):
 
 | Memory | Keeps up at | Fails at (trials) | Series at the kept-up point: achieved median [95% CI] (M) | Per lane core (M) | Kept up | Lookup p50 / p99 (us) | Control |
@@ -588,7 +588,7 @@ and neither system was changed for either.
 #### Kept-up points and 20-trial series under local memory
 
 Same harness, layout and binaries, `numactl --cpunodebind=0 --membind=0` throughout (19:50-21:00,
-other users' jobs on the host costing discards: an editor server at up to 28 cores, a
+other users' jobs on the host costing discards: an editor's remote server at up to 28 cores, a
 configuration agent, a package proxy). Brackets as in the threshold search above (3 fresh
 processes per point, all three at 99% with a valid generator, geometric bisection to within 10%,
 verified ends, generator-invalid points marked); series as in the publication protocol (20 usable
@@ -628,8 +628,8 @@ Replayer from `ce53d732` (`--shards`, `--lane-memory`), layout agreed with the i
 cores 8-71 and 72-135 (64 + 64), 128 event lanes pinned one per core so `--shards 2` follows the
 NUMA node, 128 query lanes, event issuers 0-3 and 136-139, query issuers 4-7 and 140-143,
 `--issuer-by-lane`. The 00:10-02:15 window on 2026-10-06 ran with other users' jobs on the
-measurement cores throughout (an editor server floating at 1.6-11 cores, a backup's tar and zstd,
-git, chef), so every row below is labelled loaded host and the clean repeat is scheduled; the
+measurement cores throughout (an editor's remote server floating at 1.6-11 cores, a backup's tar
+and zstd, git, a configuration agent), so every row below is labelled loaded host and the clean repeat is scheduled; the
 protocol's half-core rule replaced shortfalls under foreign load (up to five per point in the
 rescued brackets) and every trial's foreign processes and their cores are in the records.
 
@@ -664,9 +664,10 @@ rescued brackets) and every trial's foreign processes and their cores are in the
 
 ### T7, second window (host daemons present): issuer-built payloads
 
-The 05:00-07:00 window on 2026-10-06 had the editor server closed and no builds, but host daemons
-and other users' jobs sat above half a core in most samples (dotsync2 at about one core, the bpf
-usage tracer, polkitd, mcdaemon, chef-client, a cf_manager service, certreq); the half-core rule
+The 05:00-07:00 window on 2026-10-06 had that editor server closed and no builds, but host daemons
+and other users' jobs sat above half a core in most samples (a file-sync daemon at about one core, a
+BPF tracing daemon, a policy daemon, a cache daemon, a configuration agent, a service manager, a
+certificate agent); the half-core rule
 replaced every trial of the first pass, so from 05:07 those names were recorded as background for
 the window and the rule kept for everything else, and every row is labelled as such. Layout as in
 the first window with two cores per socket left free (lanes 10-71 and 72-133, 124 pinned lanes,
@@ -700,9 +701,10 @@ read a socket-wide shift of socket 1's lane cost that varies by trial (66-84 ns 
 54 in the others) rather than particular lanes sharing cores with daemons. The duplicated-content
 share of the two shards is 2.3% (1,566,806 summed distinct blocks over 1,532,076), arena 53.0 MB
 against 47.7 MB. Which cores the host's daemons favour, from the window's 300+ samples
-(`foreign-cores.py`): the bpf usage tracer is pinned to core 103, falcon_proxy to 129, strobelight
-to 45, smc_proxy to 52; the floating ones (the editor's native server, polkitd, dotsync2, below,
-fetch_krl) concentrate on socket 1's lane cores 121-128, 138-139 and 87. The sampler now records
+(from the window's records): the BPF tracing daemon is pinned to core 103, a monitoring proxy to
+129, a profiler to 45 and a service proxy to 52; the floating ones (an editor's native server, the
+policy daemon, the file-sync daemon, a resource monitor, a key-revocation fetcher) concentrate on
+socket 1's lane cores 121-128, 138-139 and 87. The sampler now records
 every thread's core per flagged process and each socket's mean frequency before and after every
 trial (`t7-table.py --trials <row>` joins them per trial), and the next two-socket row is the
 index's owners' stealing lanes, since freeing cores does not remove a socket-wide shift.
