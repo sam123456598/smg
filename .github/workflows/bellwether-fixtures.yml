@@ -12,7 +12,12 @@ name: Bellwether Fixtures
 #
 # The fixtures come from the bellwether commit in
 # .github/versions/bellwether.ref. To move to newer fixtures, change that hash:
-# the pull request that does it runs against the new commit.
+# the pull request that does it runs against the new commit. bellwether keeps
+# its benchmark sets compressed, so the job unpacks the fixture tree with
+# bellwether's own command and the tests read the plain copy. A set that is
+# compressed is fetched from bellwether's LFS store by that command, which
+# needs the token in that step once such sets are pinned; today every pinned
+# set is plain.
 #
 # bellwether is private, so the checkout needs the BELLWETHER_READ_TOKEN secret
 # (read access to that repository's contents). A pull request from a fork, or
@@ -118,6 +123,19 @@ jobs:
           path: .bellwether
           persist-credentials: false
 
+      # The plain fixture tree, as the tests read it: each model's manifest,
+      # its table of sets, and the sets as JSON Lines.
+      - name: Install uv
+        if: steps.pin.outputs.available == 'true'
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: .bellwether/uv.lock
+
+      - name: Unpack the fixtures
+        if: steps.pin.outputs.available == 'true'
+        run: uv run --project .bellwether bellwether unpack --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
+
       # This job builds three test targets and nothing else, so it keeps its
       # own cache entry instead of racing the full builds for theirs.
       - name: Setup Rust
@@ -151,7 +169,7 @@ jobs:
         if: steps.pin.outputs.available == 'true'
         timeout-minutes: 45
         env:
-          BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures
+          BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
         run: |
           source "$HOME/.cargo/env"
           cargo test -p llm-tokenizer -p smg -p smg-symphony --test 'bellwether_*' -- --nocapture
