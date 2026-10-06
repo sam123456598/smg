@@ -828,6 +828,7 @@ impl PositionalIndexer {
 
         let mut prev_prefix = parent_prefix;
         let mut num_new_blocks = 0usize;
+        let mut num_moved = 0usize;
         // One coarse stamp per batch — cheaper than per-block clock reads and
         // precise enough for prune's second-granularity TTL.
         let now = self.now_secs();
@@ -862,7 +863,28 @@ impl PositionalIndexer {
             // pruned (its stale reverse mapping kept) restores its count —
             // mirroring apply_removed, which decrements only memberships
             // actually removed.
-            worker_blocks.insert(block.seq_hash, (position, content_hash, prefix_hash));
+            // A hash this worker already held at another place (a store without its parent
+            // followed by the whole chain, as the gateway's fallback produces) is held at the
+            // new place only: the latest store wins, and the old membership goes.
+            if let Some(old) =
+                worker_blocks.insert(block.seq_hash, (position, content_hash, prefix_hash))
+            {
+                if old != (position, content_hash, prefix_hash) {
+                    let (old_position, old_content, old_prefix) = old;
+                    if let Entry::Occupied(mut occupied) =
+                        self.index.entry((old_position, old_content))
+                    {
+                        let (removed, now_empty) =
+                            occupied.get_mut().seq.remove(old_prefix, worker_id);
+                        if now_empty {
+                            occupied.remove();
+                        }
+                        if removed {
+                            num_moved += 1;
+                        }
+                    }
+                }
+            }
             if membership_added {
                 num_new_blocks += 1;
             }
@@ -870,8 +892,10 @@ impl PositionalIndexer {
         }
 
         // Atomically update tree_sizes — lock-free array index.
-        if num_new_blocks > 0 {
-            self.tree_sizes.add(worker_id, num_new_blocks);
+        if num_new_blocks > num_moved {
+            self.tree_sizes.add(worker_id, num_new_blocks - num_moved);
+        } else if num_moved > num_new_blocks {
+            self.tree_sizes.sub(worker_id, num_moved - num_new_blocks);
         }
 
         Ok(())
@@ -1370,6 +1394,67 @@ impl fmt::Debug for PositionalIndexer {
 
 #[cfg(test)]
 mod tests {
+    /// The gateway's parent-missing fallback: b4 and b5 stored without a parent land at
+    /// positions 0 and 1; when the engine announces the chain whole they move to 4 and 5 and
+    /// their old memberships go, so the count reads six and a query for the pair alone scores
+    /// nothing.
+    #[test]
+    fn a_hash_stored_again_at_another_position_releases_its_old_place() {
+        use super::{
+            compute_content_hash, ContentHash, PositionalIndexer, SequenceHash, StoredBlock,
+            WorkerBlockMap,
+        };
+        let indexer = PositionalIndexer::new(8);
+        let worker = indexer.intern_worker("w").expect("id");
+        let mut map = WorkerBlockMap::default();
+        let contents: Vec<ContentHash> = (0..6)
+            .map(|p| compute_content_hash(&[31, p as u32]))
+            .collect();
+        let mut prefix = None::<u64>;
+        let blocks: Vec<StoredBlock> = contents
+            .iter()
+            .map(|&content| {
+                let next = match prefix {
+                    Some(prev) => PositionalIndexer::compute_next_seq_hash(prev, content.0),
+                    None => content.0,
+                };
+                prefix = Some(next);
+                StoredBlock {
+                    seq_hash: SequenceHash(next),
+                    content_hash: content,
+                }
+            })
+            .collect();
+        indexer
+            .apply_stored(worker, &blocks[..4], None, &mut map)
+            .expect("b0..b3");
+        indexer.apply_removed(worker, &[blocks[2].seq_hash, blocks[3].seq_hash], &mut map);
+        indexer
+            .apply_stored(worker, &blocks[4..], None, &mut map)
+            .expect("fallback");
+        assert_eq!(indexer.current_size(), 4);
+        assert_eq!(
+            indexer
+                .find_matches(&contents[4..], false)
+                .scores
+                .get(&worker),
+            Some(&2)
+        );
+        indexer
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("whole");
+        assert_eq!(indexer.current_size(), 6);
+        assert_eq!(map.len(), 6);
+        assert_eq!(
+            indexer.find_matches(&contents, false).scores.get(&worker),
+            Some(&6)
+        );
+        assert!(!indexer
+            .find_matches(&contents[4..], false)
+            .scores
+            .contains_key(&worker));
+    }
+
     /// The streaming hasher this function used before; the one-shot path must
     /// stay bit-identical because workers report hashes computed the old way.
     fn streaming_content_hash(token_ids: &[u32]) -> ContentHash {

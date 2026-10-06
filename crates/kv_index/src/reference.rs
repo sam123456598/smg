@@ -42,8 +42,22 @@ impl WorkerBlocks {
         content: ContentHash,
         prefix: SequenceHash,
     ) {
-        self.by_engine_hash
-            .insert(engine_hash, (position, content, prefix));
+        // A hash stored again at another place (a store without its parent followed by the
+        // whole chain) is held at the new place only, as the production indexers hold it.
+        if let Some(old) = self
+            .by_engine_hash
+            .insert(engine_hash, (position, content, prefix))
+        {
+            if old != (position, content, prefix) {
+                let (old_position, old_content, old_prefix) = old;
+                if let Some(prefixes) = self.by_position.get_mut(&(old_position, old_content)) {
+                    prefixes.remove(&old_prefix);
+                    if prefixes.is_empty() {
+                        self.by_position.remove(&(old_position, old_content));
+                    }
+                }
+            }
+        }
         self.by_position
             .entry((position, content))
             .or_default()

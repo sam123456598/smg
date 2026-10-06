@@ -255,11 +255,14 @@ impl RunBlockMap {
     }
 
     /// Insert `count` consecutive blocks starting at `first` for the keys given, with the home
-    /// slots touched `AHEAD` keys early: the lane map writes of one store.
+    /// slots touched `AHEAD` keys early: the lane map writes of one store. A key already present
+    /// moves to its new place and `on_moved` sees its old and new places (a block the engine
+    /// stored again at the same place passes through here unchanged).
     pub fn insert_run(
         &mut self,
         keys: impl ExactSizeIterator<Item = SequenceHash> + Clone,
         first: BlockRef,
+        mut on_moved: impl FnMut(BlockRef, BlockRef),
     ) {
         self.reserve(keys.len());
         let mut ahead = keys.clone();
@@ -276,6 +279,13 @@ impl RunBlockMap {
             };
             match self.probe(key.0) {
                 Ok(slot) => {
+                    let old = BlockRef {
+                        run: self.slots[slot].run,
+                        offset: self.slots[slot].offset,
+                    };
+                    if old != at {
+                        on_moved(old, at);
+                    }
                     self.slots[slot].run = at.run;
                     self.slots[slot].offset = at.offset;
                 }
@@ -398,7 +408,7 @@ mod tests {
                     let keys: Vec<SequenceHash> =
                         (0..(rng.next() % 60)).map(|_| key(&mut rng)).collect();
                     let first = at(rng.next());
-                    table.insert_run(keys.iter().copied(), first);
+                    table.insert_run(keys.iter().copied(), first, |_, _| {});
                     for (index, k) in keys.iter().enumerate() {
                         model.insert(
                             *k,
@@ -486,7 +496,7 @@ mod tests {
         table.remove_all(&[SequenceHash(1), SequenceHash(2)], |_| {
             panic!("nothing to remove")
         });
-        table.insert_run(std::iter::empty(), at(0));
+        table.insert_run(std::iter::empty(), at(0), |_, _| {});
         assert!(table.is_empty());
         assert!(table.insert(SequenceHash(1), at(1)).is_none());
         assert_eq!(table.capacity(), MIN_SLOTS);

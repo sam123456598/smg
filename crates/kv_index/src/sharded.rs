@@ -253,6 +253,7 @@ impl ShardedRunIndex {
             total.slab_bytes += stats.slab_bytes;
             total.engine_conflicts += stats.engine_conflicts;
             total.landing_mismatches += stats.landing_mismatches;
+            total.moved_hashes += stats.moved_hashes;
         }
         total
     }

@@ -1094,6 +1094,10 @@ pub struct RunIndexStats {
     /// the relay's hash check refuses at the engine, seen from the index. Such a store is
     /// placed by its content, so the index stays exact; the count names a broken engine.
     pub landing_mismatches: usize,
+    /// Blocks a store moved to another place for their worker (an engine hash stored again at
+    /// a different position, as after a store without its parent); the old membership is
+    /// released so a hash is held at one place per worker.
+    pub moved_hashes: usize,
 }
 
 /// Where a writer waited: the root, a leaf only this worker holds, or a run others hold too.
@@ -1211,6 +1215,8 @@ pub struct RunIndex {
     engine_conflicts: AtomicUsize,
     /// Stores whose blocks carried the engine hashes the index holds for other content.
     landing_mismatches: AtomicUsize,
+    /// Blocks a store moved to another place for their worker (the old membership released).
+    moved_hashes: AtomicUsize,
     #[cfg(feature = "lane-stats")]
     counters: LaneCounters,
 }
@@ -1343,6 +1349,7 @@ impl RunIndex {
                 .collect(),
             engine_conflicts: AtomicUsize::new(0),
             landing_mismatches: AtomicUsize::new(0),
+            moved_hashes: AtomicUsize::new(0),
             #[cfg(feature = "lane-stats")]
             counters: LaneCounters::default(),
         }
@@ -2046,6 +2053,11 @@ impl RunIndex {
         let outcome = self.store_walk_locked(worker, blocks, origin, map, &mut pending);
         lap(self.counter_slot(1), walk);
         let writes = tick();
+        // A block the engine names by a hash this worker already holds elsewhere (a store that
+        // moves the hash, as a store without its parent followed by the whole chain does) keeps
+        // one place per hash: the old membership is released below. A re-store of the same
+        // block at the same place, forwarded or not, is not a move.
+        let mut moved: Vec<BlockRef> = Vec::new();
         for placed in pending {
             let first = BlockRef {
                 run: placed.run,
@@ -2056,9 +2068,22 @@ impl RunIndex {
                 self.engine_conflicts
                     .fetch_add(placed.conflicts, Ordering::Relaxed);
             }
-            map.insert_run(range.iter().map(|stored| stored.seq_hash), first);
+            map.insert_run(
+                range.iter().map(|stored| stored.seq_hash),
+                first,
+                |old, new| {
+                    if self.resolve(old).map(|(place, _)| place) != Some(new) {
+                        moved.push(old);
+                    }
+                },
+            );
         }
         lap(self.counter_slot(2), writes);
+        if !moved.is_empty() {
+            self.moved_hashes.fetch_add(moved.len(), Ordering::Relaxed);
+            let work = group_by_run(moved);
+            self.apply_removals(worker, work);
+        }
         outcome
     }
 
@@ -2585,24 +2610,15 @@ impl RunIndex {
         map.remove_all(hashes, |at| refs.push(at));
         lap(self.counter_slot(3), unmapping);
         let grouping = tick();
-        refs.sort_unstable_by_key(|at| at.run);
-        let mut work: Vec<Removal> = Vec::new();
-        let mut index = 0;
-        while index < refs.len() {
-            let run = refs[index].run;
-            let end = refs[index..]
-                .iter()
-                .position(|at| at.run != run)
-                .map_or(refs.len(), |count| index + count);
-            work.push(Removal {
-                run,
-                generation: None,
-                offsets: refs[index..end].iter().map(|at| at.offset).collect(),
-            });
-            index = end;
-        }
+        let work = group_by_run(refs);
         lap(self.counter_slot(4), grouping);
         let applying = tick();
+        self.apply_removals(worker, work);
+        lap(self.counter_slot(5), applying);
+    }
+
+    /// Drop `worker` from the grouped places, one run at a time, forwarding what a split moved.
+    fn apply_removals(&self, worker: u32, mut work: Vec<Removal>) {
         // The runs' headers are the lines the locked work reads first: ask for all of them now
         // so their misses overlap instead of serialising one run after another.
         for removal in &work {
@@ -2615,7 +2631,6 @@ impl RunIndex {
             self.remove_from_run(worker, removal, &mut work, &mut freed);
             self.recycle(&mut freed);
         }
-        lap(self.counter_slot(5), applying);
     }
 
     /// Drop `worker` from the offsets of one run, forwarding offsets a split moved on.
@@ -2939,6 +2954,7 @@ impl RunIndex {
             slab_bytes: self.slab.chunk_bytes(),
             engine_conflicts: self.engine_conflicts.load(Ordering::Relaxed),
             landing_mismatches: self.landing_mismatches.load(Ordering::Relaxed),
+            moved_hashes: self.moved_hashes.load(Ordering::Relaxed),
             ..RunIndexStats::default()
         };
         for id in 1..allocated as u32 {
@@ -2955,6 +2971,28 @@ impl RunIndex {
 
 /// Offsets taken from the map may have moved into suffixes since they were written: send those
 /// on, tagged with the generation the suffix had at the split.
+/// The places of one worker's blocks grouped by run (stored coordinates; the per-run work
+/// forwards what a split moved).
+fn group_by_run(mut refs: Vec<BlockRef>) -> Vec<Removal> {
+    refs.sort_unstable_by_key(|at| at.run);
+    let mut work: Vec<Removal> = Vec::new();
+    let mut index = 0;
+    while index < refs.len() {
+        let run = refs[index].run;
+        let end = refs[index..]
+            .iter()
+            .position(|at| at.run != run)
+            .map_or(refs.len(), |count| index + count);
+        work.push(Removal {
+            run,
+            generation: None,
+            offsets: refs[index..end].iter().map(|at| at.offset).collect(),
+        });
+        index = end;
+    }
+    work
+}
+
 fn reforward(
     arena: &WordArena,
     forwards: u32,
@@ -3462,6 +3500,93 @@ mod tests {
             .apply_stored(w, &blocks, None, &mut map)
             .expect("store");
         assert_eq!(scores(&index, &held), vec![(w, 12)]);
+    }
+
+    /// The gateway's parent-missing fallback: a worker holds b0..b3, evicts b2 and b3, the
+    /// engine extends after b3 but the parent is unknown, so b4 and b5 are stored without a
+    /// parent and land at positions 0 and 1 under the hashes of positions 4 and 5; when the
+    /// engine then announces the whole chain, each hash is held at one place only, the old
+    /// memberships are released, the counts read six blocks, a query for the mislaid pair
+    /// scores nothing, and a worker interned later into the freed id inherits nothing.
+    #[test]
+    fn a_hash_stored_again_at_another_position_releases_its_old_place() {
+        let index = RunIndex::with_max_workers(8);
+        let mut reference = ReferenceIndexer::new();
+        let w = index.intern_worker("w").expect("id");
+        let mut map = RunBlockMap::default();
+        let chain: Vec<ContentHash> = (0..6).map(|p| content(23, p)).collect();
+        let blocks = blocks_of(&chain);
+        index
+            .apply_stored(w, &blocks[..4], None, &mut map)
+            .expect("b0..b3");
+        reference.apply_stored(w, &blocks[..4], None).expect("ref");
+        let evicted = [blocks[2].seq_hash, blocks[3].seq_hash];
+        index.apply_removed(w, &evicted, &mut map);
+        reference.apply_removed(w, &evicted);
+        // The fallback: b4 and b5 with no parent, so at positions 0 and 1.
+        index
+            .apply_stored(w, &blocks[4..], None, &mut map)
+            .expect("fallback");
+        reference
+            .apply_stored(w, &blocks[4..], None)
+            .expect("ref fallback");
+        assert_eq!(scores(&index, &chain[4..]), vec![(w, 2)]);
+        assert_eq!(index.worker_block_count(w), 4);
+        // The engine announces the chain whole.
+        index
+            .apply_stored(w, &blocks, None, &mut map)
+            .expect("whole");
+        reference.apply_stored(w, &blocks, None).expect("ref whole");
+        assert_eq!(index.worker_block_count(w), 6);
+        assert_eq!(index.current_size(), 6);
+        assert_eq!(index.entry_count(), 6);
+        assert_eq!(index.stats().moved_hashes, 2);
+        assert_eq!(scores(&index, &chain), vec![(w, 6)]);
+        assert_eq!(scores(&index, &chain[4..]), vec![]);
+        assert_eq!(index.debug_blocks(), reference.blocks());
+        assert_eq!(reference.find_matches(&chain[4..]).len(), 0);
+        // The id is freed and reused: nothing is inherited.
+        index.remove_worker(w, map);
+        assert!(index.is_empty());
+        let v = index.intern_worker("v").expect("id");
+        assert_eq!(v, w);
+        assert_eq!(scores(&index, &chain), vec![]);
+        assert_eq!(index.worker_block_count(v), 0);
+    }
+
+    /// A worker that stores its chain again after another worker's divergence split the run
+    /// re-stores every block at the same place in forwarded coordinates: nothing moves, nothing
+    /// is released.
+    #[test]
+    fn a_re_store_across_a_split_moves_nothing() {
+        let index = RunIndex::with_max_workers(8);
+        let a = index.intern_worker("a").expect("id");
+        let b = index.intern_worker("b").expect("id");
+        let (mut ma, mut mb) = (RunBlockMap::default(), RunBlockMap::default());
+        let chain: Vec<ContentHash> = (0..30).map(|p| content(24, p)).collect();
+        let blocks = blocks_of(&chain);
+        index.apply_stored(a, &blocks, None, &mut ma).expect("a");
+        let mut fork = chain[..12].to_vec();
+        fork.extend((12..20).map(|p| content(25, p)));
+        index
+            .apply_stored(b, &blocks_of(&fork), None, &mut mb)
+            .expect("b");
+        // a re-stores the whole chain and then a tail after its own parent.
+        index
+            .apply_stored(a, &blocks, None, &mut ma)
+            .expect("a again");
+        index
+            .apply_stored(a, &blocks[20..], Some(blocks[19].seq_hash), &mut ma)
+            .expect("a tail");
+        assert_eq!(index.stats().moved_hashes, 0);
+        assert_eq!(index.worker_block_count(a), 30);
+        assert_eq!(scores(&index, &chain), vec![(a, 30), (b, 12)]);
+        let mut reference = ReferenceIndexer::new();
+        reference.apply_stored(a, &blocks, None).expect("ref a");
+        reference
+            .apply_stored(b, &blocks_of(&fork), None)
+            .expect("ref b");
+        assert_eq!(index.debug_blocks(), reference.blocks());
     }
 
     /// `is_empty` follows the blocks: false from the first store, true again once every block
