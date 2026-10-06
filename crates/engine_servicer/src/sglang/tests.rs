@@ -1136,11 +1136,13 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Whichever asked first, the start replay or the late join: all four came
+    // from the replay socket and nothing is unknown.
     let counts = relay.counts();
     assert_eq!(
         (
             counts.relayed,
-            counts.gap_batches_recovered,
+            counts.gap_batches_recovered + counts.primed_batches,
             counts.unknown_before_start
         ),
         (4, 4, 0),

@@ -43,10 +43,16 @@
 //! did. A payload that does not decode relays as an empty batch under its
 //! sequence, so nobody sees a gap for it. The batches before the first one
 //! the relay sees are treated the same way: ZMQ delivers nothing from before
-//! a subscription, so a relay whose first batch (of an incarnation) is past
-//! sequence 1 (the publishers count from 0, the mock engine from 1) asks the
-//! replay for everything from 0 before relaying it, unless that batch
-//! carries the engine's startup clear, after which nothing earlier matters.
+//! a subscription, so the relay asks the replay for everything from 0 when
+//! it starts (retrying every second until the engine's replay answers, since
+//! the engine may still be coming up), and again before relaying a first
+//! live batch (of an incarnation) past sequence 1 (the publishers count from
+//! 0, the mock engine from 1) unless that batch carries the engine's startup
+//! clear, after which nothing earlier matters. The start replay is what
+//! covers an engine that published a few batches at registration and nothing
+//! since: without it the relay would never hear of them; and because those
+//! batches may follow the first (empty) answer, a subscription from zero
+//! that finds the relay still holding nothing asks the replay once more.
 //! What the replay no longer reaches back to is counted as unknown before
 //! the record's start (`unknown_before_start`): the window is then not
 //! complete from the publisher's first batch, a subscriber from zero gets
@@ -84,7 +90,7 @@ use std::{
 use engine_zmq_client::codec::TrailingTolerant;
 use futures::stream;
 use smg_grpc_client::common_proto::{self as common};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tonic::Status;
 use tracing::{debug, info, warn};
 use zeromq::{
@@ -122,6 +128,9 @@ pub const HISTORY_BYTES_ENV: &str = "SMG_KV_EVENT_HISTORY_BYTES";
 pub const DEFAULT_HISTORY_BATCHES: usize = 10_000;
 pub const DEFAULT_HISTORY_BYTES: usize = 256 << 20;
 const DEFAULT_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the start replay is retried while the engine's replay socket
+/// does not answer yet.
+const PRIME_RETRY: Duration = Duration::from_secs(1);
 /// Live batches a slow subscriber may fall behind before it is refilled from
 /// the history.
 const LIVE_CHANNEL: usize = 4_096;
@@ -227,6 +236,9 @@ pub struct RelayCounts {
     /// nor the engine's replay gave (summed over incarnations): how late the
     /// history and the snapshots start.
     pub unknown_before_start: u64,
+    /// Batches taken from the publisher's replay at the relay's start, before
+    /// any live batch reached it.
+    pub primed_batches: u64,
     /// Publisher incarnations after the first.
     pub publisher_restarts: u64,
     /// Subscribers that fell behind the live channel and were refilled.
@@ -347,6 +359,9 @@ pub struct KvEventRelay {
     shared: Arc<Mutex<Shared>>,
     live: broadcast::Sender<Live>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// A subscriber came while the relay holds nothing: the publisher task
+    /// asks the engine's replay for the publisher's start again.
+    prime_request: Arc<Notify>,
 }
 
 impl Drop for KvEventRelay {
@@ -391,6 +406,7 @@ impl KvEventRelay {
             config,
             live,
             task: Mutex::new(None),
+            prime_request: Arc::new(Notify::new()),
         })
     }
 
@@ -456,11 +472,12 @@ impl KvEventRelay {
         let config = self.config.clone();
         let shared = Arc::clone(&self.shared);
         let live = self.live.clone();
+        let prime_request = Arc::clone(&self.prime_request);
         #[expect(
             clippy::disallowed_methods,
             reason = "the publisher subscription outlives any one RPC; aborted when the relay drops"
         )]
-        let handle = tokio::spawn(run(config, shared, live));
+        let handle = tokio::spawn(run(config, shared, live, prime_request));
         *task = Some(handle);
     }
 
@@ -509,6 +526,12 @@ impl KvEventRelay {
                         unknown_before: shared.unknown_before,
                     }
                 } else {
+                    // Nothing relayed yet: the publisher may have spoken
+                    // before the subscription reached it and after the
+                    // start replay answered; ask its replay once more.
+                    if self.config.replay_endpoint.is_some() {
+                        self.prime_request.notify_one();
+                    }
                     Serve::Live
                 }
             } else {
@@ -776,7 +799,12 @@ fn decode(payload: &[u8], sequence: u64) -> Decoded {
 }
 
 /// The publisher task: one SUB socket for the relay's lifetime.
-async fn run(config: RelayConfig, shared: Arc<Mutex<Shared>>, live: broadcast::Sender<Live>) {
+async fn run(
+    config: RelayConfig,
+    shared: Arc<Mutex<Shared>>,
+    live: broadcast::Sender<Live>,
+    prime_request: Arc<Notify>,
+) {
     let mut socket = match connect(&config.endpoint, &config.topic).await {
         Ok(socket) => socket,
         Err(status) => {
@@ -791,8 +819,30 @@ async fn run(config: RelayConfig, shared: Arc<Mutex<Shared>>, live: broadcast::S
         normalizer: Normalizer::from_env(),
         event_id: 0,
     };
+    // The publisher may have been counting before the subscription reached
+    // it: take what its replay still holds before the first live batch, and
+    // keep asking until the engine answers (it may still be starting). A
+    // live batch arriving first settles the start on its own path.
+    let mut primed = config.replay_endpoint.is_none();
+    let mut next_prime = tokio::time::Instant::now();
     loop {
-        let message = match socket.recv().await {
+        let received = tokio::select! {
+            received = socket.recv() => received,
+            () = tokio::time::sleep_until(next_prime), if !primed => {
+                primed = relay.prime_from_replay().await;
+                next_prime = tokio::time::Instant::now() + PRIME_RETRY;
+                continue;
+            }
+            () = prime_request.notified(), if config.replay_endpoint.is_some() => {
+                if lock(&shared).cursor.is_none() {
+                    primed = false;
+                    next_prime = tokio::time::Instant::now();
+                }
+                continue;
+            }
+        };
+        primed = true;
+        let message = match received {
             Ok(message) => message,
             Err(error) => {
                 warn!(endpoint = %config.endpoint, %error, "KV event receive failed; retrying");
@@ -971,6 +1021,95 @@ impl Relaying<'_> {
         }
     }
 
+    /// Before any live batch of an incarnation: everything the engine's
+    /// replay still holds, so a publisher that counted before the
+    /// subscription reached it is known even if it never publishes again.
+    /// `true` once the replay answered (batches, or an empty buffer: the
+    /// engine is up and has nothing yet), `false` when it could not be
+    /// reached or did not finish, to be asked again.
+    async fn prime_from_replay(&mut self) -> bool {
+        let Some(endpoint) = &self.config.replay_endpoint else {
+            return true;
+        };
+        let timeout = self.config.replay_timeout;
+        let (replies, complete) = match tokio::time::timeout(
+            timeout * 2,
+            replay(endpoint, 0, timeout),
+        )
+        .await
+        {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(error)) => {
+                debug!(endpoint = %self.config.endpoint, %error, "KV event replay not answering yet");
+                return false;
+            }
+            Err(_) => return false,
+        };
+        if lock(self.shared).cursor.is_some() {
+            // A live batch got in first and settled the start.
+            return true;
+        }
+        if replies.is_empty() {
+            if complete {
+                info!(
+                    endpoint = %self.config.endpoint,
+                    "KV event relay asked the publisher's replay at start; it holds nothing yet"
+                );
+            }
+            return complete;
+        }
+        let first = replies[0].0;
+        // The publishers count from 0 (vLLM, SGLang) or 1 (the mock engine).
+        let unknown_before = if first <= 1 { 0 } else { first };
+        if unknown_before > 0 {
+            self.lose(0, first - 1);
+        }
+        let mut expected = first;
+        let mut taken = 0u64;
+        let mut last = first;
+        for (sequence, payload) in replies {
+            if sequence < expected {
+                continue;
+            }
+            if expected < sequence {
+                self.lose(expected, sequence - 1);
+            }
+            self.relay(sequence, decode(&payload, sequence));
+            taken += 1;
+            last = sequence;
+            expected = sequence + 1;
+        }
+        let counts = {
+            let mut shared = lock(self.shared);
+            shared.unknown_before = unknown_before;
+            shared.counts.unknown_before_start += unknown_before;
+            shared.counts.primed_batches += taken;
+            shared.counts.clone()
+        };
+        if unknown_before == 0 {
+            info!(
+                endpoint = %self.config.endpoint,
+                first,
+                last,
+                batches = taken,
+                ?counts,
+                "KV event relay primed from the publisher's replay at start"
+            );
+        } else {
+            warn!(
+                endpoint = %self.config.endpoint,
+                first,
+                last,
+                batches = taken,
+                unknown_before,
+                ?counts,
+                "KV event relay primed from the publisher's replay at start; the replay no \
+                 longer reaches back to the publisher's first batch"
+            );
+        }
+        true
+    }
+
     /// Fill `gap` from the engine's replay socket: what it gives back is
     /// relayed under its sequence (past the gap's end too, when the replay
     /// ran ahead of the live socket), what it does not becomes holes.
@@ -978,7 +1117,7 @@ impl Relaying<'_> {
         let (from, to) = (*gap.start(), *gap.end());
         let replies = match &self.config.replay_endpoint {
             Some(endpoint) => match replay(endpoint, from, self.config.replay_timeout).await {
-                Ok(replies) => replies,
+                Ok((replies, _)) => replies,
                 Err(error) => {
                     warn!(
                         endpoint = %self.config.endpoint,
@@ -1033,13 +1172,13 @@ impl Relaying<'_> {
 /// Ask a publisher's replay ROUTER for its buffered batches from `from`:
 /// `[b"", from as 8 bytes big-endian]` on a DEALER; replies are
 /// `[b"", topic, seq, payload]` (vLLM) or `[b"", seq, payload]` (SGLang),
-/// ending with the all-ones sequence. Returned in arrival order; a stop
-/// before the end marker returns what arrived.
+/// ending with the all-ones sequence. Returned in arrival order with whether
+/// the end marker arrived; a stop before it returns what arrived.
 async fn replay(
     endpoint: &str,
     from: u64,
     timeout: Duration,
-) -> Result<Vec<(u64, Vec<u8>)>, String> {
+) -> Result<(Vec<(u64, Vec<u8>)>, bool), String> {
     let mut dealer = DealerSocket::new();
     dealer
         .connect(endpoint)
@@ -1063,7 +1202,7 @@ async fn replay(
                     received = replies.len(),
                     "KV event replay timed out"
                 );
-                return Ok(replies);
+                return Ok((replies, false));
             }
         };
         let (sequence, payload) = match reply.len() {
@@ -1079,7 +1218,7 @@ async fn replay(
             return Err(format!("malformed replay reply from {endpoint}"));
         };
         if sequence.as_ref() == &END_SEQUENCE[..] {
-            return Ok(replies);
+            return Ok((replies, true));
         }
         if sequence.len() != 8 {
             return Err(format!("malformed replay sequence from {endpoint}"));
@@ -1380,11 +1519,49 @@ mod tests {
             replay_timeout: Duration::from_secs(2),
         });
         relay.start();
-        Lab {
+        let mut lab = Lab {
             publisher,
             router,
             relay,
+        };
+        if with_replay {
+            // The relay asks the replay socket for the publisher's start
+            // before anything else; this publisher has nothing yet.
+            lab.answer_replay(0, &[]).await;
         }
+        lab
+    }
+
+    /// A relay whose replay socket is not bound yet: the relay keeps asking
+    /// for the publisher's start until it is.
+    async fn start_lab_without_replay_socket_yet() -> (Lab, String) {
+        let mut publisher = PubSocket::new();
+        let endpoint = publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("publisher binds")
+            .to_string();
+        let replay_endpoint = format!(
+            "tcp://127.0.0.1:{}",
+            portpicker::pick_unused_port().expect("a free replay port")
+        );
+        let relay = KvEventRelay::new(RelayConfig {
+            endpoint,
+            replay_endpoint: Some(replay_endpoint.clone()),
+            topic: "kv".to_string(),
+            history_batches: 100,
+            history_bytes: 64 << 20,
+            replay_timeout: Duration::from_secs(2),
+        });
+        relay.start();
+        (
+            Lab {
+                publisher,
+                router: None,
+                relay,
+            },
+            replay_endpoint,
+        )
     }
 
     impl Lab {
@@ -2077,6 +2254,134 @@ mod tests {
         assert!(joined_late(2, false));
         assert!(!joined_late(2, true));
         assert!(joined_late(500, false));
+    }
+
+    /// A publisher that published at registration and nothing since: the
+    /// relay never gets a live batch to notice it by, so it takes the
+    /// replay's buffer at start, before any live batch, and a subscriber
+    /// from zero gets those blocks.
+    #[tokio::test]
+    async fn the_relay_takes_the_publishers_replay_at_start_before_any_live_batch() {
+        let mut lab = start_lab_without_replay_socket_yet().await;
+        let (lab, replay_endpoint) = (&mut lab.0, lab.1);
+        let batch2 = golden::bytes(golden::BATCH2);
+        // The engine comes up a moment after the servicer: the first attempt
+        // found no replay socket, the retry finds it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut router = RouterSocket::new();
+        router.bind(&replay_endpoint).await.expect("replay binds");
+        lab.router = Some(router);
+        // The mock counts from 1: sequences 1..=3 went out at registration.
+        lab.answer_replay(
+            0,
+            &[
+                (1, batch2.clone()),
+                (2, batch2.clone()),
+                (3, batch2.clone()),
+            ],
+        )
+        .await;
+        lab.wait_relayed(3).await;
+        let counts = lab.relay.counts();
+        assert_eq!(
+            (
+                counts.primed_batches,
+                counts.unknown_before_start,
+                counts.gap_batches_lost,
+                counts.publisher_gaps,
+            ),
+            (3, 0, 0, 0),
+            "{counts:?}"
+        );
+        // Nothing live ever came; the state is served from zero as a snapshot
+        // cut at 3 (a window from 1 is not complete from 0).
+        let mut fresh = lab.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut fresh).await;
+        assert_eq!(chunk.sequence_number, 3);
+        assert_eq!(chunk.snapshot.as_ref().map(|chunk| chunk.blocks), Some(3));
+        assert_eq!(
+            chunk.snapshot.as_ref().map(|chunk| chunk.unknown_before),
+            Some(0)
+        );
+        // Live continues from the publisher's next sequence.
+        lab.publish(4, &batch2).await;
+        assert_eq!(read(&mut fresh).await.sequence_number, 4);
+        let mut resumed = lab.subscribe(2).expect("inside the window");
+        for expected in [3, 4] {
+            assert_eq!(read(&mut resumed).await.sequence_number, expected);
+        }
+    }
+
+    /// The start replay answered empty, then the publisher spoke (the mock's
+    /// registration batches) without the subscription catching them, and
+    /// never again: the first subscriber from zero finds the relay empty,
+    /// which makes it ask the replay once more, and receives the batches.
+    #[tokio::test]
+    async fn a_first_subscriber_makes_an_empty_relay_ask_the_replay_again() {
+        let mut lab = start_lab(100, true).await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        let mut stream = lab.subscribe(0).expect("live, nothing held");
+        lab.answer_replay(
+            0,
+            &[
+                (1, batch2.clone()),
+                (2, batch2.clone()),
+                (3, batch2.clone()),
+            ],
+        )
+        .await;
+        for expected in [1, 2, 3] {
+            assert_eq!(read(&mut stream).await.sequence_number, expected);
+        }
+        let counts = lab.relay.counts();
+        assert_eq!(
+            (
+                counts.primed_batches,
+                counts.unknown_before_start,
+                counts.relayed
+            ),
+            (3, 0, 3),
+            "{counts:?}"
+        );
+        lab.publish(4, &batch2).await;
+        assert_eq!(read(&mut stream).await.sequence_number, 4);
+        // The next subscriber from zero gets the state the relay now holds
+        // (a snapshot: the window starts at 1), and asks nothing more.
+        let mut next = lab.subscribe(0).expect("a snapshot");
+        assert_eq!(read(&mut next).await.sequence_number, 4);
+        assert_eq!(lab.relay.counts().served_snapshots, 1);
+    }
+
+    /// A replay whose buffer rolled before the relay started marks what it
+    /// no longer holds as unknown, as the late-join path does.
+    #[tokio::test]
+    async fn a_start_replay_that_begins_past_the_publishers_start_marks_the_rest_unknown() {
+        let mut lab = start_lab_without_replay_socket_yet().await;
+        let (lab, replay_endpoint) = (&mut lab.0, lab.1);
+        let batch2 = golden::bytes(golden::BATCH2);
+        let mut router = RouterSocket::new();
+        router.bind(&replay_endpoint).await.expect("replay binds");
+        lab.router = Some(router);
+        lab.answer_replay(0, &[(6, batch2.clone()), (7, batch2.clone())])
+            .await;
+        lab.wait_relayed(2).await;
+        let counts = lab.relay.counts();
+        assert_eq!(
+            (
+                counts.primed_batches,
+                counts.unknown_before_start,
+                counts.gap_batches_lost,
+            ),
+            (2, 6, 6),
+            "{counts:?}"
+        );
+        let mut fresh = lab.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut fresh).await;
+        assert_eq!(chunk.sequence_number, 7);
+        assert_eq!(
+            chunk.snapshot.as_ref().map(|chunk| chunk.unknown_before),
+            Some(6)
+        );
     }
 
     #[tokio::test]
