@@ -3,11 +3,13 @@
 //! When a request names one function (`tool_choice: {"type": "function", ...}`), the gateway
 //! constrains the engine to that function's parameter schema, and the whole output is the arguments
 //! of that one call. When it requires a call from the request's tools (`tool_choice: "required"`,
-//! or an allowed-tools list), the output is a JSON array of call objects, each with the function's
-//! `name` and its `parameters`. [`Constrained`] is the [`Parser`] for both. It knows the shape from
-//! the request, so it needs no scanner, and it streams the arguments as the model's own bytes, as
-//! every format does; the old gateway parsed the whole output once it had ended and, for a forced
-//! function, streamed the whole output as one call's arguments without looking at it.
+//! or an allowed-tools list in `required` mode), the output is a JSON array of call objects, each
+//! with the function's `name` and its `parameters`. [`Constrained`] is the [`Parser`] for both. It
+//! knows the shape from the request, so it needs no scanner, and it streams the arguments as the
+//! model's own bytes, as every format does; the old gateway parsed the whole output once it had
+//! ended and, for a forced function, streamed the whole output as one call's arguments without
+//! looking at it. Where the gateway constrains a model through a structural tag instead, the output
+//! keeps the model's own markers, and the model's format parses it.
 //!
 //! One function: the bytes before the value are whitespace and dropped as such; the call starts at
 //! the first byte of the value, named by the request (its `source` is empty, since no output byte
@@ -20,11 +22,12 @@
 //!
 //! Required: the list's brackets and commas are `Dropped { Wrapper }`, the whitespace between them
 //! `Dropped { Whitespace }`, and each object goes to an [`Assembler`], which emits the call's
-//! events and says where the object ended. An output that does not begin with a list, bytes where a
-//! call, a comma or the list's end should be, and bytes after the list that are not whitespace come
-//! back as `Malformed` with `Other`, from the first such byte to the end. A list cut short ends
-//! with what arrived: the assembler closes a started call, and an object that never named a call
-//! comes back as `Malformed`.
+//! events and says where the object ended. The list's syntax is checked as JSON has it: a call or
+//! the list's end after the opening bracket, a comma or the end after a call, a call after a comma.
+//! An output that does not begin with a list, bytes the syntax does not allow where they stand, and
+//! bytes after the list that are not whitespace come back as `Malformed` with `Other`, from the
+//! first such byte to the end. A list cut short ends with what arrived: the assembler closes a
+//! started call, and an object that never named a call comes back as `Malformed`.
 //!
 //! Every byte of the output lands in exactly one event; every text event carries its token count
 //! from the [`Ledger`]; call ids are `call_<index>`, as in every format until the id scheme is
@@ -46,7 +49,8 @@ use crate::{
 pub enum Choice {
     /// One function, named by the request: the whole output is its arguments.
     Function(String),
-    /// At least one call from the request's tools: the output is a list of call objects.
+    /// At least one call from the request's tools (`tool_choice: "required"`, or an allowed-tools
+    /// list in `required` mode): the output is a list of call objects.
     Required,
 }
 
@@ -291,12 +295,16 @@ struct List {
 enum Phase {
     /// Before the opening bracket.
     Before,
-    /// Inside the list, between objects.
-    Between,
+    /// Right after the opening bracket: a call or the list's end comes next.
+    Opened,
     /// Inside an object.
     Object(Assembler),
+    /// After a call: a comma or the list's end comes next.
+    AfterCall,
+    /// After a comma: a call comes next.
+    AfterComma,
     /// After the closing bracket.
-    After,
+    Closed,
     /// The output left the shape; everything from here is malformed, for the reason given.
     Broken(&'static str),
 }
@@ -319,7 +327,7 @@ impl List {
                         if assembler.started() {
                             self.calls += 1;
                         }
-                        self.phase = Phase::Between;
+                        self.phase = Phase::AfterCall;
                     }
                     rest = &rest[taken..];
                 }
@@ -330,7 +338,11 @@ impl List {
                     });
                     rest = "";
                 }
-                Phase::Before | Phase::Between | Phase::After => {
+                Phase::Before
+                | Phase::Opened
+                | Phase::AfterCall
+                | Phase::AfterComma
+                | Phase::Closed => {
                     let trimmed = rest.trim_start_matches(json_space);
                     if trimmed.len() < rest.len() {
                         out.push(Event::Dropped {
@@ -342,23 +354,28 @@ impl List {
                     }
                     let next = rest.chars().next();
                     let (phase, wrapper) = match (&self.phase, next) {
-                        (Phase::Before, Some('[')) => (Phase::Between, true),
+                        (Phase::Before, Some('[')) => (Phase::Opened, true),
                         (Phase::Before, _) => {
                             (Phase::Broken("the output is not a list of calls"), false)
                         }
-                        (Phase::Between, Some(',')) => (Phase::Between, true),
-                        (Phase::Between, Some(']')) => (Phase::After, true),
-                        (Phase::Between, Some('{')) => (
+                        (Phase::Opened | Phase::AfterComma, Some('{')) => (
                             Phase::Object(Assembler::new(
                                 self.calls,
                                 format!("call_{}", self.calls),
                             )),
                             false,
                         ),
-                        (Phase::Between, _) => (
-                            Phase::Broken(
-                                "bytes where a call, a comma or the list's end should be",
-                            ),
+                        (Phase::Opened | Phase::AfterCall, Some(']')) => (Phase::Closed, true),
+                        (Phase::AfterCall, Some(',')) => (Phase::AfterComma, true),
+                        (Phase::Opened, _) => (
+                            Phase::Broken("bytes where a call or the list's end should be"),
+                            false,
+                        ),
+                        (Phase::AfterComma, _) => {
+                            (Phase::Broken("bytes where a call should be"), false)
+                        }
+                        (Phase::AfterCall, _) => (
+                            Phase::Broken("bytes where a comma or the list's end should be"),
                             false,
                         ),
                         (_, _) => (Phase::Broken("bytes after the list"), false),
@@ -378,7 +395,7 @@ impl List {
 
     /// The output ended: an open object ends with what arrived. Returns the calls made.
     fn finish(&mut self, out: &mut Events) -> u32 {
-        if let Phase::Object(assembler) = std::mem::replace(&mut self.phase, Phase::After) {
+        if let Phase::Object(assembler) = std::mem::replace(&mut self.phase, Phase::Closed) {
             if assembler.started() {
                 self.calls += 1;
             }
@@ -602,10 +619,49 @@ mod tests {
             Event::Malformed {
                 text: Text::uncounted("1, 2]"),
                 why: MalformedReason::Other(
-                    "bytes where a call, a comma or the list's end should be".to_string()
+                    "bytes where a call or the list's end should be".to_string()
                 ),
             }
         );
+    }
+
+    #[test]
+    fn a_comma_comes_between_calls_and_nowhere_else() {
+        let call = "{\"name\": \"f\", \"parameters\": {}}";
+        let malformed = |text: &str, why: &str| Event::Malformed {
+            text: Text::uncounted(text),
+            why: MalformedReason::Other(why.to_string()),
+        };
+        let a_call_or_the_end = "bytes where a call or the list's end should be";
+        for (output, from, why, calls) in [
+            (
+                format!("[{call}{call}]"),
+                format!("{call}]"),
+                "bytes where a comma or the list's end should be",
+                1,
+            ),
+            (
+                format!("[,{call}]"),
+                format!(",{call}]"),
+                a_call_or_the_end,
+                0,
+            ),
+            (
+                format!("[{call},]"),
+                "]".to_string(),
+                "bytes where a call should be",
+                1,
+            ),
+            ("[,,]".to_string(), ",,]".to_string(), a_call_or_the_end, 0),
+        ] {
+            let events = required(&[&output]);
+            assert_eq!(
+                events[events.len() - 2],
+                malformed(&from, why),
+                "{output}: {events:?}"
+            );
+            assert_eq!(events.last(), Some(&finish(calls)), "{output}");
+        }
     }
 
     #[test]
