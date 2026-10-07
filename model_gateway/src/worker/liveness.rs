@@ -68,15 +68,18 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// The warm-up slice: one cache miss in `1 / share` is routed to a warming
 /// worker (the least-loaded one) so it builds a cache instead of idling behind
-/// the fleet's affinity. A worker is warming while its index has gained fewer
-/// than `blocks` blocks since it last became thin, and it is thin for `secs`
-/// after it became routable or, whatever the fleet's age, while its index
-/// holds less than `thin_ratio` of the fleet's level (the median over healthy
-/// workers) or nothing at all: a resync after a publisher restart, an
-/// `OUT_OF_RANGE` or `DATA_LOSS`, or an engine that came back empty leaves a
-/// worker whose every prompt has an overlap elsewhere, so no miss would ever
-/// reach it otherwise. `share == 0` disables; `thin_ratio == 0` keeps the age
-/// rule alone.
+/// the fleet's affinity. A worker is warming for `secs` after it became
+/// routable, until its index has gained `blocks` blocks since (a new worker's
+/// first cache), or, whatever its age, while its index is thin: holding less
+/// than `thin_ratio` of the fleet's level (the median over healthy workers) or
+/// nothing at all. A resync after a publisher restart, an `OUT_OF_RANGE` or
+/// `DATA_LOSS`, or an engine that came back empty leaves a worker whose every
+/// prompt has an overlap elsewhere, so no miss would ever reach it otherwise;
+/// it stays warming until it crosses the ratio, however many blocks it regains
+/// on the way (the `blocks` cap bounds the age rule only: on the churn run a
+/// worker that regrew to 1,765 of a 32,767 level was dropped at the cap after
+/// one diversion and idled for 25 minutes). `share == 0` disables;
+/// `thin_ratio == 0` keeps the age rule alone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Warmup {
     pub secs: Duration,
@@ -93,8 +96,9 @@ pub(crate) struct Warmup {
 impl Warmup {
     /// Whether a worker admitted `age` ago, holding `indexed` blocks against a
     /// fleet level of `fleet_level`, whose index has gained `growth` blocks
-    /// since it last became thin (`None` when the index has never seen it),
-    /// is warming up.
+    /// since its admission (`None` when the index has never seen it; the
+    /// baseline restarts when the count drops), is warming up: thin against
+    /// the fleet, or young and short of its first `blocks`.
     pub(crate) fn applies(
         &self,
         age: Duration,
@@ -103,8 +107,8 @@ impl Warmup {
         fleet_level: usize,
     ) -> bool {
         self.share > 0.0
-            && growth.is_none_or(|blocks| blocks < self.blocks)
-            && (age < self.secs || self.is_thin(indexed, fleet_level))
+            && (self.is_thin(indexed, fleet_level)
+                || (age < self.secs && growth.is_none_or(|blocks| blocks < self.blocks)))
     }
 
     /// Whether an index of `indexed` blocks is thin against the fleet's
@@ -579,13 +583,33 @@ mod tests {
             "emptied: thin, 180 blocks regrown"
         );
         assert!(warmup.applies(old, Some(0), 0, 30_000), "empty outright");
+        // Churn c3: the index regrew to 1,765 of a 32,767 level within a
+        // minute of the clear (the decode blocks of the requests in flight)
+        // and the cap meant for a new worker's first cache ended the warm-up
+        // there, thin or not; one diversion, then idle for 25 minutes.
         assert!(
-            !warmup.applies(old, Some(1_100), 1_100, 30_000),
-            "regrown by the warm-up blocks: back to affinity, thin or not"
+            warmup.applies(old, Some(1_765), 1_765, 32_767),
+            "regrown past the warm-up blocks but still thin: served on"
+        );
+        assert!(
+            warmup.applies(old, Some(16_383), 16_383, 32_767),
+            "thin until the ratio"
+        );
+        assert!(
+            !warmup.applies(old, Some(16_384), 16_384, 32_767),
+            "at the ratio it is back to affinity"
         );
         assert!(
             !warmup.applies(old, Some(0), 20_000, 30_000),
             "two thirds of the fleet's level is not thin at a half"
+        );
+        assert!(
+            warmup.applies(Duration::from_secs(10), Some(2_000), 2_000, 30_000),
+            "a young worker in an old fleet is served past its first blocks while thin"
+        );
+        assert!(
+            !warmup.applies(Duration::from_secs(10), Some(2_000), 2_000, 2_000),
+            "the cap bounds the age rule: warm at the fleet's level"
         );
         assert!(
             !warmup.applies(old, None, 0, 0),

@@ -183,12 +183,20 @@ zero against a full fleet). The slice now serves a worker that is thin: admitted
 `--worker-warmup-secs`, or, whatever its age, holding less than `--worker-warmup-thin-ratio` (a half)
 of the fleet's level (the median index size over the healthy workers) or nothing, once the fleet's
 level is at least `--worker-warmup-blocks` (a cache worth catching up to). A thin worker stays
-eligible until its index has grown by the warm-up blocks since it became thin; the growth baseline
-restarts whenever the index count drops, so a resync after a publisher restart, an `OUT_OF_RANGE` or
-`DATA_LOSS` resubscription, or an engine that comes back empty all open a warm-up without a
-re-admission. A thin worker is served even in a young fleet; workers warming only because they are
-young are served only when the fleet is not all young. A few blocks of overlap count as a head only
-when they are under half of the request, so a short request cached whole stays with its holder.
+eligible while it is thin, however many blocks it regains on the way: a resync after a publisher
+restart, an `OUT_OF_RANGE` or `DATA_LOSS` resubscription, or an engine that comes back empty all
+open a warm-up without a re-admission, and it closes only at the ratio. The warm-up blocks bound the
+age rule alone (a new worker's first cache, measured from the count at its admission). Until
+2026-10-06 the cap applied to thin workers too, and churn c3 (6ce84c9e, a fleet whose level is the
+engines' 32,767-block caches) showed why that was wrong: within a minute of the publisher restart
+the emptied worker's index had regrown to 1,765 blocks from the decode blocks of its requests in
+flight, past the 1,024-block cap, and the pool table dropped it from the thin list after one
+diverted hit and two slice decisions; it held 5 % of the fleet's level and got nothing for the 25
+minutes to the next fault. The drills had not seen it because the mock fleets' level there is a few
+thousand blocks, where the cap and the ratio nearly coincide. A thin worker is served even in a
+young fleet; workers warming only because they are young are served only when the fleet is not all
+young. A few blocks of overlap count as a head only when they are under half of the request, so a
+short request cached whole stays with its holder.
 
 **Hit diversion (added 2026-10-06).** The thinness rule serves misses, and a replay where every
 request has a holder (a system prompt or a chat template in front of everything, as in the churn

@@ -1251,8 +1251,9 @@ impl PoolTable {
             if let Some(id) = id {
                 position_of.insert(id, position as u32);
             }
-            // Index size and growth since the worker last became thin (or was
-            // admitted); the growth baseline restarts when the count drops.
+            // Index size, and its growth since the admission for the age rule
+            // (the baseline restarts when the count drops); thinness is read
+            // against the fleet's level below, whatever the growth.
             sized.push(id.map(|id| {
                 let indexed = indexer.worker_block_count(id);
                 (indexed, worker.warmup_growth(indexed))
@@ -5578,6 +5579,12 @@ mod tests {
     /// Eight workers; the first `holders` hold 1,100 blocks each of their own
     /// 4,400-token sequence, the rest nothing.
     fn fleet_with_holders(holders: usize) -> HolderFleet {
+        fleet_with_holders_of(holders, 1_100)
+    }
+
+    /// Eight workers; the first `holders` hold `blocks` blocks each of their
+    /// own sequence, the rest nothing.
+    fn fleet_with_holders_of(holders: usize, blocks: usize) -> HolderFleet {
         let policy = CacheAwarePolicy::with_config(test_config());
         let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
         let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
@@ -5591,7 +5598,9 @@ mod tests {
             if h >= holders {
                 continue;
             }
-            let tokens: Vec<u32> = (0..4_400).map(|i| (h as u32 + 1) * 100_000 + i).collect();
+            let tokens: Vec<u32> = (0..blocks as u32 * 4)
+                .map(|i| (h as u32 + 1) * 100_000 + i)
+                .collect();
             store_blocks(&indexer, id, &tokens, 4, (h as u64 + 1) * 1_000_000);
             prefixes.push(tokens[..240].to_vec());
         }
@@ -5691,6 +5700,130 @@ mod tests {
             policy.divert_hits.load(Ordering::Relaxed),
             hits_before + 32,
             "no diversion once the worker is no longer thin"
+        );
+    }
+
+    #[test]
+    fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
+        // Churn c3 (6ce84c9e): the fleet's level was 32,767 blocks a worker,
+        // far above the warm-up blocks. Within a minute of the publisher
+        // restart the emptied worker's index had regrown to 1,765 from the
+        // decode blocks of its requests in flight, and the pool table,
+        // applying the age rule's growth cap to a thin worker, dropped it
+        // there after one diversion: idle for the 25 minutes to the next
+        // fault. Here the level is 4,096 (the ratio at 2,048), the worker has
+        // regrown to 1,100 before any diversion, every request is a deep hit
+        // (60 of 64 blocks, held elsewhere), each diverted request stays in
+        // flight for the rest of the test, and the table is rebuilt every
+        // eight decisions as the second's refresh would.
+        let HolderFleet {
+            policy,
+            workers,
+            indexer,
+            heads,
+        } = fleet_with_holders_of(7, 4_096);
+        let thin = indexer.worker_id("http://w7:8000").unwrap();
+        // The growth baselines date from the first table, built on the empty
+        // fleet as on the run; the regrowth comes after.
+        policy.pool_table(&workers, &indexer, liveness::now_ms());
+        let regrown: Vec<u32> = (0..4_400).map(|i| 80_000_000 + i).collect();
+        store_blocks(&indexer, thin, &regrown, 4, 8_000_000);
+        assert_eq!(indexer.worker_block_count(thin), 1_100);
+        let request = |i: usize| -> Vec<u32> {
+            let mut tokens = heads[i % 7].clone();
+            tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+            tokens
+        };
+        let select = |tokens: &[u32]| -> usize {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let mut rebuilds = 1u64;
+        let mut decisions = 0usize;
+        let mut first = None;
+        let mut received = 0usize;
+        while decisions < 2_000 && indexer.worker_block_count(thin) < 2_048 {
+            if decisions.is_multiple_of(8) {
+                rebuilds += 1;
+                policy.pool_table(
+                    &workers,
+                    &indexer,
+                    liveness::now_ms() + rebuilds * POOL_TABLE_REFRESH_MS,
+                );
+            }
+            let tokens = request(decisions);
+            let idx = select(&tokens);
+            decisions += 1;
+            if idx != 7 {
+                continue;
+            }
+            received += 1;
+            store_blocks(
+                &indexer,
+                thin,
+                &tokens,
+                4,
+                9_000_000 + decisions as u64 * 100,
+            );
+            // The diverted request runs on (tens of seconds on the trace).
+            workers[7].increment_load();
+            if first.is_none() {
+                first = Some(decisions);
+                // Inside the window, with that request in flight, no second
+                // diversion: the hit counter runs on without a reset.
+                let hits = policy.divert_hits.load(Ordering::Relaxed);
+                for i in 0..16 {
+                    select(&request(10_000 + i));
+                }
+                assert_eq!(
+                    policy.divert_hits.load(Ordering::Relaxed),
+                    hits + 16,
+                    "no second diversion inside the window while the first is in flight"
+                );
+            }
+            // The window elapses; the request is still in flight.
+            workers[7].note_diverted(0);
+        }
+        assert!(
+            first.is_some_and(|first| first <= 8),
+            "the thin worker is served within the first eight hits although it \
+             regrew past the warm-up blocks, was {first:?}"
+        );
+        assert!(
+            indexer.worker_block_count(thin) >= 2_048,
+            "refilled to the ratio across the rebuilds: {} blocks after {decisions} decisions",
+            indexer.worker_block_count(thin)
+        );
+        assert!(
+            received >= 15 && decisions <= 140 * 8 + 32,
+            "one hit in eight all the way (seven heads of 60 blocks, then tails of 4): \
+             {decisions} decisions, {received} received, {} in flight",
+            workers[7].load()
+        );
+        // At the ratio the table rebuilt lists no thin worker, and with no
+        // thin worker the diversion costs nothing: the hits are not even
+        // counted.
+        let table = policy.pool_table(
+            &workers,
+            &indexer,
+            liveness::now_ms() + (rebuilds + 1) * POOL_TABLE_REFRESH_MS,
+        );
+        assert!(table.thin.is_empty(), "no longer thin: {:?}", table.thin);
+        let hits = policy.divert_hits.load(Ordering::Relaxed);
+        for i in 0..32 {
+            select(&request(20_000 + i));
+        }
+        assert_eq!(
+            policy.divert_hits.load(Ordering::Relaxed),
+            hits,
+            "no hit counted, let alone diverted, once no worker is thin"
         );
     }
 
