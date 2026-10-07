@@ -23,7 +23,9 @@
 #![forbid(unsafe_code)]
 
 pub mod adapt;
+pub mod engine;
 pub mod event;
+pub mod format;
 pub mod formats;
 pub mod input;
 pub mod json;
@@ -32,8 +34,10 @@ pub mod parser;
 pub mod tagged;
 pub mod tokens;
 
+pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
-pub use formats::{CallSyntax, Qwen3};
+pub use format::{CallSyntax, Emits, Format};
+pub use formats::{qwen2_5, qwen3};
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};

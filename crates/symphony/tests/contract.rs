@@ -28,8 +28,8 @@ mod common;
 
 use common::{bytes_of, chunkings, delta, prompt};
 use symphony::{
-    json::PartialJson, DropReason, EngineFinish, Event, Events, FinishReason, Input,
-    MalformedReason, ParseError, Parser, Qwen3, TokenSpan,
+    formats, json::PartialJson, CallSyntax, DropReason, Engine, EngineFinish, Event, Events,
+    FinishReason, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
 
 /// A format under test: how to make its parser, and the outputs it is checked over.
@@ -40,7 +40,7 @@ struct Format {
 }
 
 fn qwen3() -> Box<dyn Parser> {
-    Box::new(Qwen3::new())
+    Box::new(Engine::new(formats::qwen3(CallSyntax::Json)))
 }
 
 const FORMATS: &[Format] = &[Format {
