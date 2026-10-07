@@ -5,9 +5,10 @@ use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvIndexKind, MetricsConfig, OracleConfig, PdPairingMode,
-    PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-    RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MetricsConfig,
+    OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
+    RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig,
+    TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -542,17 +543,14 @@ impl RouterConfigBuilder {
 
     // ==================== Discovery ====================
 
-    pub fn discovery_config(mut self, discovery: DiscoveryConfig) -> Self {
-        self.config.discovery = Some(discovery);
+    pub fn discovery_config(mut self, discovery: impl Into<DiscoveryConfig>) -> Self {
+        self.config.discovery = Some(discovery.into());
         self
     }
 
-    /// With default settings
+    /// Kubernetes discovery with default settings
     pub fn enable_discovery(mut self) -> Self {
-        self.config.discovery = Some(DiscoveryConfig {
-            enabled: true,
-            ..Default::default()
-        });
+        self.config.discovery = Some(KubernetesDiscoveryConfig::default().into());
         self
     }
 
