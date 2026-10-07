@@ -2,21 +2,22 @@
 //!
 //! bellwether (smg-project/bellwether) records, per model, what a model's output must parse to: the
 //! output text, its token ids, chunk plans, and the reference assistant message from the round trip
-//! through the checkpoint's template. This test replays every Qwen3-8B parse case through
-//! [`Qwen3`], folds the events into the assistant message with [`adapt::chat::message`], and
-//! compares it with the reference: whole, at every byte split, byte by byte, and on thirty seeded
-//! byte plans. Every replay also has to conserve the output's bytes across its events and agree
-//! with every other replay of the same case.
+//! through the checkpoint's template. This test replays every Qwen3-8B parse case through the
+//! Qwen3 table ([`qwen3()`]), folds the events into the assistant message with
+//! [`adapt::chat::message`], and compares it with the reference: whole, at every byte split, byte
+//! by byte, and on thirty seeded byte plans. Every replay also has to conserve the output's bytes
+//! across its events and agree with every other replay of the same case.
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
-//! checkout; without it the test prints a skip notice and passes. A second parity test replays the
-//! models that write their calls as tags (Qwen 3.5 and later, Qwen3-Coder) through the same parser
-//! with the tagged call syntax, typed by each case's request tools, after the prompt tail each
-//! template leaves ([`TAGGED`]); it skips the slugs bellwether has not recorded yet, and says so.
-//! That test also allows two classes of difference the corpus itself has ([`Allowance`]): a
-//! reference argument whose type contradicts the one the tool declares, which the template writes
-//! the same way as the string, and reasoning in a reference whose template writes no thought.
-//! Each allowed case is counted and printed, so the classes cannot hide anything else.
+//! checkout; without it the test prints a skip notice and passes. A second parity test replays
+//! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
+//! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
+//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves; it
+//! skips the slugs bellwether has not recorded yet, and says so. That test also allows two classes
+//! of difference the corpus itself has ([`Allowance`]): a reference argument whose type
+//! contradicts the one the tool declares, which the template writes the same way as the string,
+//! and reasoning in a reference whose template writes no thought. Each allowed case is counted
+//! and printed, so the classes cannot hide anything else.
 //!
 //! Two policy questions stand between the parser and bitwise parity, and the test declares them
 //! rather than hides them. Bellwether #17: the template's separator bytes (the newline after
@@ -43,24 +44,265 @@ use common::{bytes_of, chunkings, prompt, replay, replay_after};
 use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
-    adapt, Declared, DropReason, EngineFinish, Event, Events, Input, ParseError, Parser, Qwen3,
-    TokenSpan,
+    adapt,
+    formats::{qwen2_5, qwen3},
+    CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
+    Parser, TokenSpan,
 };
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 const SLUG: &str = "qwen3-8b";
-/// bellwether's slugs for the checkpoints that write a call as tags, in its manifests' spelling,
-/// each with how its template ends the generation prompt. The fixtures carry the request and the
-/// output, not the rendered prompt, so this is stated here until bellwether records the prompt's
-/// tail (noted for Simo in STATE.md).
-const TAGGED: &[(&str, GenerationPrompt)] = &[
-    ("qwen3.5-9b", GenerationPrompt::OpensTheThought),
-    ("qwen3.5-27b", GenerationPrompt::OpensTheThought),
-    ("qwen3.6-27b", GenerationPrompt::OpensTheThought),
-    ("qwen3.8-27b", GenerationPrompt::OpensTheThought),
-    ("qwen3-coder-30b-a3b-instruct", GenerationPrompt::Plain),
-    ("qwen3-coder-next", GenerationPrompt::Plain),
+/// bellwether's slugs for the Qwen checkpoints, in its manifests' spelling, each with the table
+/// that reads it and how its template ends the generation prompt. The fixtures carry the request
+/// and the output, not the rendered prompt, so the prompt's tail is stated here until bellwether
+/// records it (noted for Simo in STATE.md). A slug bellwether has not recorded is skipped with a
+/// notice; `qwen3-8b` is the one CI's pinned fixtures always hold, and has its own test.
+const MODELS: &[(&str, Family, GenerationPrompt)] = &[
+    // Qwen3: the model writes its own `<think>`; thinking off closes it in the prompt.
+    (
+        "qwen3-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-0.6b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-235b-a22b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // The 2507 line, Qwen3-Next and Qwen3-VL split into instruct, with no thought, and thinking,
+    // whose template always opens the thought in the prompt.
+    (
+        "qwen3-4b-instruct-2507",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-30b-a3b-instruct-2507",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-235b-a22b-instruct-2507",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-4b-thinking-2507",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-235b-a22b-thinking-2507",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-next-80b-a3b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-next-80b-a3b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-2b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-4b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-8b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-30b-a3b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-32b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-235b-a22b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-vl-2b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-4b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-30b-a3b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-32b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-vl-235b-a22b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // Qwen2.5: no thought at all.
+    (
+        "qwen2.5-7b-instruct-1m",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen2.5-14b-instruct-1m",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen2.5-vl-3b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen2.5-vl-7b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen2.5-vl-32b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    ("qwen2.5-omni-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    // Qwen 3.5 and later write calls as tags and open the thought in the prompt; Qwen3-Coder
+    // writes tags and has no thought.
+    // Qwen3.5-0.8B's template has no thought.
+    ("qwen3.5-0.8b", Family::Qwen3Tagged, GenerationPrompt::Plain),
+    (
+        "qwen3.5-4b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.5-9b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.5-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.5-35b-a3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.5-122b-a10b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.6-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.6-35b-a3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3.8-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "qwen3-coder-30b-a3b-instruct",
+        Family::Qwen3Tagged,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "qwen3-coder-next",
+        Family::Qwen3Tagged,
+        GenerationPrompt::Plain,
+    ),
 ];
+
+/// The table that reads a checkpoint's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    /// [`qwen3`] with the JSON call syntax.
+    Qwen3,
+    /// [`qwen3`] with the tagged call syntax, typed by the case's request tools.
+    Qwen3Tagged,
+    /// [`qwen2_5`].
+    Qwen2_5,
+}
+
+impl Family {
+    fn engine(self, fixture: &Fixture) -> Engine {
+        match self {
+            Self::Qwen3 => Engine::new(qwen3(CallSyntax::Json)),
+            Self::Qwen3Tagged => Engine::new(qwen3(CallSyntax::Tagged(Declared::of(
+                &fixture.request.tools,
+            )))),
+            Self::Qwen2_5 => Engine::new(qwen2_5()),
+        }
+    }
+
+    /// The probe cases known to differ under this syntax: the code fence holds the JSON syntax,
+    /// which the JSON assembler reads as a call and the tagged one reports as text between a
+    /// call's tags.
+    fn known_differences(self, prompt: GenerationPrompt) -> &'static [KnownDifference] {
+        let list = match self {
+            Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
+            Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
+        };
+        // A template without a thought leaves the reasoning out, so the marker inside it is never
+        // read; that case falls under the reasoning allowance instead of the list.
+        match prompt {
+            GenerationPrompt::Plain => &list[1..],
+            _ => list,
+        }
+    }
+
+    /// The corpus classes this syntax meets: the tagged syntax cannot carry a type the text does
+    /// not say, and a template without a thought drops the reference's reasoning.
+    fn allowances(self, prompt: GenerationPrompt) -> Vec<Allowance> {
+        let mut allowed = Vec::new();
+        if self == Self::Qwen3Tagged {
+            allowed.push(Allowance::DeclaredTypeConflict);
+        }
+        if prompt == GenerationPrompt::Plain {
+            allowed.push(Allowance::ReasoningNotWritten);
+        }
+        if self == Self::Qwen2_5 {
+            allowed.push(Allowance::CallsNotWritten);
+        }
+        allowed
+    }
+}
 
 /// How a template ends the generation prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,17 +310,27 @@ enum GenerationPrompt {
     /// Qwen 3.5 and later: `<think>\n`, so the output starts inside the thought; when the request
     /// turns thinking off, `<think>\n\n</think>\n\n`, and the output starts in content.
     OpensTheThought,
-    /// Qwen3-Coder: `<|im_start|>assistant\n` and nothing more; the template has no thought.
+    /// The Qwen3 thinking variants (the 2507 line, Qwen3-Next, Qwen3-VL): `<think>\n` whatever
+    /// the request says; their templates have no switch, so the output always starts inside the
+    /// thought.
+    AlwaysOpensTheThought,
+    /// Qwen3: nothing, and the model writes its own `<think>`; thinking off closes it in the
+    /// prompt as above.
+    ModelWritesTheThought,
+    /// Qwen3-Coder, Qwen2.5 and the instruct variants: `<|im_start|>assistant\n` and nothing more;
+    /// the template has no thought.
     Plain,
 }
 
 impl GenerationPrompt {
     /// The bytes after `<|im_start|>assistant\n` for the case's request.
     fn tail(self, fixture: &Fixture) -> &'static str {
-        match self {
-            Self::Plain => "",
-            Self::OpensTheThought if fixture.request.thinking_off() => "<think>\n\n</think>\n\n",
-            Self::OpensTheThought => "<think>\n",
+        match (self, fixture.request.thinking_off()) {
+            (Self::Plain, _) | (Self::ModelWritesTheThought, false) => "",
+            (Self::OpensTheThought | Self::ModelWritesTheThought, true) => {
+                "<think>\n\n</think>\n\n"
+            }
+            (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => "<think>\n",
         }
     }
 }
@@ -96,6 +348,11 @@ enum Allowance {
     /// The template writes no thought, so the reasoning the reference carries is not in the output
     /// (bellwether #52: a case recorded although the template drops a part of the message).
     ReasoningNotWritten,
+    /// The template writes a message's content or its calls, not both, so the calls the reference
+    /// carries are not in the output: Qwen2.5-VL and Qwen2.5-Omni (bellwether #52 again). Allowed
+    /// only when the output holds no call marker at all, so a call the parser missed never passes
+    /// as one the template dropped.
+    CallsNotWritten,
 }
 
 /// A case known to differ from the reference beyond the separator bytes: why, and what the parser
@@ -304,7 +561,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
     );
     let failures = parity(
         &fixtures,
-        &|_| Qwen3::new(),
+        &|_| Engine::new(qwen3(CallSyntax::Json)),
         &|_| "",
         KNOWN_DIFFERENCES,
         &[],
@@ -318,7 +575,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
     clippy::print_stdout,
     reason = "the skip notice and the per-case report are test diagnostic output"
 )]
-fn tagged_parse_fixtures_match_the_reference() {
+fn every_recorded_qwen_model_parses_like_its_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
         eprintln!(
             "skipping: {FIXTURES_ENV} is not set; \
@@ -328,39 +585,26 @@ fn tagged_parse_fixtures_match_the_reference() {
     };
     let mut failures = Vec::new();
     let mut recorded = 0;
-    for &(slug, prompt) in TAGGED {
+    for &(slug, family, prompt) in MODELS {
         let dir = root.join(slug).join("parse");
         if !dir.is_dir() {
             eprintln!("skipping {slug}: bellwether has not recorded its parse sets yet");
             continue;
         }
         let fixtures = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
-        println!("{slug}:");
-        // A template without a thought leaves the reasoning out, so the marker inside it is never
-        // read; that case falls under the reasoning allowance instead of the list.
-        let known = match prompt {
-            GenerationPrompt::OpensTheThought => KNOWN_TAGGED_DIFFERENCES,
-            GenerationPrompt::Plain => &KNOWN_TAGGED_DIFFERENCES[1..],
-        };
-        let allowed: &[Allowance] = match prompt {
-            GenerationPrompt::OpensTheThought => &[Allowance::DeclaredTypeConflict],
-            GenerationPrompt::Plain => &[
-                Allowance::DeclaredTypeConflict,
-                Allowance::ReasoningNotWritten,
-            ],
-        };
+        println!("{slug} ({family:?}, {prompt:?}):");
         failures.extend(parity(
             &fixtures,
-            &|fixture| Qwen3::with_tagged_calls(Declared::of(&fixture.request.tools)),
+            &|fixture| family.engine(fixture),
             &|fixture| prompt.tail(fixture),
-            known,
-            allowed,
+            family.known_differences(prompt),
+            &family.allowances(prompt),
         ));
         recorded += 1;
     }
     if recorded == 0 {
         eprintln!(
-            "skipping: none of the tagged slugs is recorded under {}",
+            "skipping: none of the Qwen slugs is recorded under {}",
             root.display()
         );
     }
@@ -378,7 +622,7 @@ fn tagged_parse_fixtures_match_the_reference() {
 )]
 fn parity(
     fixtures: &[Fixture],
-    new_parser: &dyn Fn(&Fixture) -> Qwen3,
+    new_parser: &dyn Fn(&Fixture) -> Engine,
     prompt_tail: &dyn Fn(&Fixture) -> &'static str,
     known_differences: &[KnownDifference],
     allowed: &[Allowance],
@@ -453,11 +697,12 @@ fn parity(
             }
             listed += 1;
             "listed (bellwether #16)"
-        } else if let Some(allowance) = allowance_for(&said, &expected, allowed) {
+        } else if let Some(allowance) = allowance_for(&said, &expected, text, allowed) {
             allowed_count += 1;
             match allowance {
                 Allowance::DeclaredTypeConflict => "allowed: declared-type conflict (corpus)",
                 Allowance::ReasoningNotWritten => "allowed: reasoning not written (corpus)",
+                Allowance::CallsNotWritten => "allowed: calls not written (corpus)",
             }
         } else {
             failures.push(format!(
@@ -497,8 +742,14 @@ fn parity(
 }
 
 /// The allowance that covers the difference between `said` and `expected`, if one of `allowed`
-/// does: the two agree once the separators are trimmed, except as the allowance says.
-fn allowance_for(said: &Said, expected: &Said, allowed: &[Allowance]) -> Option<Allowance> {
+/// does: the two agree once the separators are trimmed, except as the allowance says. `text` is
+/// the output, for the allowance that asks what the template wrote.
+fn allowance_for(
+    said: &Said,
+    expected: &Said,
+    text: &str,
+    allowed: &[Allowance],
+) -> Option<Allowance> {
     let (said, expected) = (said.trimmed(), expected.trimmed());
     allowed.iter().copied().find(|allowance| match allowance {
         Allowance::ReasoningNotWritten => {
@@ -506,6 +757,16 @@ fn allowance_for(said: &Said, expected: &Said, allowed: &[Allowance]) -> Option<
                 && expected.reasoning.is_some()
                 && Said {
                     reasoning: None,
+                    ..expected.clone()
+                } == said
+        }
+        Allowance::CallsNotWritten => {
+            said.calls.is_empty()
+                && !expected.calls.is_empty()
+                && !text.contains("<tool_call>")
+                && Said {
+                    calls: Vec::new(),
+                    finish: "stop".to_string(),
                     ..expected.clone()
                 } == said
         }
@@ -619,8 +880,14 @@ fn qwen3_token_plans_count_every_token_where_its_first_byte_lands() {
         let expected_reasoning = reasoning_oracle(text, &starts);
         let finish = engine_finish(&fixture.reference.finish_reason);
         let by_text = Said::of(
-            &replay(&mut Qwen3::new(), text, &[], &finish, false)
-                .unwrap_or_else(|e| panic!("{}: {e}", fixture.id)),
+            &replay(
+                &mut Engine::new(qwen3(CallSyntax::Json)),
+                text,
+                &[],
+                &finish,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", fixture.id)),
         );
         for (name, sizes) in token_plans(fixture) {
             let place = format!("{} plan {name}", fixture.id);
@@ -746,7 +1013,7 @@ fn replay_tokens(
     sizes: &[usize],
     finish: &EngineFinish,
 ) -> Result<Vec<Event>, ParseError> {
-    let mut parser = Qwen3::new();
+    let mut parser = Engine::new(qwen3(CallSyntax::Json));
     let mut out = Events::new();
     parser.feed(prompt(), &mut out)?;
     let mut first = 0;
