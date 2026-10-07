@@ -203,12 +203,18 @@ That is the kept cache's doing, not the rule's: the engine still holds every sha
 publishes a block only when it stores it, so the index knows the worker's new conversations and not
 the heads every request shares, and affinity's ties never include it until its cache turns over,
 which needs the requests it is not getting. The levers are the ratio (`--worker-warmup-thin-ratio`
-nearer one keeps the diversion going until the index nearly matches the level, measured below), a
-starvation rule keyed on the worker's request share rather than its index size, or a servicer that
-re-publishes its resident blocks when its publisher restarts, as the relay's snapshot does for a
-gateway restart. A thin worker is served even in a young fleet; workers warming only because they
-are young are served only when the fleet is not all young. A few blocks of overlap count as a head
-only when they are under half of the request, so a short request cached whole stays with its holder.
+nearer one keeps the diversion going until the index nearly matches the level: at 0.9 the same
+reproduction refills the worker to 30,226 blocks, 92 % of the level, in a minute through eleven
+diverted hits and thirty-eight slice decisions, memberships to 259.5k of 262.1k, and it idles after
+that all the same; the default stays 0.5, the knob is documented), a starvation rule keyed on the
+worker's request share rather than its index size, or a servicer that re-publishes its resident
+blocks when its publisher restarts, as the relay's snapshot does for a gateway restart. On a real
+engine a publisher restart is an engine restart with the cache gone, so the kept-cache case is
+mostly the mock's; whether the relay's priming at start already re-publishes resident blocks after a
+relay restart is the one question left there. A thin worker is served even in a young fleet; workers
+warming only because they are young are served only when the fleet is not all young. A few blocks of
+overlap count as a head only when they are under half of the request, so a short request cached
+whole stays with its holder.
 
 **Hit diversion (added 2026-10-06).** The thinness rule serves misses, and a replay where every
 request has a holder (a system prompt or a chat template in front of everything, as in the churn
