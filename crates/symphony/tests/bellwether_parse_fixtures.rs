@@ -13,11 +13,13 @@
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
 //! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves; it
-//! skips the slugs bellwether has not recorded yet, and says so. That test also allows two classes
-//! of difference the corpus itself has ([`Allowance`]): a reference argument whose type
-//! contradicts the one the tool declares, which the template writes the same way as the string,
-//! and reasoning in a reference whose template writes no thought. Each allowed case is counted
-//! and printed, so the classes cannot hide anything else.
+//! skips the slugs bellwether has not recorded yet, and says so. When a preview run sets
+//! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows three classes of difference the scale-run
+//! sets of 2026-10-06 have ([`Allowance`]): a reference argument whose type contradicts the one the
+//! tool declares, which the template writes the same way as the string; reasoning in a reference
+//! whose template writes no thought; and calls in a reference whose template writes content or
+//! calls, not both. Each is refused at record time by bellwether now, each allowed case is counted
+//! and printed, and without the switch the classes fail the run, so they cannot hide anything.
 //!
 //! Two policy questions stand between the parser and bitwise parity, and the test declares them
 //! rather than hides them. Bellwether #17: the template's separator bytes (the newline after
@@ -294,7 +296,7 @@ impl Family {
     /// the text does not say, a template without a thought drops the reference's reasoning, and
     /// four Qwen2.5 templates write content or calls, not both.
     fn allowances(self, slug: &str, prompt: GenerationPrompt) -> Vec<Allowance> {
-        if std::env::var_os(CORPUS_ALLOWANCES_ENV).is_none() {
+        if !corpus_allowances_on() {
             return Vec::new();
         }
         let mut allowed = Vec::new();
@@ -345,6 +347,11 @@ impl GenerationPrompt {
 /// The variable a preview run sets to allow the corpus classes below; CI, on sets bellwether
 /// records now, leaves it unset, so a class that comes back fails the run.
 const CORPUS_ALLOWANCES_ENV: &str = "SYMPHONY_CORPUS_ALLOWANCES";
+
+/// Whether the run opted in: the variable is set to anything but `0` or nothing.
+fn corpus_allowances_on() -> bool {
+    std::env::var(CORPUS_ALLOWANCES_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+}
 
 /// The slugs whose template writes a message's content or its calls, not both.
 const CONTENT_OR_CALLS: &[&str] = &[

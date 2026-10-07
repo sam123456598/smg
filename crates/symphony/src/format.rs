@@ -203,9 +203,38 @@ impl Format {
         self.calls.as_ref()
     }
 
-    /// Whether the table has a state at all; the engine starts in state 0.
-    pub(crate) fn has_states(&self) -> bool {
-        !self.states.is_empty()
+    /// What every table must hold before an engine runs it: a state to start in, a call syntax
+    /// when a state emits arguments, a text for every terminal and a turn opener that is not
+    /// empty. The builder keeps a row from naming what the table lacks; this checks the rest.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.states.is_empty() {
+            return Err(format!("format {}: a table with no state", self.name));
+        }
+        if self
+            .states
+            .iter()
+            .any(|state| state.emits == Emits::Arguments)
+            && self.calls.is_none()
+        {
+            return Err(format!(
+                "format {}: an arguments state with no call syntax",
+                self.name
+            ));
+        }
+        if let Some(terminal) = self
+            .terminals
+            .iter()
+            .find(|terminal| terminal.text.is_empty())
+        {
+            return Err(format!(
+                "format {}: terminal {:?} has no text",
+                self.name, terminal.name
+            ));
+        }
+        if self.turn_opener.as_deref() == Some("") {
+            return Err(format!("format {}: an empty turn opener", self.name));
+        }
+        Ok(())
     }
 }
 
@@ -236,8 +265,24 @@ mod tests {
         assert_eq!(format.next(0, 1), None, "a closer in content has no row");
         assert_eq!(format.next(1, 0), None, "an opener inside has no row");
         assert!(format.call_syntax().is_none());
-        assert!(format.has_states());
-        assert!(!Format::new("empty").has_states());
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            Format::new("empty").validate(),
+            Err("format empty: a table with no state".to_string())
+        );
+        assert_eq!(
+            Format::new("calls")
+                .state("calls", Emits::Arguments)
+                .validate(),
+            Err("format calls: an arguments state with no call syntax".to_string())
+        );
+        assert_eq!(
+            Format::new("blank")
+                .terminal("t", "")
+                .state("c", Emits::Content)
+                .validate(),
+            Err("format blank: terminal \"t\" has no text".to_string())
+        );
     }
 
     #[test]

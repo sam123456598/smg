@@ -16,9 +16,9 @@
 //! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no
 //! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
 //!
-//! Status: the public types below are the contract, and [`adapt`] renders them for the Chat
-//! Completions, Responses and Messages APIs, streamed and whole; the engine and the format
-//! definitions follow in later changes.
+//! Status: the public types below are the contract, [`adapt`] renders them for the Chat
+//! Completions, Responses and Messages APIs, streamed and whole, and [`Engine`] runs a [`Format`]
+//! table: the Qwen family's tables are in, the other families follow one table each.
 
 #![forbid(unsafe_code)]
 

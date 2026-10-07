@@ -1051,7 +1051,8 @@ mod tests {
     #[test]
     fn the_prompt_is_replayed_from_the_turn_the_model_writes_not_from_its_start() {
         // A stray `<tool_call>` in the user's turn, and the generation prompt opens the thought:
-        // the output is the thought, not content (smg #2839, Alex's probe against main).
+        // the output is the thought, not content (smg #2839, Alex's probe against the parser
+        // this table replaced, which read the prompt's tail by its last `<think>`).
         let output = "The user asks about the marker.\n</think>\n\nIt opens a tool call.";
         for prompt in [
             "<|im_start|>user\nWhy did you print <tool_call> there?<|im_end|>\n\
@@ -1073,7 +1074,7 @@ mod tests {
             }
         }
         // An earlier call whose arguments hold `<think>`, closed in its own turn: the output is
-        // content, as the model wrote no thought (main read it as reasoning).
+        // content, as the model wrote no thought (the replaced parser read it as reasoning).
         let prompt = "<|im_start|>assistant\n<tool_call>\n\
                       {\"name\": \"write\", \"arguments\": {\"text\": \"<think>\"}}\n\
                       </tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n\

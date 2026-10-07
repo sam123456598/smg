@@ -151,14 +151,16 @@ impl Engine {
     ///
     /// # Panics
     ///
-    /// A format with no state has nowhere to put the output's text; definitions are written in
-    /// the crate, so that is a programming error.
+    /// A table [`Format::validate`] refuses has nowhere to put the output's text, or no syntax for
+    /// its calls; definitions are written in the crate, so that is a programming error.
+    #[expect(
+        clippy::panic,
+        reason = "a table the crate wrote that fails its own check is a programming error"
+    )]
     pub fn new(format: Format, declared: Declared) -> Self {
-        assert!(
-            format.has_states(),
-            "format {}: a table with no state",
-            format.name()
-        );
+        if let Err(why) = format.validate() {
+            panic!("{why}");
+        }
         Self {
             scanner: Scanner::new(format.terminal_texts()),
             format,
