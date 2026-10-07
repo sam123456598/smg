@@ -1,10 +1,20 @@
-//! Logging infrastructure with non-blocking file I/O.
+//! Logging infrastructure with non-blocking I/O for every sink.
+//!
+//! Each formatting layer hands its lines to a dedicated writer thread through
+//! a bounded, lossy channel ([`tracing_appender::non_blocking`]), so the tokio
+//! runtime threads that emit the events never wait for the sink. That matters
+//! for stdout as much as for the log file: when stdout is redirected to a
+//! regular file, every `write(2)` is subject to the kernel's dirty-page
+//! throttling and can sleep for hundreds of milliseconds under writeback
+//! pressure, which with a synchronous `std::io::stdout()` writer parked a
+//! runtime worker, and every connection it was driving, once per access-log
+//! line.
 
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use tracing::Level;
 use tracing_appender::{
-    non_blocking::WorkerGuard,
+    non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard},
     rolling::{RollingFileAppender, Rotation},
 };
 use tracing_log::{AsLog, LogTracer};
@@ -67,9 +77,29 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Guard that keeps the file appender thread alive.
+/// Guard that keeps the log writer threads alive.
+///
+/// Dropping it flushes what the writers still hold and stops their threads,
+/// so it must live for the lifetime of the process.
 pub struct LogGuard {
+    _stdout_guard: WorkerGuard,
     _file_guard: Option<WorkerGuard>,
+}
+
+/// Move `sink` to its own thread behind a bounded, lossy channel.
+///
+/// Callers never block on the sink: a line is queued for the writer thread, or
+/// counted and dropped when the queue is full. A sink that stalls therefore
+/// slows nothing but its own thread.
+#[inline]
+fn non_blocking<W: Write + Send + 'static>(
+    sink: W,
+    thread_name: &str,
+) -> (NonBlocking, WorkerGuard) {
+    NonBlockingBuilder::default()
+        .lossy(true)
+        .thread_name(thread_name)
+        .finish(sink)
 }
 
 #[inline]
@@ -207,11 +237,17 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     let mut layers = Vec::with_capacity(3);
 
+    // `std::io::stdout()` itself is a line-buffered writer that performs one
+    // synchronous `write(2)` per event on the emitting thread; keep that
+    // syscall, and whatever the kernel makes of it, off the runtime threads.
+    let (stdout_writer, stdout_guard) = non_blocking(std::io::stdout(), "smg-log-stdout");
+
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_ansi(config.colorize)
         .with_file(true)
         .with_line_number(true)
-        .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()));
+        .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
+        .with_writer(stdout_writer);
 
     let stdout_layer = if config.json_format {
         stdout_layer.json().flatten_event(true).boxed()
@@ -233,14 +269,17 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
                 {
                     eprintln!("Failed to create log directory: {e}");
                 }
-                return LogGuard { _file_guard: None };
+                return LogGuard {
+                    _stdout_guard: stdout_guard,
+                    _file_guard: None,
+                };
             }
         }
 
         let file_appender =
             RollingFileAppender::new(Rotation::DAILY, log_dir, &config.log_file_name);
 
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let (file_writer, guard) = non_blocking(file_appender, "smg-log-file");
         file_guard = Some(guard);
 
         let file_layer = tracing_subscriber::fmt::layer()
@@ -248,7 +287,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
             .with_file(true)
             .with_line_number(true)
             .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
-            .with_writer(non_blocking);
+            .with_writer(file_writer);
 
         let file_layer = if config.json_format {
             file_layer.json().flatten_event(true).boxed()
@@ -282,7 +321,62 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         .try_init();
 
     LogGuard {
+        _stdout_guard: stdout_guard,
         _file_guard: file_guard,
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use std::{io, sync::mpsc, thread, time::Duration};
+
+    use tracing_appender::non_blocking::DEFAULT_BUFFERED_LINES_LIMIT;
+
+    use super::*;
+
+    /// A sink whose first `write` blocks until released: a file write that the
+    /// kernel is throttling, as seen from the thread that issued it.
+    struct StalledSink {
+        gate: Option<mpsc::Receiver<()>>,
+    }
+
+    impl Write for StalledSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.recv();
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stalled_sink_never_blocks_the_emitting_thread() {
+        let (release, gate) = mpsc::channel();
+        let (mut writer, guard) =
+            non_blocking(StalledSink { gate: Some(gate) }, "test-log-stalled");
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            // More lines than the channel holds, while the sink accepts none.
+            for _ in 0..DEFAULT_BUFFERED_LINES_LIMIT + 1_000 {
+                writer
+                    .write_all(b"finished processing request\n")
+                    .expect("a lossy writer reports every line as written");
+            }
+            let _ = done.send(writer.error_counter().dropped_lines());
+        });
+        let dropped = finished.recv_timeout(Duration::from_secs(10));
+        // Unblock the writer thread whatever happened, so a failure does not leak it.
+        let _ = release.send(());
+        let dropped = dropped.expect("writes against a stalled sink must return, not wait for it");
+        assert!(
+            dropped > 0,
+            "the queue is bounded: overflow is dropped, never waited for"
+        );
+        drop(guard);
     }
 }
 
