@@ -223,7 +223,7 @@ impl Config {
                 "--decode-per-req-ms" => {
                     timing.decode_per_req_ms = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
-                "--max-batched-tokens" | "--prefill-chunk" => {
+                "--max-batched-tokens" => {
                     cfg.engine.max_batched_tokens = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--max-running" => cfg.engine.max_running = parse(value(&mut args, &flag)?, &flag)?,
@@ -319,7 +319,7 @@ impl Config {
 impl Config {
     /// The KV-event publisher of worker number `index` (gRPC workers first,
     /// then ZMQ ranks), when publishing is on and the engine is realistic.
-    pub fn kv_zmq_for(&self, index: u16) -> Option<crate::kv_zmq::KvZmqConfig> {
+    pub(crate) fn kv_zmq_for(&self, index: u16) -> Option<crate::kv_zmq::KvZmqConfig> {
         if !self.realistic {
             return None;
         }
@@ -376,7 +376,7 @@ fn usage() -> String {
        --prefill-tps <f>        linear model: prefill tokens/sec (default 8000; selects linear)\n\
        --decode-base-ms <f>     linear model: fixed decode-step ms (default 6.0)\n\
        --decode-per-req-ms <f>  linear model: decode ms per running request (default 0.35)\n\
-       --max-batched-tokens <n> token budget per pass (default 8192; --prefill-chunk is an alias)\n\
+       --max-batched-tokens <n> token budget per pass (default 8192)\n\
        --max-running <n>        max sequences per pass (default 256)\n\
        --kv-tokens <n>          KV cache capacity in tokens (default 524288)\n\
        --kv-blocks <n>          KV cache capacity in blocks (overrides --kv-tokens)\n\

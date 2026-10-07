@@ -28,6 +28,13 @@ ids): `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed
 chunks + complete), `GetLoads`, `Abort`, and (realistic mode only)
 `SubscribeKvEvents`; other admin RPCs return `unimplemented`.
 
+**ZMQ** (`--zmq-handshake <ipc://…> --zmq-count N [--zmq-start-index I]`):
+mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP
+and gRPC workers, which bind and are dialed, each rank dials the frontend's
+handshake address, registers, takes `EngineCoreRequest`s and pushes
+`EngineCoreOutputs` with the engine's load as `scheduler_stats`; the admin API
+sees it as worker `zmq:<index>`.
+
 ## Run (canned)
 
 ```bash
@@ -39,7 +46,8 @@ cargo run --release -p mock-worker -- \
 
 Each worker is one port. Register them against an IGW gateway with
 `POST /workers` (`{"url":"http://127.0.0.1:9000"}`, or `grpc://…` with
-`connection_mode`/`runtime`/`models` for gRPC).
+`connection_mode`/`runtime`/`models` for gRPC). `mock-worker --help` lists
+every flag with its default.
 
 ## Realistic engine
 
@@ -76,7 +84,8 @@ experiments against it transfer to engines:
   tokens `T` of the pass, decode `max(1, 5.74 + 54.01·u − 25.74·u²)` ms over
   the KV utilisation `u` of the decoding requests; a pass lasts prefill plus
   decode, and the first token of a prefill adds no decode time.
-  `--timing linear` keeps the older `prefill_tps` / `base + slope·batch` model.
+  `--timing linear` is the simpler model: prefill at `--prefill-tps` tokens/s,
+  decode `base + per-request · batch` ms.
 - **cached tokens** — a request sharing a prefix with cached blocks pays less
   prefill and reports `cached_tokens` (gRPC chunks, HTTP
   `usage.prompt_tokens_details.cached_tokens`).
@@ -90,7 +99,7 @@ experiments against it transfer to engines:
 | `--prefill-tps` | 8000 | linear model: prefill tokens/s (selects `linear`) |
 | `--decode-base-ms` | 6.0 | linear model: fixed decode-pass ms |
 | `--decode-per-req-ms` | 0.35 | linear model: decode ms per running request |
-| `--max-batched-tokens` | 8192 | token budget per pass (`--prefill-chunk` is an alias) |
+| `--max-batched-tokens` | 8192 | token budget per pass |
 | `--max-running` | 256 | sequences per pass |
 | `--kv-tokens` / `--kv-blocks` | 524288 tokens | KV pool capacity |
 | `--block-size` | 16 | cache block/page size (tokens); must match the worker's `kv_block_size` |
@@ -176,8 +185,9 @@ The unit tests decode both wires with the Rust relay's own normalizer
 `--admin-port` serves the ground truth a routing benchmark needs and real
 engines do not expose:
 
-- `GET /admin/fleet` — every engine (`grpc:<port>` / `http:<port>`) with cache
-  size, load, cached blocks and preemptions;
+- `GET /admin/health` — `ok`;
+- `GET /admin/fleet` — every engine (`grpc:<port>` / `http:<port>` /
+  `zmq:<index>`) with cache size, load, cached blocks and preemptions;
 - `GET /admin/requests?since=<seq>&limit=<n>` — admitted requests with the
   serving worker, prompt/cached tokens, queue wait and the **arrival-time
   oracle**: the most cached tokens any worker of the process held when the
@@ -193,7 +203,7 @@ label, e.g. `"labels":{"tokenizer_path":"gpt2"}`, and a `"kv_block_size":16`, an
 do **not** pass `--disable-tokenizer-autoload`. (HTTP workers need no tokenizer
 but cannot drive event-driven `cache_aware`, which requires token ids.)
 
-### Fault hooks (recovery drills)
+### Fault hooks
 
 All under the admin API; `{worker}` is a worker name (`grpc:<port>`,
 `zmq:<index>`) or `all`. A hook applies to every KV-event transport of the
@@ -211,7 +221,7 @@ the worker's hook state (`drop_pending`, `dropped_total`, `delay_ms`,
 | `GET /admin/fault/{worker}` | the hooks' current state (pending drops, delay, restarts, paused, generation) |
 | `POST /admin/reset/{worker}` | (already there) clear the cache and publish `AllBlocksCleared` |
 
-### Truth endpoints (guardrail 7: engine truth)
+### Truth endpoints
 
 | Endpoint | Answer |
 |----------|--------|
@@ -313,37 +323,28 @@ replay --trace mooncake_trace.jsonl --gateway http://127.0.0.1:31000 \
 With `--gateway-log <file>` (the gateway run at `--log-level debug`) the
 gateway's routing decisions are joined to the requests by request id (the
 `x-request-id` header, which is the response id without its uuid tail) and
-`t4.md` prints the T4 table (the hardware harness's columns): `phase, idx, worker, branch,
-prompt_tokens, engine cached_tokens, implied overlap, agree`. The implied
-overlap is the gateway's stated credit when its log carries one
-(`overlap_tokens=`, `overlap_blocks=` or the tree path's `matched_ratio=`);
-otherwise `agree` compares the branch's claim of an overlap (`event_hit`,
-`event_spill`) with whether the engine served cached tokens. With `--admin`
-the summary also carries `engine_truth_per_worker`, each engine's own account
-of the prompt, cached and oracle tokens it served.
+`t4.md` lists them per request: `phase, idx, worker, branch, prompt_tokens,
+engine cached_tokens, implied overlap, agree`. The implied overlap is the
+gateway's stated credit when its log carries one (`overlap_tokens=`,
+`overlap_blocks=` or the tree path's `matched_ratio=`); otherwise `agree`
+compares the branch's claim of an overlap (`event_hit`, `event_spill`) with
+whether the engine served cached tokens. With `--admin` the summary also
+carries `engine_truth_per_worker`, each engine's own account of the prompt,
+cached and oracle tokens it served, and `fleet.csv` samples every worker's
+load, cached blocks, preemptions and KV batches once a second for the whole
+run.
 
 The mock fleet it is meant for is `mock-worker --engine realistic --admin-port`
 (the [Realistic engine](#realistic-engine) above; note the caveat that its timing
 polynomials were validated against hardware only with prefix caching off).
 
-### Soak (guardrail 3)
+### Long runs
 
-A soak keeps one gateway and one mock fleet up for 24 hours and replays the
-trace window by window with this replayer (`--skip` advancing by `--limit`
-each window, `--admin` for the oracle join, a label per window), while:
-
-- a fault scheduler drives the mock's admin fault hooks on a cycle, over the
-  workers in turn: drop 20 batches, a 1000 ms publishing delay for 60 s, a
-  publisher restart, pause 30 s then resume, and a worker restart (cache
-  reset plus publisher restart, what the index sees when an engine restarts);
-- a sampler appends one row per minute: gateway RSS and its allocator gauges,
-  its cache-aware branch counters, match-ratio mean, engine cache-hit gauge
-  and KV-subscription failures from `/metrics`, and from the mock's admin API
-  the last minute's requests, hit/oracle, prefix reuse, per-worker balance,
-  preemptions and KV batches.
-
-The report reads the guardrail on the allocator's live bytes at idle (hour N
-against hour 1, within 5%), with RSS as the retention indicator, and prints
-hit/oracle, reuse and balance in the minutes before and after each fault, the
-counters, and the per-window table (rows served, TTFT, goodput, hit/oracle,
-reuse, balance, active workers). The scripts live outside the crate.
+For a run of hours, keep one gateway and one fleet up and start the replayer
+window by window (`--skip` advancing by `--limit`, a `--label` per window,
+`--admin` for the oracle join), driving the admin fault hooks on a cycle over
+the workers in turn (lost batches, a publishing delay, a publisher restart, a
+pause and resume, a cache reset) and sampling the gateway's `/metrics` once a
+minute. The memory reading that matters is the gateway allocator's live bytes
+at idle, hour over hour; its RSS shows how much the allocator keeps, not what
+is live.

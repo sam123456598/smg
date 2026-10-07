@@ -20,7 +20,7 @@ use ts::{
 
 use crate::{
     config::Config,
-    engine::{self, Engine, LoadsLike, NewRequest},
+    engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
     replay::Capture,
 };
 
@@ -105,7 +105,6 @@ struct MockScheduler {
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
-type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
 type TokenizerStream =
     Pin<Box<dyn Stream<Item = Result<common::GetTokenizerChunk, Status>> + Send>>;
 
@@ -302,8 +301,8 @@ impl TokenSpeedScheduler for MockScheduler {
                     engine.subscribe_kv(start),
                 )))
             }
-            // Otherwise Unimplemented makes the gateway's KvEventMonitor give up
-            // cleanly (no idle per-worker task), exactly as before this RPC existed.
+            // Otherwise Unimplemented, on which the gateway's KvEventMonitor gives
+            // up cleanly instead of keeping an idle per-worker task.
             _ => Err(Status::unimplemented(
                 "mock-worker (KV events require --engine realistic with --prefix-cache true)",
             )),

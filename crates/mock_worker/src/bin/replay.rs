@@ -85,13 +85,14 @@ struct Args {
     #[arg(long, default_value_t = 7)]
     seed: u64,
     /// The gateway's log at debug level: its routing decisions are joined to
-    /// the requests by request id (T4: gateway credit vs engine truth).
+    /// the requests by request id, so the gateway's cache credit can be
+    /// compared with what the engine served.
     #[arg(long)]
     gateway_log: Option<PathBuf>,
     /// The fleet's block size, to turn a credit in blocks into tokens.
     #[arg(long, default_value_t = 16)]
     block_size: u32,
-    /// Rows of the T4 table written to `t4.md`.
+    /// Rows of the per-request decision table written to `t4.md`.
     #[arg(long, default_value_t = 40)]
     t4_rows: usize,
 }
@@ -732,7 +733,7 @@ fn request_id_prefix(id: &str) -> String {
     id.to_string()
 }
 
-fn t4_summary(ok: &[&ReqResult], decisions: usize) -> Value {
+fn decision_summary(ok: &[&ReqResult], decisions: usize) -> Value {
     let joined: Vec<&&ReqResult> = ok.iter().filter(|r| !r.branch.is_empty()).collect();
     let agree = joined.iter().filter(|r| r.agree == Some(true)).count();
     let credit_known = joined.iter().filter(|r| r.credit_tokens.is_some()).count();
@@ -756,10 +757,10 @@ fn t4_summary(ok: &[&ReqResult], decisions: usize) -> Value {
     })
 }
 
-/// The T4 table (the hardware harness's columns): `implied overlap` is the
+/// The per-request decision table (`t4.md`): `implied overlap` is the
 /// gateway's stated credit when its log carries one, `-` otherwise (then
 /// `agree` compares the branch's claim of an overlap with the engine).
-fn t4_table(results: &[ReqResult], rows: usize) -> String {
+fn decision_table(results: &[ReqResult], rows: usize) -> String {
     let mut out = String::from(
         "| phase | idx | worker | branch | prompt_tokens | engine cached_tokens | implied overlap | agree |
 |---|---|---|---|---|---|---|---|
@@ -1048,7 +1049,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Gateway routing decisions (T4): join by request id.
+    // Gateway routing decisions: join by request id.
     let mut decisions: HashMap<String, Decision> = HashMap::new();
     if let Some(log) = &args.gateway_log {
         match fs::read_to_string(log) {
@@ -1154,7 +1155,7 @@ async fn main() -> Result<()> {
         "hit_over_oracle": if oracle_total == 0 { f64::NAN } else { cached_total as f64 / oracle_total as f64 },
         "oracle_known": oracle_known,
         "per_worker_requests": per_worker.iter().map(|(w, v)| json!({"worker": w, "requests": v.0, "uncached_prompt_tokens": v.1})).collect::<Vec<_>>(),
-        "t4": t4_summary(&ok, decisions.len()),
+        "t4": decision_summary(&ok, decisions.len()),
         "engine_truth_per_worker": truth_per_worker.get("workers").cloned().unwrap_or(Value::Array(Vec::new())),
         "balance_max_over_mean": balance_max_over_mean,
         "slo": {"ttft_ms": args.slo_ttft_ms, "itl_ms": args.slo_itl_ms, "itl_metric": "per-request mean (strict variant: per-request p99)"},
@@ -1193,7 +1194,10 @@ async fn main() -> Result<()> {
         ));
     }
     fs::write(args.out.join("requests.csv"), csv)?;
-    fs::write(args.out.join("t4.md"), t4_table(&results, args.t4_rows))?;
+    fs::write(
+        args.out.join("t4.md"),
+        decision_table(&results, args.t4_rows),
+    )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
@@ -1449,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn t4_table_has_the_harness_columns() {
+    fn decision_table_has_the_expected_columns() {
         let mut r = ReqResult {
             row: 3,
             status: "ok".to_string(),
@@ -1460,12 +1464,12 @@ mod tests {
             agree: Some(true),
             ..Default::default()
         };
-        let table = t4_table(std::slice::from_ref(&r), 10);
+        let table = decision_table(std::slice::from_ref(&r), 10);
         assert!(table.starts_with("| phase | idx | worker | branch | prompt_tokens | engine cached_tokens | implied overlap | agree |"));
         assert!(table.contains("| replay | 3 | 19500 | event_hit | 640 | 512 | - | true |"));
         assert!(table.contains("agreement: 1/1"));
         r.credit_tokens = Some(512);
-        let table = t4_table(std::slice::from_ref(&r), 10);
+        let table = decision_table(std::slice::from_ref(&r), 10);
         assert!(table.contains("| 640 | 512 | 512 | true |"));
     }
 

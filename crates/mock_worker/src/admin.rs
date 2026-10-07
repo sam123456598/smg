@@ -1,6 +1,6 @@
 //! Process-wide admin API for the simulated fleet: the ground truth a routing
-//! benchmark needs that real engines do not expose, and the fault hooks the
-//! recovery drills switch on.
+//! benchmark needs that real engines do not expose, and the fault hooks a
+//! recovery test switches on.
 //!
 //! - `GET /admin/fleet`: every registered engine with its cache size and load.
 //! - `GET /admin/requests?since=<seq>&limit=<n>`: admitted-request records
@@ -40,11 +40,11 @@ use crate::{
     engine::{self, Engine},
 };
 
-pub struct AdminState {
+struct AdminState {
     cfg: Arc<Config>,
 }
 
-pub fn router(state: Arc<AdminState>) -> Router {
+fn router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/admin/health", get(health))
         .route("/admin/fleet", get(fleet))

@@ -146,8 +146,8 @@ async fn line_is_on_disk_before_the_first_frame() {
     let path = dir.path().join("generate.jsonl");
     let mut cfg = config(Some(path.clone()));
     cfg.realistic = true;
-    // The leap's engine keeps its step times in a timing model: the linear one
-    // with a 200 ms decode base holds the first frame back as before.
+    // The linear timing model with a 200 ms decode base holds the first
+    // frame back long enough for the check.
     cfg.engine.timing = TimingModel::Linear {
         prefill_tps: 8000.0,
         decode_base_ms: 200.0,

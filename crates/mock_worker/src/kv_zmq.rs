@@ -33,10 +33,7 @@
 //! `AllBlocksCleared` batch, as the scheduler does; replay replies are
 //! `[routing…, seq, payload]` and `[routing…, END, b""]`.
 
-use std::{
-    collections::VecDeque,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::VecDeque;
 
 use futures::StreamExt;
 use rmpv::Value;
@@ -46,10 +43,10 @@ use zeromq::{
     PubSocket, RouterSocket, ZmqError, ZmqMessage,
 };
 
-use crate::engine::Engine;
+use crate::engine::{unix_seconds, Engine};
 
 /// The engines' end-of-replay marker: `(-1).to_bytes(8, "big", signed=True)`.
-pub const END_SEQ: [u8; 8] = [0xff; 8];
+const END_SEQ: [u8; 8] = [0xff; 8];
 
 /// Which engine's publisher to imitate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,20 +69,20 @@ impl std::str::FromStr for Wire {
 
 /// Where and how one worker publishes.
 #[derive(Clone, Debug)]
-pub struct KvZmqConfig {
-    pub host: String,
+pub(crate) struct KvZmqConfig {
+    pub(crate) host: String,
     /// PUB port; the replay ROUTER, when enabled, binds `port + 1`.
-    pub port: u16,
-    pub replay: bool,
-    pub topic: String,
-    pub buffer_steps: usize,
-    pub dp_rank: i32,
-    pub wire: Wire,
+    pub(crate) port: u16,
+    pub(crate) replay: bool,
+    pub(crate) topic: String,
+    pub(crate) buffer_steps: usize,
+    pub(crate) dp_rank: i32,
+    pub(crate) wire: Wire,
 }
 
 /// Bind the sockets and publish the engine's events until its event channel
 /// closes.
-pub async fn serve(engine: Engine, cfg: KvZmqConfig) {
+pub(crate) async fn serve(engine: Engine, cfg: KvZmqConfig) {
     let mut publisher = PubSocket::new();
     let endpoint = format!("tcp://{}:{}", cfg.host, cfg.port);
     if let Err(e) = publisher.bind(&endpoint).await {
@@ -113,7 +110,7 @@ pub async fn serve(engine: Engine, cfg: KvZmqConfig) {
 }
 
 /// Publish on already-bound sockets (tests bind port 0 and read it back).
-pub async fn run(
+async fn run(
     engine: Engine,
     cfg: KvZmqConfig,
     mut publisher: PubSocket,
@@ -174,7 +171,7 @@ async fn recv_replay(replay: &mut Option<RouterSocket>) -> Result<ZmqMessage, Zm
 }
 
 /// The publisher's own state: sequence counter and replay buffer.
-pub struct Publisher {
+struct Publisher {
     topic: Vec<u8>,
     seq: u64,
     buffer: VecDeque<(u64, Vec<u8>)>,
@@ -184,7 +181,7 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    pub fn new(topic: Vec<u8>, buffer_steps: usize, dp_rank: i32, wire: Wire) -> Self {
+    fn new(topic: Vec<u8>, buffer_steps: usize, dp_rank: i32, wire: Wire) -> Self {
         Self {
             topic,
             seq: 0,
@@ -196,13 +193,14 @@ impl Publisher {
     }
 
     /// The next sequence number to be published.
-    pub fn next_seq(&self) -> u64 {
+    #[cfg(test)]
+    fn next_seq(&self) -> u64 {
         self.seq
     }
 
     /// Encode `batch`, assign it the next sequence, keep it for replay and
     /// return the PUB message.
-    pub fn publish(&mut self, batch: &common::KvEventBatch) -> ZmqMessage {
+    fn publish(&mut self, batch: &common::KvEventBatch) -> ZmqMessage {
         let payload = encode_batch(batch, self.dp_rank, self.wire);
         let seq = self.seq;
         self.seq += 1;
@@ -214,14 +212,14 @@ impl Publisher {
     }
 
     /// A publisher restart: the sequence starts over and the buffer is gone.
-    pub fn restart(&mut self) {
+    fn restart(&mut self) {
         self.seq = 0;
         self.buffer.clear();
     }
 
     /// Replies to a replay request as vLLM frames them (see the module doc);
     /// a request without an 8-byte start sequence gets no reply.
-    pub fn replay(&self, request: &ZmqMessage) -> Vec<ZmqMessage> {
+    fn replay(&self, request: &ZmqMessage) -> Vec<ZmqMessage> {
         let frames: Vec<Vec<u8>> = request.iter().map(|f| f.to_vec()).collect();
         let Some((start, routing)) = frames.split_last() else {
             return Vec::new();
@@ -264,22 +262,15 @@ fn routed(routing: &[Vec<u8>]) -> ZmqMessage {
 }
 
 /// A PUB message: `[topic, sequence (u64 big-endian), payload]`.
-pub fn frame(topic: &[u8], seq: u64, payload: Vec<u8>) -> ZmqMessage {
+fn frame(topic: &[u8], seq: u64, payload: Vec<u8>) -> ZmqMessage {
     let mut message = ZmqMessage::from(topic.to_vec());
     message.push_back(seq.to_be_bytes().to_vec().into());
     message.push_back(payload.into());
     message
 }
 
-fn unix_seconds() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
 /// The batch SGLang's scheduler publishes first: a lone `AllBlocksCleared`.
-pub fn startup_cleared() -> common::KvEventBatch {
+fn startup_cleared() -> common::KvEventBatch {
     common::KvEventBatch {
         sequence_number: 0,
         timestamp: 0.0,

@@ -150,8 +150,8 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                 tracing::debug!("zmq engine {engine_index} ignoring start of wave {wave}");
             }
             Ok(EngineInbound::Utility(call)) => {
-                // The mock holds no KV blocks, so a prefix-cache reset always
-                // succeeds; no other EngineCore method exists here.
+                // A prefix-cache reset is acknowledged and leaves the simulated
+                // engine's cache as it is; no other EngineCore method exists here.
                 let outcome = if call.method == "reset_prefix_cache" {
                     Ok(OpaqueValue::from(true))
                 } else {
@@ -372,7 +372,11 @@ mod tests {
             }
         }
         assert!(finished, "stream should reach a terminal output");
-        assert_eq!(tokens.len(), 4, "canned mode emits output_tokens tokens");
+        assert_eq!(
+            tokens.len(),
+            4,
+            "a request without max_tokens gets output_tokens tokens"
+        );
     }
 
     /// Two mock ranks dial one socket set — the grouped-worker topology the
@@ -426,7 +430,11 @@ mod tests {
                 }
             }
             assert!(finished, "rank {rank} should reach a terminal output");
-            assert_eq!(tokens.len(), 4, "rank {rank} emits output_tokens tokens");
+            assert_eq!(
+                tokens.len(),
+                4,
+                "rank {rank} answers with output_tokens tokens"
+            );
         }
     }
 }

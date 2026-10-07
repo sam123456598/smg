@@ -37,13 +37,13 @@ use crate::{
 };
 
 /// Per-listener HTTP state: shared config plus an optional engine simulator.
-pub struct AppState {
+struct AppState {
     cfg: Arc<Config>,
     engine: Option<Engine>,
 }
 
 /// Build the router serving the mock HTTP worker contract.
-pub fn router(state: Arc<AppState>) -> Router {
+fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -188,8 +188,8 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         };
     }
 
-    // Canned mode: a single up-front delay, then a fixed response. Always
-    // chat-shaped (unchanged) so the existing scale rig is unaffected.
+    // Canned mode: a single up-front delay, then a fixed chat-shaped response,
+    // whichever endpoint was called.
     if !state.cfg.gen_delay.is_zero() {
         tokio::time::sleep(state.cfg.gen_delay).await;
     }

@@ -6,8 +6,9 @@
 //!
 //! - **prefill latency that scales with input length** — time-to-first-token
 //!   grows with the (uncached) prompt size, chunked across scheduler steps;
-//! - **decode latency that grows with batch size** — inter-token latency is
-//!   `base + slope · batch`, so a busy replica is slower per token;
+//! - **decode latency that grows with load** — a decode pass costs more as
+//!   the decoding requests' KV utilisation rises (with the linear model, as
+//!   the batch widens), so a busy replica is slower per token;
 //! - **finite KV capacity with admission/queueing** — when KV is full requests
 //!   wait, producing the `num_waiting_uncached_tokens` signal `least_load` uses;
 //! - **prefix caching** — a request sharing a prefix with cached blocks pays
@@ -17,8 +18,8 @@
 //! The engine is an actor: one `tokio` task per virtual worker owns all mutable
 //! state and advances it in real wall-clock time, but the per-step work is plain
 //! arithmetic. Idle engines block on their request channel, so a fleet of mostly
-//! idle workers stays cheap. The scheduling math lives in [`SchedulerState::step`],
-//! a pure synchronous function returning the work done plus the time it took —
+//! idle workers stays cheap. The scheduling math lives in `SchedulerState::step`,
+//! a pure synchronous function returning the work done plus the time it took,
 //! which makes it deterministically unit-testable with no real timers.
 
 use std::{
@@ -92,7 +93,7 @@ impl TimingModel {
 
     /// A calibration file's model (`Calibration::load`): the point table and
     /// pass-total form when the file has them, else its polynomials.
-    pub fn fitted(c: &Calibration) -> Self {
+    pub(crate) fn fitted(c: &Calibration) -> Self {
         match (&c.prefill_table, c.prefill_pass) {
             (Some(table), pass) if table.len() >= 2 => {
                 let (pass_intercept_ms, pass_ms_per_token) = pass.unwrap_or_else(|| {
@@ -222,7 +223,7 @@ impl TimingModel {
 /// intercept already covers, so it is not added again). Unknown keys are
 /// ignored.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Calibration {
+pub(crate) struct Calibration {
     pub prefill: [f64; 3],
     pub decode: [f64; 3],
     /// Measured single-request prefill `(tokens, ms)` points, sorted by tokens
@@ -238,7 +239,7 @@ pub struct Calibration {
 }
 
 impl Calibration {
-    pub fn load(path: &str) -> Result<Self, String> {
+    pub(crate) fn load(path: &str) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read calibration {path}: {e}"))?;
         let value: serde_json::Value = serde_json::from_str(&text)
@@ -246,7 +247,7 @@ impl Calibration {
         Self::from_value(&value).map_err(|e| format!("calibration {path}: {e}"))
     }
 
-    pub fn from_value(v: &serde_json::Value) -> Result<Self, String> {
+    pub(crate) fn from_value(v: &serde_json::Value) -> Result<Self, String> {
         let poly = |keys: [&str; 3], names: [&str; 3]| -> Result<[f64; 3], String> {
             let node = keys
                 .iter()
@@ -529,13 +530,14 @@ struct EngineShared {
     /// admin API can read it without entering the actor: the fleet oracle
     /// ("which worker holds the most of this prompt") is a read over these.
     cache_mirror: RwLock<HashSet<u64>>,
-    /// Fault hooks for the recovery drills (admin API).
+    /// Fault hooks, switched on through the admin API.
     faults: Faults,
     /// Wakes a paused actor.
     resume: Notify,
 }
 
-/// Fault hooks: what the recovery drills switch on through the admin API.
+/// Fault hooks the admin API switches on: batches lost on the wire, delayed
+/// publishing, a frozen engine, a publisher restart.
 #[derive(Default)]
 struct Faults {
     /// Event batches still to lose on the wire.
@@ -552,7 +554,7 @@ struct Faults {
 
 /// The hooks' current state.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FaultStatus {
+pub(crate) struct FaultStatus {
     pub drop_pending: u32,
     pub dropped_total: u64,
     pub delay_ms: u64,
@@ -563,7 +565,7 @@ pub struct FaultStatus {
 
 /// What the engine itself would serve from cache for a prompt right now.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CacheTruth {
+pub(crate) struct CacheTruth {
     pub cached_tokens: u32,
     pub cached_blocks: u32,
     pub block_size: u32,
@@ -571,7 +573,7 @@ pub struct CacheTruth {
 
 /// A batch as the publisher releases it to every transport.
 #[derive(Clone, Debug)]
-pub struct Published {
+pub(crate) struct Published {
     pub batch: common::KvEventBatch,
     /// Lost on the wire by a drop hook: not delivered live, kept for replay.
     pub dropped: bool,
@@ -594,7 +596,7 @@ enum EngineMsg {
 /// accuracy. `oracle_tokens` is the best cached prefix any worker of this
 /// process held when the request arrived (the router's ideal choice).
 #[derive(Clone, Debug)]
-pub struct RequestRecord {
+pub(crate) struct RequestRecord {
     pub seq: u64,
     pub request_id: String,
     pub worker: String,
@@ -622,12 +624,12 @@ fn records() -> &'static Mutex<(u64, VecDeque<RequestRecord>)> {
 const RECORD_CAPACITY: usize = 500_000;
 
 /// All engines registered in this process.
-pub fn fleet_engines() -> Vec<Engine> {
+pub(crate) fn fleet_engines() -> Vec<Engine> {
     fleet().lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// Records with `seq > since`, oldest first, at most `limit`.
-pub fn records_since(since: u64, limit: usize) -> Vec<RequestRecord> {
+pub(crate) fn records_since(since: u64, limit: usize) -> Vec<RequestRecord> {
     let guard = records().lock().unwrap_or_else(|p| p.into_inner());
     guard
         .1
@@ -655,7 +657,7 @@ fn unix_ms(at: SystemTime) -> u64 {
 }
 
 /// Seconds since the Unix epoch, as the engines stamp their event batches.
-pub fn unix_seconds() -> f64 {
+pub(crate) fn unix_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -733,7 +735,7 @@ impl Engine {
 
     /// Lose the next `batches` event batches on the wire (they stay in the
     /// replay buffer).
-    pub fn fault_drop(&self, batches: u32) {
+    pub(crate) fn fault_drop(&self, batches: u32) {
         self.shared
             .faults
             .drop_batches
@@ -741,7 +743,7 @@ impl Engine {
     }
 
     /// Publish every batch `ms` milliseconds after its pass ends (0 clears).
-    pub fn fault_delay_ms(&self, ms: u64) {
+    pub(crate) fn fault_delay_ms(&self, ms: u64) {
         self.shared.faults.delay_ms.store(ms, Ordering::Relaxed);
     }
 
@@ -749,7 +751,7 @@ impl Engine {
     /// is emptied, the cache is kept. Returns once the actor has applied it
     /// (after its current pass, at most), so a status read right after sees
     /// the new generation.
-    pub async fn restart_publisher(&self) {
+    pub(crate) async fn restart_publisher(&self) {
         let (ack, applied) = tokio::sync::oneshot::channel();
         if self.tx.send(EngineMsg::RestartPublisher(ack)).is_ok() {
             let _ = tokio::time::timeout(Duration::from_secs(2), applied).await;
@@ -757,17 +759,17 @@ impl Engine {
     }
 
     /// Freeze the engine: no passes, no tokens, no events; requests queue.
-    pub fn pause(&self) {
+    pub(crate) fn pause(&self) {
         self.shared.faults.paused.store(true, Ordering::Relaxed);
     }
 
     /// Run again after a pause.
-    pub fn resume(&self) {
+    pub(crate) fn resume(&self) {
         self.shared.faults.paused.store(false, Ordering::Relaxed);
         self.shared.resume.notify_one();
     }
 
-    pub fn fault_status(&self) -> FaultStatus {
+    pub(crate) fn fault_status(&self) -> FaultStatus {
         let f = &self.shared.faults;
         FaultStatus {
             drop_pending: f.drop_batches.load(Ordering::Relaxed),
@@ -782,7 +784,7 @@ impl Engine {
     /// What this engine would serve from cache for `token_ids` right now:
     /// its own prefix match over the mirror, last block recomputed, as
     /// admission would compute it.
-    pub fn cached_tokens_for(&self, token_ids: &[u32]) -> CacheTruth {
+    pub(crate) fn cached_tokens_for(&self, token_ids: &[u32]) -> CacheTruth {
         let bs = self.shared.block_size.max(1);
         let keys = prompt_blocks(token_ids, bs as usize).0;
         let mut matched = self.match_prefix(&keys) as u32;
@@ -798,7 +800,7 @@ impl Engine {
 
     /// Every batch the publisher releases from now on, with its drop mark and
     /// generation (for transports that keep their own replay buffer).
-    pub fn subscribe_published(&self) -> Pin<Box<dyn Stream<Item = Published> + Send>> {
+    pub(crate) fn subscribe_published(&self) -> Pin<Box<dyn Stream<Item = Published> + Send>> {
         let live_rx = self.shared.kv_tx.subscribe();
         Box::pin(stream::unfold(live_rx, |mut rx| async move {
             loop {
@@ -812,12 +814,12 @@ impl Engine {
     }
 
     /// This engine's name (`grpc:<port>` / `http:<port>`; empty when unnamed).
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         &self.shared.name
     }
 
     /// Number of consecutive blocks from the start of `keys` this engine holds.
-    pub fn match_prefix(&self, keys: &[u64]) -> usize {
+    fn match_prefix(&self, keys: &[u64]) -> usize {
         let mirror = self
             .shared
             .cache_mirror
@@ -852,7 +854,7 @@ impl Engine {
     }
 
     /// Whether this engine emits KV-cache events.
-    pub fn kv_enabled(&self) -> bool {
+    pub(crate) fn kv_enabled(&self) -> bool {
         self.shared.prefix_cache
     }
 
@@ -1101,9 +1103,6 @@ struct RunningReq {
     held: Vec<u64>,
     /// Whether an anonymous (not yet full) block is allocated for the tail.
     partial: bool,
-    /// Anonymous blocks reserved ahead for the rest of the prompt (full-ISL
-    /// admission); chunks draw on these before asking the pool.
-    reserved_spare: u64,
     /// Tokens of the not-yet-full tail block (the next stored event's payload).
     pending: Vec<u32>,
     /// FNV over every token of the sequence so far (the next block's key).
@@ -1157,7 +1156,7 @@ struct WaitingReq {
 }
 
 /// What a pass reports about a request it admitted for the first time.
-pub(crate) struct Admitted {
+struct Admitted {
     request_id: String,
     prompt_tokens: u32,
     cached_tokens: u32,
@@ -1292,7 +1291,7 @@ impl BlockPool {
 
 /// The actor-owned scheduler state. `running` stays in admission order, which
 /// is what LIFO preemption relies on.
-pub(crate) struct SchedulerState {
+struct SchedulerState {
     running: Vec<RunningReq>,
     waiting: VecDeque<WaitingReq>,
     pool: BlockPool,
@@ -1306,7 +1305,7 @@ pub(crate) struct SchedulerState {
 }
 
 /// The result of one pass.
-pub(crate) struct Step {
+struct Step {
     duration: Duration,
     sends: Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)>,
     batch: Option<common::KvEventBatch>,
@@ -1326,20 +1325,16 @@ struct Completed {
     tokens: Vec<u32>,
 }
 
-/// Why a running request could not get the KV it needed this pass.
-enum Blocked {
-    /// The request itself was preempted (it is back in the queue).
-    SelfPreempted,
-    /// No preemption allowed and no room.
-    NoRoom,
-}
+/// Making room for a running request's next tokens preempted the request
+/// itself (it is back in the queue; the pass moves on without it).
+struct SelfPreempted;
 
 fn blocks_for(tokens: u32, block_size: u32) -> u64 {
     u64::from(tokens.div_ceil(block_size.max(1)))
 }
 
 impl SchedulerState {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             running: Vec::new(),
             waiting: VecDeque::new(),
@@ -1354,12 +1349,12 @@ impl SchedulerState {
     }
 
     /// Ask the next pass to clear the cache and announce `AllBlocksCleared`.
-    pub(crate) fn reset(&mut self) {
+    fn reset(&mut self) {
         self.reset_pending = true;
     }
 
     /// The publisher restarted: batch sequence numbers start over.
-    pub(crate) fn restart_publisher(&mut self) {
+    fn restart_publisher(&mut self) {
         self.kv_seq = 0;
     }
 
@@ -1369,19 +1364,14 @@ impl SchedulerState {
 
     /// Queue a request with no oracle information (tests).
     #[cfg(test)]
-    pub(crate) fn enqueue(&mut self, req: NewRequest, p: &EngineParams) {
+    fn enqueue(&mut self, req: NewRequest, p: &EngineParams) {
         self.enqueue_with_oracle(req, p, 0);
     }
 
     /// Queue a request, recording the queued token-work it contributes, together
     /// with the fleet oracle's cached-token count at arrival (what the
     /// best-informed router could have obtained).
-    pub(crate) fn enqueue_with_oracle(
-        &mut self,
-        req: NewRequest,
-        p: &EngineParams,
-        oracle_tokens: u32,
-    ) {
+    fn enqueue_with_oracle(&mut self, req: NewRequest, p: &EngineParams, oracle_tokens: u32) {
         let prompt_tokens = req.prompt_token_ids.len() as u32;
         let (keys, rolling_hash, _) = prompt_blocks(&req.prompt_token_ids, p.block_size as usize);
         let cached_blocks = if p.prefix_cache {
@@ -1439,7 +1429,7 @@ impl SchedulerState {
     /// allocation (`Removed`) followed by the blocks it completed (`Stored`,
     /// contiguous, chained to a parent). The caller makes every event of the
     /// pass visible at its end.
-    pub(crate) fn step(&mut self, p: &EngineParams) -> Step {
+    fn step(&mut self, p: &EngineParams) -> Step {
         let mut kv: Vec<common::KvCacheEvent> = Vec::new();
         let mut inserted: Vec<u64> = Vec::new();
         let mut evicted: Vec<u64> = Vec::new();
@@ -1490,13 +1480,8 @@ impl SchedulerState {
                 // this chunk finishes the prompt.
                 let add = chunk + u32::from(completes);
                 let mut freed = Vec::new();
-                match self.ensure(i, add, p, true, &mut freed) {
-                    Ok(()) => {}
-                    Err(Blocked::SelfPreempted) => continue,
-                    Err(Blocked::NoRoom) => {
-                        i += 1;
-                        continue;
-                    }
+                if self.ensure(i, add, p, &mut freed).is_err() {
+                    continue;
                 }
                 evicted.extend(freed.iter().copied());
                 self.push_removed(&mut kv, freed, p);
@@ -1514,13 +1499,8 @@ impl SchedulerState {
                 self.push_stored(&mut kv, i, completed, p);
             } else if !p.prefill_first {
                 let mut freed = Vec::new();
-                match self.ensure(i, 1, p, true, &mut freed) {
-                    Ok(()) => {}
-                    Err(Blocked::SelfPreempted) => continue,
-                    Err(Blocked::NoRoom) => {
-                        i += 1;
-                        continue;
-                    }
+                if self.ensure(i, 1, p, &mut freed).is_err() {
+                    continue;
                 }
                 evicted.extend(freed.iter().copied());
                 self.push_removed(&mut kv, freed, p);
@@ -1640,7 +1620,6 @@ impl SchedulerState {
                 output_ids,
                 held: Vec::new(),
                 partial: false,
-                reserved_spare: 0,
                 pending: Vec::new(),
                 rolling_hash: w.rolling_hash,
                 token_seed,
@@ -1673,13 +1652,8 @@ impl SchedulerState {
                     continue;
                 }
                 let mut freed = Vec::new();
-                match self.ensure(i, 1, p, true, &mut freed) {
-                    Ok(()) => {}
-                    Err(Blocked::SelfPreempted) => continue,
-                    Err(Blocked::NoRoom) => {
-                        i += 1;
-                        continue;
-                    }
+                if self.ensure(i, 1, p, &mut freed).is_err() {
+                    continue;
                 }
                 evicted.extend(freed.iter().copied());
                 self.push_removed(&mut kv, freed, p);
@@ -1763,32 +1737,26 @@ impl SchedulerState {
     }
 
     /// Make room for `add` more tokens of `running[idx]`, evicting idle cached
-    /// blocks first and, when allowed, preempting the most recently admitted
-    /// request (LIFO) until the allocation fits. A lone request that cannot
-    /// fit even then is over-allocated rather than deadlocked.
+    /// blocks first and then preempting the most recently admitted request
+    /// (LIFO) until the allocation fits; `Err` when the victim was the request
+    /// itself. A lone request that cannot fit even then is over-allocated
+    /// rather than deadlocked.
     fn ensure(
         &mut self,
         idx: usize,
         add: u32,
         p: &EngineParams,
-        allow_preempt: bool,
         freed: &mut Vec<u64>,
-    ) -> Result<(), Blocked> {
+    ) -> Result<(), SelfPreempted> {
         let bs = p.block_size.max(1);
         let before = self.running[idx].seq_len();
-        let mut need = blocks_for(before + add, bs) - blocks_for(before, bs);
-        let spare = self.running[idx].reserved_spare.min(need);
-        self.running[idx].reserved_spare -= spare;
-        need -= spare;
+        let need = blocks_for(before + add, bs) - blocks_for(before, bs);
         if need == 0 {
             return Ok(());
         }
         loop {
             if self.pool.reserve(need, p.capacity_blocks(), freed) {
                 return Ok(());
-            }
-            if !allow_preempt {
-                return Err(Blocked::NoRoom);
             }
             if self.running.len() == 1 {
                 self.pool.force_reserve(need);
@@ -1798,7 +1766,7 @@ impl SchedulerState {
             let victim = self.running.len() - 1;
             self.preempt_last(p);
             if victim == idx {
-                return Err(Blocked::SelfPreempted);
+                return Err(SelfPreempted);
             }
         }
     }
@@ -1855,7 +1823,6 @@ impl SchedulerState {
         if r.partial {
             self.pool.release_anonymous(1);
         }
-        self.pool.release_anonymous(r.reserved_spare);
     }
 
     /// Compute `chunk` more prompt tokens of `running[idx]`, registering the
@@ -2016,7 +1983,7 @@ impl std::str::FromStr for LoadsLike {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "mock" | "sglang" => Ok(Self::Mock),
+            "mock" => Ok(Self::Mock),
             "vllm" => Ok(Self::Vllm),
             other => Err(format!("--loads-like must be mock|vllm, got {other}")),
         }
@@ -2025,7 +1992,7 @@ impl std::str::FromStr for LoadsLike {
 
 impl LoadSnapshot {
     /// The snapshot as a backend of kind `like` would report it.
-    pub fn as_reported_by(&self, like: LoadsLike) -> Self {
+    pub(crate) fn as_reported_by(&self, like: LoadsLike) -> Self {
         match like {
             LoadsLike::Mock => self.clone(),
             LoadsLike::Vllm => Self {
@@ -2630,8 +2597,9 @@ mod tests {
     }
 
     #[test]
-    fn calibrated_model_reproduces_the_gb300_batched_sweep() {
-        // fit-gb300-v2.json: table of single-request medians, pass form from the batched sweep.
+    fn calibrated_model_reproduces_a_measured_batched_sweep() {
+        // A hardware calibration: the table of single-request medians and the
+        // pass form fitted to its batched sweep.
         let model = TimingModel::Calibrated {
             table: vec![
                 (1.0, 23.84),
@@ -2670,7 +2638,7 @@ mod tests {
 
     #[test]
     fn calibration_reads_the_gpu_harness_layout() {
-        // qwen3-8b-gb300-vllm0.31.json, abridged.
+        // A calibration file as the GPU harness writes it, abridged.
         let harness: serde_json::Value = serde_json::from_str(
             r#"{"target": "127.0.0.1:20061", "kv_capacity_tokens": 676128,
                 "prefill_points_ms": {"1": {"median_ms": 23.84}},
@@ -2915,7 +2883,6 @@ mod tests {
             blocks_for(1000, 16),
             "the first pass allocates its chunk, not the whole prompt"
         );
-        assert_eq!(st.running[0].reserved_spare, 0, "nothing is reserved ahead");
         let (_, passes) = run_to_first_token(&mut st, &p, &mut rx);
         assert_eq!(passes, 2, "two more passes finish the prefill");
         assert_eq!(
