@@ -100,6 +100,7 @@ enum Call {
     Json(json::Assembler),
     Tagged(tagged::Assembler),
     Dsml(tagged::dsml::Assembler),
+    Keyed(tagged::keyed::Assembler),
 }
 
 impl Call {
@@ -111,6 +112,9 @@ impl Call {
             Some(CallSyntax::Json) | None => Self::Json(json::Assembler::new(index, id)),
             Some(CallSyntax::Tagged) => Self::Tagged(tagged::Assembler::new(index, id)),
             Some(CallSyntax::Dsml) => Self::Dsml(tagged::dsml::Assembler::new(index, id)),
+            Some(CallSyntax::Keyed(tags)) => {
+                Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))
+            }
         }
     }
 
@@ -122,6 +126,10 @@ impl Call {
                 assembler.feed(text, out);
                 text.len()
             }
+            Self::Keyed(assembler) => {
+                assembler.feed(text, declared, out);
+                text.len()
+            }
         }
     }
 
@@ -130,14 +138,15 @@ impl Call {
             Self::Json(assembler) => assembler.started(),
             Self::Tagged(assembler) => assembler.started(),
             Self::Dsml(assembler) => assembler.started(),
+            Self::Keyed(assembler) => assembler.started(),
         }
     }
 
     /// Ends the call the way the region closed, and says whether the terminal that closed it was
     /// taken as the call's end. The JSON assembler has one ending, and the engine names a block its
     /// terminal closed (`close_call`); the Qwen tagged one closes the call for the client when the
-    /// block ended, and leaves it open when the stream was cut; the DSML one takes the invoke's
-    /// closing tag as `ToolCallEnd`'s bytes.
+    /// block ended, and leaves it open when the stream was cut; the DSML and keyed ones take the
+    /// call's closing marker as `ToolCallEnd`'s bytes.
     fn end(self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
         match (self, closed) {
             (Self::Json(assembler), _) => assembler.finish(out),
@@ -148,6 +157,11 @@ impl Call {
                 return true;
             }
             (Self::Dsml(assembler), Closed::ByEnd) => assembler.finish(out),
+            (Self::Keyed(assembler), Closed::ByMarker) => {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Keyed(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
@@ -292,7 +306,7 @@ impl Engine {
     /// The next call takes the next free index; the index is spent only if the region produces a
     /// call, so a `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
-        self.call = Some(Call::new(self.format.call_syntax().copied(), self.calls));
+        self.call = Some(Call::new(self.format.call_syntax().cloned(), self.calls));
     }
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took
@@ -303,12 +317,18 @@ impl Engine {
         let Some(call) = self.call.take() else {
             return false;
         };
-        if call.started() {
-            self.calls += 1;
-        }
+        let started_before = call.started();
         let mut finished = Events::new();
         let taken = call.end(closed, terminal, &mut finished);
-        for event in finished.drain() {
+        let finished = finished.drain();
+        // A keyed call with no arguments is named only at its end, so the end's events count too.
+        let started_at_the_end = finished
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallStart { .. }));
+        if started_before || started_at_the_end {
+            self.calls += 1;
+        }
+        for event in finished {
             let event = match event {
                 Event::Malformed {
                     text,
