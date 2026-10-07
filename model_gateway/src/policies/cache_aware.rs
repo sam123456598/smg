@@ -92,7 +92,6 @@ use super::{
     cost::{
         self, CandidateInputs, OptimisticAccounting, Pick, RequestInputs, WorkerSelectionPolicy,
     },
-    least_load::ExpectedWaitView,
     normalize_model_key,
     utils::PeriodicTask,
     CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
@@ -1737,13 +1736,6 @@ impl CacheAwarePolicy {
         guard.as_ref().map(|rx| rx.borrow().clone())
     }
 
-    /// The latest load snapshot regardless of the decay setting, for
-    /// selection policies that read backend loads.
-    fn load_snapshot(&self) -> Option<Arc<LoadSnapshot>> {
-        let guard = self.load_rx.read();
-        guard.as_ref().map(|rx| rx.borrow().clone())
-    }
-
     /// Request inputs for the tree paths: units are tokens (token tree) or
     /// chars (string tree); the trees carry no prefix hashes.
     fn tree_request(&self, units: usize, avg_load: f64) -> RequestInputs<'static> {
@@ -2043,11 +2035,6 @@ impl CacheAwarePolicy {
             return self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info);
         }
 
-        let loads = if needs.backend_loads || needs.expected_wait {
-            self.load_snapshot()
-        } else {
-            None
-        };
         // With `all_workers` the rows are the eligible workers the decision
         // read merged with the holders, in slice order (a sampled decision
         // reads eligibility for a bounded sample of the pool beside the
@@ -2058,45 +2045,12 @@ impl CacheAwarePolicy {
         } else {
             Vec::new()
         };
-        // The host's own expected-wait reading of each row the policy will
-        // see, in the order the inputs are built below.
-        let expected: Vec<ExpectedWaitView> = if needs.expected_wait {
-            let candidate_rows: Vec<usize>;
-            let rows: &[usize] = if wants_all {
-                &all_rows
-            } else {
-                candidate_rows = candidates.iter().map(|candidate| candidate.idx).collect();
-                &candidate_rows
-            };
-            self.load_scorer
-                .expected_waits(workers, rows, loads.as_deref())
-        } else {
-            Vec::new()
-        };
         let predicted = match (accounting, request.prefix_hashes) {
             (Some(accounting), Some(hashes)) => accounting.predicted_overlaps(hashes),
             _ => Vec::new(),
         };
         let gather = |idx: usize, raw: f64, effective: f64| {
-            let worker = &workers[idx];
-            let url = worker.url();
-            let load = loads.as_deref().and_then(|snapshot| snapshot.get(url));
-            let booked = accounting.map_or(0, |accounting| accounting.pending_prefill_tokens(url));
-            let active_prefill_tokens = match load {
-                Some(load) => Some(load.total_waiting_uncached_tokens().max(0) as u64 + booked),
-                None if booked > 0 => Some(booked),
-                None => None,
-            };
-            // Decode work is priced by the blocks a worker's active sequences
-            // hold. The router has no per-request block ledger yet, so every
-            // request in flight on the worker is taken to hold this request's
-            // blocks, plus any output blocks the accounting layer credited.
-            // The backend's KV usage is not that signal: it counts reusable
-            // cached blocks too and lags by a poll interval.
-            let decode_blocks = Some(
-                worker.load() as f64 * request.request_blocks as f64
-                    + accounting.map_or(0.0, |accounting| accounting.output_blocks(url)),
-            );
+            let url = workers[idx].url();
             let predicted_blocks = predicted
                 .iter()
                 .find(|(predicted_url, _)| &**predicted_url == url)
@@ -2113,27 +2067,10 @@ impl CacheAwarePolicy {
                 idx,
                 url,
                 device_blocks,
-                host_blocks: 0.0,
-                disk_blocks: 0.0,
                 effective_score,
-                active_requests: worker.load(),
-                active_prefill_tokens,
-                decode_blocks,
-                kv_usage: load.map(WorkerLoadResponse::effective_token_usage),
-                queue_depth: load.map(|load| load.total_waiting_reqs().max(0) as u64),
-                running_requests: load.map(|load| {
-                    load.loads
-                        .iter()
-                        .map(|rank| rank.num_running_reqs.max(0) as u64)
-                        .sum()
-                }),
-                taint: 1.0,
-                expected_wait_secs: None,
-                drain_tokens_per_sec: None,
-                dispatched_since_report: 0,
             }
         };
-        let mut inputs: Vec<CandidateInputs<'_>> = if wants_all {
+        let inputs: Vec<CandidateInputs<'_>> = if wants_all {
             // Rows and candidates are both in slice order, so one merge pass
             // pairs them.
             let mut next = candidates.iter().peekable();
@@ -2160,12 +2097,6 @@ impl CacheAwarePolicy {
                 })
                 .collect()
         };
-        for (input, view) in inputs.iter_mut().zip(&expected) {
-            input.expected_wait_secs = Some(view.seconds);
-            input.drain_tokens_per_sec = Some(view.drain_tokens_per_sec);
-            input.dispatched_since_report = view.dispatched_since_report;
-        }
-
         let selected = match self.selection.select(request, &inputs) {
             Pick::None => {
                 self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
@@ -7160,19 +7091,7 @@ mod tests {
                 idx: candidate.idx,
                 url: &urls[candidate.idx],
                 device_blocks: candidate.raw_score,
-                host_blocks: 0.0,
-                disk_blocks: 0.0,
                 effective_score: candidate.effective_score,
-                active_requests: 0,
-                active_prefill_tokens: None,
-                decode_blocks: None,
-                kv_usage: None,
-                queue_depth: None,
-                running_requests: None,
-                taint: 1.0,
-                expected_wait_secs: None,
-                drain_tokens_per_sec: None,
-                dispatched_since_report: 0,
             })
             .collect()
     }

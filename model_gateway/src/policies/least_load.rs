@@ -158,18 +158,6 @@ pub struct LeastLoadPolicy {
     tie_rng: Option<Mutex<StdRng>>,
 }
 
-/// One worker's expected-wait reading for a selection policy (see
-/// [`LeastLoadPolicy::expected_waits`]).
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ExpectedWaitView {
-    /// The selector's score for the worker, in seconds.
-    pub seconds: f64,
-    /// Tokens per second the score drains at.
-    pub drain_tokens_per_sec: f64,
-    /// Requests this router dispatched to the worker since its last report.
-    pub dispatched_since_report: u64,
-}
-
 /// Everything one expected-wait score reads besides the worker itself.
 #[derive(Clone, Copy)]
 struct ScoreInputs<'a> {
@@ -403,56 +391,6 @@ impl LeastLoadPolicy {
             }
         }
         inputs
-    }
-
-    /// What the selector would score each candidate at right now, without
-    /// choosing or crediting: the expected wait in seconds, the drain rate
-    /// behind it and the router's dispatches since the worker's last report,
-    /// for selection policies that trade that wait against other signals
-    /// (`CandidateInputs::expected_wait_secs`). Same lock order as the
-    /// selector. A dark fleet, which the selector ranks by in-flight count,
-    /// reads here as one mean prefill per in-flight request at the default
-    /// drain rate: the same order, in seconds, so a credit priced in tokens
-    /// still compares.
-    pub(super) fn expected_waits(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        candidates: &[usize],
-        complete_snapshot: Option<&LoadSnapshot>,
-    ) -> Vec<ExpectedWaitView> {
-        let loads_guard = self.cached_loads.read().ok();
-        let loads = loads_guard.as_deref();
-        let inflight = self
-            .inflight_tokens
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let inputs = self.score_inputs(workers, candidates, loads, complete_snapshot, &inflight);
-        candidates
-            .iter()
-            .map(|&idx| {
-                let worker = &workers[idx];
-                let url = worker.url();
-                let dispatched_since_report =
-                    inflight.get(url).map_or(0, |dispatch| dispatch.requests);
-                let (seconds, drain_tokens_per_sec) =
-                    match Self::fresh_load(loads, complete_snapshot, url) {
-                        Some(load) => (self.score(worker, &inputs), self.drain_rate(load)),
-                        None if inputs.fleet_has_loads => {
-                            (self.score(worker, &inputs), inputs.nominal_throughput)
-                        }
-                        None => (
-                            worker.load() as f64 * f64::from(self.mean_prefill_tokens)
-                                / self.default_throughput,
-                            self.default_throughput,
-                        ),
-                    };
-                ExpectedWaitView {
-                    seconds,
-                    drain_tokens_per_sec,
-                    dispatched_since_report,
-                }
-            })
-            .collect()
     }
 
     /// Waiting-queue token-work for a worker.

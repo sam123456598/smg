@@ -195,23 +195,7 @@ fn run(scenario: Scenario, chooser: Chooser<'_>, seed: u64) -> Outcome {
                             idx: i,
                             url: &w.url,
                             device_blocks: overlaps[i] as f64,
-                            host_blocks: 0.0,
-                            disk_blocks: 0.0,
                             effective_score: overlaps[i] as f64,
-                            active_requests: inflight[i],
-                            active_prefill_tokens: Some(backlogs[i] as u64),
-                            decode_blocks: Some(inflight[i] as f64 * prompt.len() as f64),
-                            // KV share as the engines report it: the queued
-                            // work's tokens over the pool, not the cache fill.
-                            kv_usage: Some(
-                                (backlogs[i] / (w.cache_blocks * BLOCK) as f64).min(1.0),
-                            ),
-                            queue_depth: Some(inflight[i] as u64),
-                            running_requests: Some(0),
-                            taint: 1.0,
-                            expected_wait_secs: Some(backlogs[i] / scenario.drain_tokens_per_tick),
-                            drain_tokens_per_sec: Some(scenario.drain_tokens_per_tick),
-                            dispatched_since_report: 0,
                         })
                         .collect();
                     let chosen = match policy.select(&request, &inputs) {

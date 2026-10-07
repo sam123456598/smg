@@ -615,9 +615,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 2, help_heading = "Load Monitoring")]
     worker_stall_secs: u64,
 
-    /// Seconds without a token or a completion from a worker that still
-    /// answers polls, with requests in flight and a growing queue, after which
-    /// new requests stop being routed to it until it makes progress.
+    /// Seconds without a token or a completion from a worker with requests
+    /// in flight whose waiting queue grows, or whose in-flight pile grows or
+    /// is four deep, after which new requests stop being routed to it until
+    /// it makes progress. The bound stretches to the time its in-flight
+    /// prompts may still need in prefill, up to 120 seconds.
     #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
     worker_wedge_secs: u64,
 

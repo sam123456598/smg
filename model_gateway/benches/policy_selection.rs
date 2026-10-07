@@ -1,6 +1,6 @@
 //! Selection-policy stage cost: what one request pays inside `WorkerSelectionPolicy::select`
 //! for each policy, and what the host pays to gather the inputs from a 128-worker overlap map
-//! and load table before calling it.
+//! before calling it.
 //!
 //! Run with: cargo bench --bench policy_selection
 #![expect(
@@ -27,8 +27,6 @@ struct Fleet {
     urls: Vec<String>,
     /// Overlap in blocks for the workers that hold part of the prompt (the indexer's map).
     overlap: HashMap<u32, u32>,
-    /// Backend load table: (waiting uncached tokens, used tokens, waiting reqs, running reqs).
-    loads: HashMap<String, (u64, u64, u64, u64)>,
     prefix_hashes: Vec<u64>,
 }
 
@@ -40,29 +38,12 @@ fn fleet(workers: usize) -> Fleet {
         .filter(|&i| mix(u64::from(i)).is_multiple_of(3))
         .map(|i| (i, (mix(u64::from(i) + 7) % 256) as u32 + 1))
         .collect();
-    let loads = urls
-        .iter()
-        .enumerate()
-        .map(|(i, url)| {
-            let seed = i as u64;
-            (
-                url.clone(),
-                (
-                    mix(seed + 11) % 20_000,
-                    mix(seed + 13) % 200_000,
-                    mix(seed + 17) % 8,
-                    mix(seed + 19) % 64,
-                ),
-            )
-        })
-        .collect();
     let prefix_hashes = (0..PROMPT_TOKENS / BLOCK_SIZE)
         .map(|i| mix(i as u64 + 1_000))
         .collect();
     Fleet {
         urls,
         overlap,
-        loads,
         prefix_hashes,
     }
 }
@@ -77,27 +58,11 @@ fn gather<'a>(fleet: &'a Fleet, all_workers: bool) -> Vec<CandidateInputs<'a>> {
             if overlap == 0 && !all_workers {
                 return None;
             }
-            let (waiting_tokens, used_tokens, waiting_reqs, running_reqs) =
-                fleet.loads.get(url).copied().unwrap_or_default();
             Some(CandidateInputs {
                 idx,
                 url,
                 device_blocks: f64::from(overlap),
-                host_blocks: 0.0,
-                disk_blocks: 0.0,
                 effective_score: f64::from(overlap),
-                active_requests: (running_reqs + waiting_reqs) as usize,
-                active_prefill_tokens: Some(waiting_tokens),
-                decode_blocks: Some(
-                    (running_reqs + waiting_reqs) as f64 * (PROMPT_TOKENS / BLOCK_SIZE) as f64,
-                ),
-                kv_usage: Some(used_tokens as f64 / 400_000.0),
-                queue_depth: Some(waiting_reqs),
-                running_requests: Some(running_reqs),
-                taint: 1.0,
-                expected_wait_secs: Some(waiting_tokens as f64 / 2_000.0),
-                drain_tokens_per_sec: Some(2_000.0),
-                dispatched_since_report: 0,
             })
         })
         .collect()
@@ -132,7 +97,7 @@ fn bench_select(c: &mut Criterion) {
 }
 
 /// Gather plus select: per iteration, build the candidate inputs from the 128-worker overlap
-/// map and load table (what the cache-aware host does), then select.
+/// map (what the cache-aware host does), then select.
 fn bench_gather_and_select(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_selection/gather_and_select");
     let fleet = fleet(128);

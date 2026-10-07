@@ -4,8 +4,8 @@
 //! the top effective-score group: the exact maximum at temperature zero, or the softmax-sampled
 //! score group otherwise. The host then resolves that group exactly as it always has: the
 //! per-request pressure gate, then LeastLoad's expected-wait selection and credit. An empty group
-//! is the miss path. Decisions are therefore identical to the pre-policy code; the pin test in
-//! `cache_aware.rs` compares the two on recorded inputs.
+//! is the miss path. Decisions are therefore identical to the pre-policy code; the tests in
+//! `cache_aware.rs` compare the two at zero temperature and under a temperature.
 
 use super::{
     inputs::{CandidateInputs, RequestInputs},
