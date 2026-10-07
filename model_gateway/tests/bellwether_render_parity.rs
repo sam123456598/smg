@@ -112,16 +112,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          concatenates them as text, so the render fails (smg-project/smg#2783)",
     ),
     (
-        "qwen3-8b/render/text-empty-user",
-        "the gateway's request validation rejects an empty message content with 400; the template \
-         renders it (smg-project/bellwether#13, needs:simo)",
-    ),
-    (
-        "deepseek-r1/render/text-empty-user",
-        "the gateway's request validation rejects an empty message content with 400; the template \
-         renders it (smg-project/bellwether#13, needs:simo)",
-    ),
-    (
         "qwen3-8b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the engines do; \
          the Qwen3 template accepts an object (smg-project/bellwether#12, needs:simo)",
