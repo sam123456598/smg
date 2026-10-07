@@ -119,7 +119,7 @@ fn bench_select(c: &mut Criterion) {
     for workers in [8, 32, 128] {
         let fleet = fleet(workers);
         for name in POLICY_NAMES {
-            let policy = build(name, None, 0.0).unwrap();
+            let policy = build(name, 0.0).unwrap();
             let inputs = gather(&fleet, policy.needs().all_workers);
             let req = request(&fleet);
             group.throughput(Throughput::Elements(1));
@@ -137,7 +137,7 @@ fn bench_gather_and_select(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_selection/gather_and_select");
     let fleet = fleet(128);
     for name in POLICY_NAMES {
-        let policy = build(name, None, 0.0).unwrap();
+        let policy = build(name, 0.0).unwrap();
         let all_workers = policy.needs().all_workers;
         let req = request(&fleet);
         group.throughput(Throughput::Elements(1));

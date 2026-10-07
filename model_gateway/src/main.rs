@@ -367,22 +367,14 @@ struct CliArgs {
 
     /// Worker selection policy for cache_aware, run over the per-worker
     /// inputs the router gathers (prefix overlap, in-flight requests,
-    /// backend load reports). cache-aware-default is the affinity-group
-    /// decision and the only policy a production build knows; a build
-    /// with the bench-policies feature adds the measured, bench-only
-    /// cache-aware-balanced (queued prefill plus live in-flight work less
-    /// a capped prefix credit, at one fleet drain rate)
+    /// backend load reports); cache-aware-default, the affinity-group
+    /// decision, is the one policy
     #[arg(
         long,
         default_value = "cache-aware-default",
         help_heading = "Routing Policy"
     )]
     selection_policy: String,
-
-    /// YAML/JSON parameters for --selection-policy; each policy documents
-    /// its own and rejects unknown ones
-    #[arg(long, help_heading = "Routing Policy")]
-    selection_policy_params: Option<String>,
 
     /// Lifetime in milliseconds of optimistic dispatch bookings for
     /// cache_aware: predicted prefill and prefix placement are charged to the
@@ -1629,7 +1621,6 @@ impl CliArgs {
                 cache_boundaries: self.cache_boundaries.clone(),
                 selection_policy: (self.selection_policy != DEFAULT_SELECTION_POLICY)
                     .then(|| self.selection_policy.clone()),
-                selection_policy_params: self.selection_policy_params.clone(),
                 selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {

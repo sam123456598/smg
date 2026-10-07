@@ -433,18 +433,14 @@ impl CacheAwarePolicy {
             .selection_policy
             .as_deref()
             .unwrap_or(cost::DEFAULT_POLICY);
-        let selection = cost::build(
-            selection_policy_name,
-            config.selection_policy_params.as_deref(),
-            config.selection_temperature,
-        )
-        .unwrap_or_else(|err| {
-            // Configuration validation rejects this before a policy is built;
-            // a policy constructed outside that path still routes, with the
-            // default decision, rather than failing every request.
-            error!(%err, "Invalid selection policy; using {}", cost::DEFAULT_POLICY);
-            cost::default_policy(config.selection_temperature)
-        });
+        let selection = cost::build(selection_policy_name, config.selection_temperature)
+            .unwrap_or_else(|err| {
+                // Configuration validation rejects this before a policy is built;
+                // a policy constructed outside that path still routes, with the
+                // default decision, rather than failing every request.
+                error!(%err, "Invalid selection policy; using {}", cost::DEFAULT_POLICY);
+                cost::default_policy(config.selection_temperature)
+            });
         let accounting = (config.selection_accounting_ttl_ms > 0).then(|| {
             OptimisticAccounting::new(Duration::from_millis(config.selection_accounting_ttl_ms))
         });
@@ -7183,7 +7179,7 @@ mod tests {
 
     #[test]
     fn default_policy_reproduces_affinity_score_group_at_zero_temperature() {
-        let policy = cost::build(cost::DEFAULT_POLICY, None, 0.0).unwrap();
+        let policy = cost::build(cost::DEFAULT_POLICY, 0.0).unwrap();
         let urls: Vec<String> = (0..16).map(|i| format!("http://w{i:02}:8000")).collect();
         let request = RequestInputs {
             prompt_tokens: 64,
@@ -7210,7 +7206,7 @@ mod tests {
 
     #[test]
     fn default_policy_temperature_groups_are_score_groups() {
-        let policy = cost::build(cost::DEFAULT_POLICY, None, 0.5).unwrap();
+        let policy = cost::build(cost::DEFAULT_POLICY, 0.5).unwrap();
         let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
         let candidates: Vec<OverlapCandidate> = (0..8)
             .map(|idx| OverlapCandidate {
@@ -7395,72 +7391,6 @@ mod tests {
         CacheAwarePolicy::with_config(test_config()).reconcile_in_flight("http://w1:8000", 0);
     }
 
-    /// The balanced policy through the host: the holder of the prompt's
-    /// blocks wins while its expected wait is within the credit of the cold
-    /// worker's, and loses the request once its queue is deeper than that.
-    #[cfg(feature = "bench-policies")]
-    #[test]
-    fn balanced_policy_trades_the_holders_affinity_against_its_queue() {
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
-            selection_policy: Some("cache-aware-balanced".to_string()),
-            ..test_config()
-        });
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        policy.init_workers(&workers);
-        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer =
-            setup_indexer_with_blocks("http://w2:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
-        monitor.indexers.insert("unknown".to_string(), indexer);
-        policy.set_kv_event_monitor(Some(monitor));
-
-        // Both drain at 2,000 tokens/s; w2 holds the prompt's two blocks, a
-        // credit of 8 tokens (4 ms). Each round publishes fresh loads, which
-        // also clears the previous dispatch's since-poll credit.
-        let route = |w1_queued: i32, w2_queued: i32| {
-            let loads: HashMap<String, WorkerLoadResponse> = [
-                (
-                    "http://w1:8000".to_string(),
-                    expected_wait_load(w1_queued, 0.1, 2_000.0),
-                ),
-                (
-                    "http://w2:8000".to_string(),
-                    expected_wait_load(w2_queued, 0.1, 2_000.0),
-                ),
-            ]
-            .into_iter()
-            .collect();
-            let (_tx, rx) = watch::channel(complete_load_snapshot(loads.clone()));
-            policy.set_load_receiver(Some(rx));
-            policy.update_loads(&loads);
-            let selected = policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        tokens: Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            policy.on_request_complete(workers[selected].url(), true);
-            selected
-        };
-        assert_eq!(
-            route(0, 4),
-            1,
-            "the holder keeps the request within its credit"
-        );
-        assert_eq!(
-            route(0, 40),
-            0,
-            "a deeper queue outweighs the capped credit"
-        );
-        assert_eq!(
-            route(40, 0),
-            1,
-            "and the holder wins outright when it is the idle one"
-        );
-    }
-
     #[test]
     fn invalid_selection_policy_falls_back_to_the_default() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
@@ -7617,23 +7547,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "bench-policies")]
-    #[test]
-    fn an_all_workers_policy_ranks_the_holder_beside_the_sample() {
-        let config = CacheAwareConfig {
-            selection_policy: Some("cache-aware-balanced".to_string()),
-            ..test_config()
-        };
-        let (policy, workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], config);
-        for _ in 0..8 {
-            let idx = policy
-                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
-                .unwrap();
-            assert_eq!(idx, 37);
-            policy.on_request_complete(workers[idx].url(), true);
-        }
-    }
-
     #[test]
     fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -7729,23 +7642,6 @@ mod tests {
             "200 decisions on a head every worker holds reached {} workers",
             picked.len()
         );
-    }
-
-    #[cfg(feature = "bench-policies")]
-    #[test]
-    fn an_all_workers_policy_over_a_sampled_pool_keeps_the_deepest_holder() {
-        let config = CacheAwareConfig {
-            selection_policy: Some("cache-aware-balanced".to_string()),
-            ..test_config()
-        };
-        let (policy, workers) = shared_prefix_pool(64, 50, config);
-        for _ in 0..4 {
-            let idx = policy
-                .select_worker(&workers, &tokens_info(&[1, 2, 3, 4, 5, 6, 7, 8]))
-                .unwrap();
-            assert_eq!(idx, 50);
-            policy.on_request_complete(workers[idx].url(), true);
-        }
     }
 
     #[test]

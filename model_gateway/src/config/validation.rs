@@ -517,7 +517,6 @@ impl ConfigValidator {
                 cache_ttl_secs,
                 cache_boundaries,
                 selection_policy,
-                selection_policy_params,
                 selection_accounting_ttl_ms: _,
             } => {
                 Self::validate_cache_boundaries(cache_boundaries)?;
@@ -527,11 +526,9 @@ impl ConfigValidator {
                 let selection_policy_name = selection_policy
                     .as_deref()
                     .unwrap_or(selection_cost::DEFAULT_POLICY);
-                if let Err(err) = selection_cost::build(
-                    selection_policy_name,
-                    selection_policy_params.as_deref(),
-                    *selection_temperature,
-                ) {
+                if let Err(err) =
+                    selection_cost::build(selection_policy_name, *selection_temperature)
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "selection_policy".to_string(),
                         value: selection_policy_name.to_string(),
@@ -1748,7 +1745,6 @@ mod tests {
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
-                selection_policy_params: None,
                 selection_accounting_ttl_ms: 0,
             },
         );
@@ -1781,7 +1777,6 @@ mod tests {
                     cache_ttl_secs: 180,
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
-                    selection_policy_params: None,
                     selection_accounting_ttl_ms: 0,
                 },
             )
@@ -1819,7 +1814,6 @@ mod tests {
                     cache_ttl_secs,
                     cache_boundaries: boundaries,
                     selection_policy: None,
-                    selection_policy_params: None,
                     selection_accounting_ttl_ms: 0,
                 },
             )
@@ -1874,7 +1868,6 @@ mod tests {
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
-                selection_policy_params: None,
                 selection_accounting_ttl_ms: 0,
             },
         );
@@ -1998,7 +1991,6 @@ mod tests {
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
-                selection_policy_params: None,
                 selection_accounting_ttl_ms: 0,
             },
         );
@@ -2053,7 +2045,6 @@ mod tests {
                     cache_ttl_secs: 180,
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
-                    selection_policy_params: None,
                     selection_accounting_ttl_ms: 0,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
@@ -2187,7 +2178,6 @@ mod tests {
                     cache_ttl_secs: 180,
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
-                    selection_policy_params: None,
                     selection_accounting_ttl_ms: 0,
                 }),
                 prefill_policy: None,

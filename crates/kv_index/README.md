@@ -183,9 +183,7 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   placed it through the worker's load guard, on every path; booked state is reconciled with the
   live in-flight count each poll. Worker selection runs through a cost-function selection layer
   (`model_gateway/src/policies/cost/`) whose default reproduces the existing cache-aware decision;
-  a `cache-aware-balanced` variant (expected wait less a capped prefix credit relative to the
-  fleet's best holder, behind a two-signal saturation veto) exists for the benches only and is
-  not a gateway option; event-driven requests are hashed under their cache namespace.
+  event-driven requests are hashed under their cache namespace.
 - **Protection by default.** Worker overload protection is on as steering: a worker at or above
   `--worker-overload-waiting-requests` or `--worker-overload-token-usage` is left out of selection
   while another is under them, and a fleet uniformly over them is routed to its least-loaded worker;
@@ -199,8 +197,7 @@ alias of `chain`); `--kv-indexer-ttl-secs`, `--kv-indexer-max-entries` (position
 `--worker-warmup-share` (0.25), `--worker-warmup-blocks` (1024), `--worker-warmup-thin-ratio`
 (0.5); `--worker-overload-protection` (on), `--disable-worker-overload-protection`,
 `--worker-overload-waiting-requests` (8), `--worker-overload-token-usage` (0.8),
-`--worker-overload-shed` (off); `--selection-policy` (`cache-aware-default`; the
-`cache-aware-balanced` variant is reachable from the benches only), `--selection-policy-params`,
+`--worker-overload-shed` (off); `--selection-policy` (`cache-aware-default`),
 `--selection-accounting-ttl-ms` (0);
 `--load-monitor-interval` (10; a `GetLoads` poll goes only to a worker whose KV-event stream pushed no load
 record within the interval, the poll being the fallback for servicers that do not push).

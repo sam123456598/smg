@@ -245,23 +245,12 @@ fn run(scenario: Scenario, chooser: Chooser<'_>, seed: u64) -> Outcome {
     }
 }
 
-/// Policies under test: the product's default, plus the bench-only balanced policy when it is
-/// compiled in.
+/// Policies under test: the product's default.
 fn policies() -> Vec<(&'static str, WorkerSelectionPolicy)> {
-    let list = vec![(
+    vec![(
         "cache-aware-default",
-        build("cache-aware-default", None, 0.0).unwrap(),
-    )];
-    #[cfg(feature = "bench-policies")]
-    let list = {
-        let mut list = list;
-        list.push((
-            "cache-aware-balanced",
-            build("cache-aware-balanced", None, 0.0).unwrap(),
-        ));
-        list
-    };
-    list
+        build("cache-aware-default", 0.0).unwrap(),
+    )]
 }
 
 const REPEAT_HEAVY: Scenario = Scenario {
