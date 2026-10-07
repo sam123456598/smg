@@ -41,13 +41,15 @@
 //! - Tool names are not checked against the request's tools; the format has no tool list yet.
 //!
 //! The prompt decides where the output starts: its terminals are replayed over the same table
-//! from the initial state, and the output begins in the state they leave. Qwen 3.5's template
-//! opens `<think>` in the generation prompt, so the output starts inside the thought, with
-//! `ReasoningStart` pushed for the prompt, and its first `</think>` closes it; Qwen3 writes its
-//! own `<think>`; and a prompt that disables thinking ends with `<think>\n\n</think>\n\n`, which
-//! leaves the engine in content. A prompt that leaves an arguments state open is read as content
-//! for now (a prefilled call is a later step), and the whole prompt is scanned rather than its
-//! tail, which is linear and done once per output.
+//! from the initial state, and the output begins in the state they leave. The replay starts at
+//! the last turn opener the table names (`<|im_start|>assistant` for ChatML), so a marker quoted
+//! in an earlier turn, a `<tool_call>` in the user's question or a `<think>` inside an earlier
+//! call's arguments, moves nothing; a table that names no opener is replayed from the prompt's
+//! start. Qwen 3.5's template opens `<think>` in the generation prompt, so the output starts
+//! inside the thought, with `ReasoningStart` pushed for the prompt, and its first `</think>`
+//! closes it; Qwen3 writes its own `<think>`; and a prompt that disables thinking ends with
+//! `<think>\n\n</think>\n\n`, which leaves the engine in content. A prompt that leaves an
+//! arguments state open is read as content for now (a prefilled call is a later step).
 //!
 //! [`Declared`]: crate::tagged::Declared
 
@@ -79,6 +81,8 @@ enum Closed {
 #[derive(Debug)]
 pub struct Engine {
     format: Format,
+    /// The request's tools, which type a tagged call's values.
+    declared: Declared,
     scanner: Scanner,
     state: usize,
     /// The call being assembled while the engine is in an arguments state.
@@ -97,25 +101,20 @@ enum Call {
 }
 
 impl Call {
-    fn new(syntax: Option<&CallSyntax>, index: u32) -> Self {
+    fn new(syntax: Option<CallSyntax>, index: u32) -> Self {
         let id = format!("call_{index}");
         match syntax {
             // A format whose table has an arguments state but names no syntax reads the call as
             // Qwen3 writes it; the definitions in the crate always name one.
             Some(CallSyntax::Json) | None => Self::Json(json::Assembler::new(index, id)),
-            Some(CallSyntax::Tagged(_)) => Self::Tagged(tagged::Assembler::new(index, id)),
+            Some(CallSyntax::Tagged) => Self::Tagged(tagged::Assembler::new(index, id)),
         }
     }
 
-    fn feed(&mut self, text: &str, syntax: Option<&CallSyntax>, out: &mut Events) -> usize {
-        match (self, syntax) {
-            (Self::Json(assembler), _) => assembler.feed(text, out),
-            (Self::Tagged(assembler), Some(CallSyntax::Tagged(declared))) => {
-                assembler.feed(text, declared, out)
-            }
-            // A tagged assembler exists only under the tagged syntax; the arm is unreachable, and
-            // the text is kept as the call's rather than lost.
-            (Self::Tagged(assembler), _) => assembler.feed(text, &Declared::default(), out),
+    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+        match self {
+            Self::Json(assembler) => assembler.feed(text, out),
+            Self::Tagged(assembler) => assembler.feed(text, declared, out),
         }
     }
 
@@ -146,13 +145,15 @@ enum Stage {
 }
 
 impl Engine {
-    /// An engine at the start of an output, in the format's initial state.
+    /// An engine at the start of an output, in the format's initial state, with the request's
+    /// tools, which type a tagged call's values (`Declared::default()` for a request without
+    /// tools, or a format that types nothing by them).
     ///
     /// # Panics
     ///
     /// A format with no state has nowhere to put the output's text; definitions are written in
     /// the crate, so that is a programming error.
-    pub fn new(format: Format) -> Self {
+    pub fn new(format: Format, declared: Declared) -> Self {
         assert!(
             format.has_states(),
             "format {}: a table with no state",
@@ -161,6 +162,7 @@ impl Engine {
         Self {
             scanner: Scanner::new(format.terminal_texts()),
             format,
+            declared,
             state: 0,
             call: None,
             calls: 0,
@@ -168,11 +170,6 @@ impl Engine {
             reasoning_tokens: 0,
             stage: Stage::Fresh,
         }
-    }
-
-    /// The format this engine runs.
-    pub fn format(&self) -> &Format {
-        &self.format
     }
 
     fn emits(&self) -> Emits {
@@ -201,7 +198,7 @@ impl Engine {
                     return;
                 };
                 let mut assembled = Events::new();
-                let taken = call.feed(text, self.format.call_syntax(), &mut assembled);
+                let taken = call.feed(text, &self.declared, &mut assembled);
                 for event in assembled.drain() {
                     out.push(self.tokens.relabel(event));
                 }
@@ -275,7 +272,7 @@ impl Engine {
     /// The next call takes the next free index; the index is spent only if the region produces a
     /// call, so a `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
-        self.call = Some(Call::new(self.format.call_syntax(), self.calls));
+        self.call = Some(Call::new(self.format.call_syntax().copied(), self.calls));
     }
 
     /// Ends the call region: the assembler closes what arrived. A region its terminal closed
@@ -306,11 +303,20 @@ impl Engine {
     }
 
     /// Where the prompt leaves the engine: its terminals replayed over the table from the initial
-    /// state. An arguments state is not entered from the prompt.
+    /// state, starting at the last turn opener the table names. An arguments state is not entered
+    /// from the prompt.
     fn seed(&mut self, prompt: &str, out: &mut Events) {
+        let turn = match self
+            .format
+            .turn_opener()
+            .and_then(|opener| prompt.rfind(opener))
+        {
+            Some(at) => &prompt[at..],
+            None => prompt,
+        };
         let mut scanner = Scanner::new(self.format.terminal_texts());
         let mut state = 0;
-        let pieces = scanner.feed(prompt).into_iter().chain(scanner.finish());
+        let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
         for piece in pieces {
             if let Piece::Marker(index) = piece {
                 if let Some(to) = self.format.next(state, index) {

@@ -11,6 +11,7 @@
 //!   call that was open and starts the next.
 //! - No row leaves reasoning on a call marker: Qwen3 closes its thought with `</think>` before a
 //!   call, so a `<tool_call>` inside the thought is reasoning text.
+//! - The turn opener is ChatML's `<|im_start|>assistant`.
 //!
 //! The tests here are the engine's as much as this format's: they were written against the
 //! hand-written parser this table replaced, and hold the table to the same events.
@@ -33,6 +34,7 @@ pub fn qwen3(syntax: CallSyntax) -> Format {
         .transition("calls", "call_close", "content")
         .transition("calls", "call_open", "calls")
         .calls(syntax)
+        .opens_turn("<|im_start|>assistant")
 }
 
 #[cfg(test)]
@@ -57,7 +59,7 @@ mod tests {
     }
 
     fn run(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json));
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
@@ -486,7 +488,7 @@ mod tests {
         ];
         let text: String = tokens.concat();
         let spans = spans_of(&tokens);
-        let mut parser = Engine::new(qwen3(CallSyntax::Json));
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         parser
             .feed(
@@ -552,7 +554,7 @@ mod tests {
             ("</think>", &[(0, 8)]),
             ("", &[(0, 0)]),
         ];
-        let mut parser = Engine::new(qwen3(CallSyntax::Json));
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         for (text, ranges) in pieces {
             let spans: Vec<TokenSpan> = ranges
@@ -614,7 +616,7 @@ mod tests {
     #[test]
     fn a_token_cut_by_a_delta_boundary_is_counted_once_and_a_special_token_counts_into_what_follows(
     ) {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json));
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         let first = [TokenSpan {
             token_id: 1,
@@ -681,7 +683,7 @@ mod tests {
 
     #[test]
     fn a_stream_that_turns_uncounted_reports_no_reasoning_count() {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json));
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         let spans = [TokenSpan {
             token_id: 0,
@@ -768,7 +770,7 @@ mod tests {
     );
 
     fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Tagged(declared())));
+        let mut parser = Engine::new(qwen3(CallSyntax::Tagged), declared());
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
@@ -938,7 +940,7 @@ mod tests {
 
     /// The prompt, then the whole output in one delta, then the engine's stop.
     fn after_prompt(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Tagged(declared())));
+        let mut parser = Engine::new(qwen3(CallSyntax::Tagged), declared());
         let mut out = Events::new();
         parser
             .feed(
@@ -1010,9 +1012,79 @@ mod tests {
         }
     }
 
+    /// The prompt, then the whole output in one delta, then the engine's stop, under the JSON
+    /// syntax.
+    fn after_prompt_json(prompt: &str, output: &str) -> Vec<Event> {
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser.feed(delta(output), &mut out).expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        out.drain()
+    }
+
+    fn reasoning_of(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_prompt_is_replayed_from_the_turn_the_model_writes_not_from_its_start() {
+        // A stray `<tool_call>` in the user's turn, and the generation prompt opens the thought:
+        // the output is the thought, not content (smg #2839, Alex's probe against main).
+        let output = "The user asks about the marker.\n</think>\n\nIt opens a tool call.";
+        for prompt in [
+            "<|im_start|>user\nWhy did you print <tool_call> there?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n",
+            "<|im_start|>user\n<tool_response>\nsee <tool_call> in src\n</tool_response>\
+             <|im_end|>\n\
+             <|im_start|>assistant\n<think>\n",
+        ] {
+            for events in [
+                after_prompt(prompt, output),
+                after_prompt_json(prompt, output),
+            ] {
+                assert_eq!(events[0], Event::ReasoningStart, "{prompt:?}");
+                assert_eq!(
+                    reasoning_of(&events),
+                    "The user asks about the marker.\n",
+                    "{prompt:?}"
+                );
+            }
+        }
+        // An earlier call whose arguments hold `<think>`, closed in its own turn: the output is
+        // content, as the model wrote no thought (main read it as reasoning).
+        let prompt = "<|im_start|>assistant\n<tool_call>\n\
+                      {\"name\": \"write\", \"arguments\": {\"text\": \"<think>\"}}\n\
+                      </tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n\
+                      </tool_response><|im_end|>\n<|im_start|>assistant\n";
+        let events = after_prompt_json(prompt, "Done.");
+        assert_eq!(events[0], Event::Content(Text::uncounted("Done.")));
+    }
+
     #[test]
     fn inputs_out_of_order_are_lifecycle_errors() {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json));
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         parser
             .feed(

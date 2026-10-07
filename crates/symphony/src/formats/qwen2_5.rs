@@ -19,6 +19,7 @@ pub fn qwen2_5() -> Format {
         .transition("calls", "call_close", "content")
         .transition("calls", "call_open", "calls")
         .calls(CallSyntax::Json)
+        .opens_turn("<|im_start|>assistant")
 }
 
 #[cfg(test)]
@@ -29,6 +30,7 @@ mod tests {
         event::{DropReason, Event, Events, Text},
         input::{EngineFinish, Input},
         parser::Parser,
+        tagged::Declared,
     };
 
     const CALL: &str = concat!(
@@ -37,7 +39,7 @@ mod tests {
     );
 
     fn run(output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(qwen2_5());
+        let mut parser = Engine::new(qwen2_5(), Declared::default());
         let mut out = Events::new();
         parser
             .feed(
@@ -89,7 +91,7 @@ mod tests {
 
     #[test]
     fn a_prompt_that_opens_a_thought_opens_nothing_here() {
-        let mut parser = Engine::new(qwen2_5());
+        let mut parser = Engine::new(qwen2_5(), Declared::default());
         let mut out = Events::new();
         parser
             .feed(

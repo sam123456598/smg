@@ -19,21 +19,25 @@
 //!   assembler for it. A format with no arguments state has none.
 //!
 //! The first state in the table is where an output starts, unless the prompt moved the engine
-//! before the output began (the engine replays the prompt's terminals over the same table).
+//! before the output began: the engine replays the prompt's terminals over the same table, from
+//! the last **turn opener** the table names (`<|im_start|>assistant` for Qwen's ChatML), so that
+//! a marker quoted in an earlier turn moves nothing. A table that names no opener is replayed
+//! from the prompt's start.
+//!
+//! The table holds what is static about a format. What belongs to one request, the tools that
+//! type a tagged call's values, reaches the [`Engine`] with the request, not the table.
 //!
 //! [`Engine`]: crate::Engine
 //! [`formats`]: crate::formats
 
-use crate::tagged::Declared;
-
 /// How the model writes a call between the call markers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallSyntax {
     /// One JSON object, `{"name": …, "arguments": {…}}`: Qwen3.
     Json,
     /// `<function=NAME>` and then `<parameter=KEY>` around each value's text, typed by the
-    /// request's tools: Qwen 3.5 and later, Qwen3-Coder.
-    Tagged(Declared),
+    /// request's tools, which reach the engine with the request: Qwen 3.5 and later, Qwen3-Coder.
+    Tagged,
 }
 
 /// What the text inside a state is.
@@ -54,6 +58,7 @@ pub struct Format {
     states: Vec<State>,
     transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
+    turn_opener: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +99,7 @@ impl Format {
             states: Vec::new(),
             transitions: Vec::new(),
             calls: None,
+            turn_opener: None,
         }
     }
 
@@ -135,6 +141,19 @@ impl Format {
     pub fn calls(mut self, syntax: CallSyntax) -> Self {
         self.calls = Some(syntax);
         self
+    }
+
+    /// The text that opens the turn the model writes, `<|im_start|>assistant` for ChatML: the
+    /// prompt's replay starts at its last occurrence.
+    #[must_use]
+    pub fn opens_turn(mut self, text: &str) -> Self {
+        self.turn_opener = Some(text.to_string());
+        self
+    }
+
+    /// The turn opener, if the table names one.
+    pub(crate) fn turn_opener(&self) -> Option<&str> {
+        self.turn_opener.as_deref()
     }
 
     /// The format's name.
