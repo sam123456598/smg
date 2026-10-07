@@ -45,7 +45,7 @@ use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
     adapt,
-    formats::{deepseek_v4_1, qwen2_5, qwen3, seed_oss},
+    formats::{deepseek_v4_1, hy4, iquest, ling, qwen2_5, qwen3, seed_oss},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -298,6 +298,23 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::SeedOss,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    // Keyed arguments, each family under its own markers; the prompt opens the thought, Hy4's
+    // whatever the request says.
+    (
+        "hy4-preview",
+        Family::Hy4,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "ling-3.0-flash",
+        Family::Ling,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "iquest-q1",
+        Family::IQuest,
+        GenerationPrompt::OpensTheThought,
+    ),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -313,12 +330,23 @@ enum Family {
     DeepSeekV4_1,
     /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
     SeedOss,
+    /// [`hy4`], [`ling`], [`iquest`]: keyed arguments, typed by the request tools.
+    Hy4,
+    Ling,
+    IQuest,
 }
 
-/// How the Qwen tables spell the thought's markers, for the reasoning allowance's guard.
-const THINK_MARKERS: (&str, &str) = ("<think>", "</think>");
-
 impl Family {
+    /// How the family spells the thought's markers, for the prompt's tail and the reasoning
+    /// allowance's guard.
+    fn think_markers(self) -> (&'static str, &'static str) {
+        match self {
+            Self::SeedOss => ("<seed:think>", "</seed:think>"),
+            Self::Hy4 => ("<think:opensource>", "</think:opensource>"),
+            _ => ("<think>", "</think>"),
+        }
+    }
+
     fn engine(self, fixture: &Fixture) -> Engine {
         let declared = Declared::of(&fixture.request.tools);
         match self {
@@ -327,6 +355,9 @@ impl Family {
             Self::Qwen2_5 => Engine::new(qwen2_5(), declared),
             Self::DeepSeekV4_1 => Engine::new(deepseek_v4_1(), declared),
             Self::SeedOss => Engine::new(seed_oss(), declared),
+            Self::Hy4 => Engine::new(hy4(), declared),
+            Self::Ling => Engine::new(ling(), declared),
+            Self::IQuest => Engine::new(iquest(), declared),
         }
     }
 
@@ -340,6 +371,10 @@ impl Family {
             // Seed-OSS reads neither of the probes' Qwen markers: `</think>` stays reasoning text
             // and the fenced `<tool_call>` block stays content, as the reference says.
             Self::SeedOss => &[],
+            // Hy4 and IQuest read neither probe's Qwen markers; Ling reads `<tool_call>` and
+            // `</think>`, so its two probes are the tagged ones' (no call comes of the fence).
+            Self::Hy4 | Self::IQuest => &[],
+            Self::Ling => KNOWN_TAGGED_DIFFERENCES,
             Self::DeepSeekV4_1 => KNOWN_DSML_DIFFERENCES,
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
@@ -359,7 +394,10 @@ impl Family {
             return Vec::new();
         }
         let mut allowed = Vec::new();
-        if matches!(self, Self::Qwen3Tagged | Self::SeedOss) {
+        if matches!(
+            self,
+            Self::Qwen3Tagged | Self::SeedOss | Self::Hy4 | Self::Ling | Self::IQuest
+        ) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
         if prompt == GenerationPrompt::Plain {
@@ -391,14 +429,18 @@ enum GenerationPrompt {
 }
 
 impl GenerationPrompt {
-    /// The bytes after `<|im_start|>assistant\n` for the case's request.
-    fn tail(self, fixture: &Fixture) -> &'static str {
+    /// The bytes after the assistant header for the case's request, in the family's spelling of
+    /// the thought's markers.
+    fn tail(self, fixture: &Fixture, family: Family) -> String {
+        let (open, close) = family.think_markers();
         match (self, fixture.request.thinking_off()) {
-            (Self::Plain, _) | (Self::ModelWritesTheThought, false) => "",
+            (Self::Plain, _) | (Self::ModelWritesTheThought, false) => String::new(),
             (Self::OpensTheThought | Self::ModelWritesTheThought, true) => {
-                "<think>\n\n</think>\n\n"
+                format!("{open}\n\n{close}\n\n")
             }
-            (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => "<think>\n",
+            (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => {
+                format!("{open}\n")
+            }
         }
     }
 }
@@ -656,10 +698,10 @@ fn qwen3_parse_fixtures_match_the_reference() {
     let failures = parity(
         &fixtures,
         &|fixture| Family::Qwen3.engine(fixture),
-        &|_| "",
+        &|_| String::new(),
         KNOWN_DIFFERENCES,
         &[],
-        THINK_MARKERS,
+        Family::Qwen3.think_markers(),
     );
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
@@ -691,10 +733,10 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
         failures.extend(parity(
             &fixtures,
             &|fixture| family.engine(fixture),
-            &|fixture| prompt.tail(fixture),
+            &|fixture| prompt.tail(fixture, family),
             family.known_differences(prompt),
             &family.allowances(slug, prompt),
-            THINK_MARKERS,
+            family.think_markers(),
         ));
         recorded += 1;
     }
@@ -719,7 +761,7 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
 fn parity(
     fixtures: &[Fixture],
     new_parser: &dyn Fn(&Fixture) -> Engine,
-    prompt_tail: &dyn Fn(&Fixture) -> &'static str,
+    prompt_tail: &dyn Fn(&Fixture) -> String,
     known_differences: &[KnownDifference],
     allowed: &[Allowance],
     think_markers: (&str, &str),
@@ -739,7 +781,7 @@ fn parity(
         for plan in chunkings(text) {
             let events = replay_after(
                 &mut new_parser(fixture),
-                prompt_tail(fixture),
+                &prompt_tail(fixture),
                 text,
                 &plan,
                 &finish,
