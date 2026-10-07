@@ -136,4 +136,5 @@ result record can be compared with it.
 per request, eviction order (tail-first or by hash), restart schedule, request count and sample
 interval. The series it prints per sample: lookup p50/p99, runs walked per lookup, runs and blocks
 live, mean run length, splits by cause, mergeable adjacent pairs, memory, and the exactness
-verdict.
+verdict. `--json <file>` writes the series and the run's figures as JSON; nothing is written
+without it.

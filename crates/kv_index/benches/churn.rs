@@ -13,12 +13,13 @@
 //! by cause, the mergeable adjacent pairs found by a debug walk (a run with one child, equal
 //! coverage, no prefix holder of its own on the child), arena and header bytes, and the events
 //! applied; and the index is checked against the reference indexer on a sample of queries. The
-//! series goes to `--json`.
+//! series goes to the file named by `--json`, when one is given.
 
 #![expect(clippy::print_stdout)]
 
 use std::{
     io::Write,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -91,8 +92,13 @@ struct Args {
     final_exact_samples: usize,
     #[arg(long, default_value = "20261006")]
     seed: u64,
-    #[arg(long, default_value = "churn_result.json")]
-    json: String,
+    /// Write the sample series and the run's figures to this file; without it nothing is
+    /// written (the bench also runs under `cargo test --all-targets`, in the crate directory).
+    #[arg(long)]
+    json: Option<PathBuf>,
+    /// Passed by `cargo bench`; ignored.
+    #[arg(long, hide = true)]
+    bench: bool,
 }
 
 fn percentile(sorted: &[u64], num: usize, den: usize) -> u64 {
@@ -287,7 +293,9 @@ fn main() -> anyhow::Result<()> {
         "final_exact": final_exact.is_ok(),
         "elapsed_s": started.elapsed().as_secs_f64(),
     });
-    std::fs::write(&args.json, serde_json::to_vec_pretty(&result)?)?;
+    if let Some(out) = &args.json {
+        std::fs::write(out, serde_json::to_vec_pretty(&result)?)?;
+    }
     println!(
         "churn done in {:.1} s; final exactness {}{}",
         started.elapsed().as_secs_f64(),
