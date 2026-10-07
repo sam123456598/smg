@@ -38,9 +38,8 @@ pub fn prefetch_read<T>(pointer: *const T) {
     {
         // SAFETY: `prefetcht0` is a hint that never faults, whatever the address holds.
         unsafe {
-            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
-                pointer.cast::<i8>(),
-            );
+            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<{ _MM_HINT_T0 }>(pointer.cast::<i8>());
         }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
