@@ -45,7 +45,7 @@ use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
     adapt,
-    formats::{deepseek_v4_1, hy4, iquest, ling, qwen2_5, qwen3, seed_oss},
+    formats::{deepseek_v4_1, hy4, iquest, lfm2_5, ling, olmo3, qwen2_5, qwen3, seed_oss},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -315,6 +315,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::IQuest,
         GenerationPrompt::OpensTheThought,
     ),
+    // Python calls: Olmo 3 has no thought; LFM2.5 writes its own `<think>`.
+    ("olmo-3-7b-instruct", Family::Olmo3, GenerationPrompt::Plain),
+    (
+        "lfm2.5-1.2b-instruct",
+        Family::Lfm2_5,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -334,6 +341,9 @@ enum Family {
     Hy4,
     Ling,
     IQuest,
+    /// [`olmo3`], [`lfm2_5`]: Python calls.
+    Olmo3,
+    Lfm2_5,
 }
 
 impl Family {
@@ -358,6 +368,8 @@ impl Family {
             Self::Hy4 => Engine::new(hy4(), declared),
             Self::Ling => Engine::new(ling(), declared),
             Self::IQuest => Engine::new(iquest(), declared),
+            Self::Olmo3 => Engine::new(olmo3(), declared),
+            Self::Lfm2_5 => Engine::new(lfm2_5(), declared),
         }
     }
 
@@ -373,8 +385,11 @@ impl Family {
             Self::SeedOss => &[],
             // Hy4 and IQuest read neither probe's Qwen markers; Ling reads `<tool_call>` and
             // `</think>`, so its two probes are the tagged ones' (no call comes of the fence).
-            Self::Hy4 | Self::IQuest => &[],
+            Self::Hy4 | Self::IQuest | Self::Olmo3 => &[],
             Self::Ling => KNOWN_TAGGED_DIFFERENCES,
+            // LFM2.5 reads `</think>` but not `<tool_call>`: the reasoning probe is listed, the
+            // fence is content as the reference says.
+            Self::Lfm2_5 => &KNOWN_TAGGED_DIFFERENCES[..1],
             Self::DeepSeekV4_1 => KNOWN_DSML_DIFFERENCES,
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
