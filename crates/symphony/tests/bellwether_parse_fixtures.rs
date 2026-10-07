@@ -56,7 +56,7 @@ const SLUG: &str = "qwen3-8b";
 /// that reads it and how its template ends the generation prompt. The fixtures carry the request
 /// and the output, not the rendered prompt, so the prompt's tail is stated here until bellwether
 /// records it (noted for Simo in STATE.md). A slug bellwether has not recorded is skipped with a
-/// notice; `qwen3-8b` is the one CI's pinned fixtures always hold, and has its own test.
+/// notice; `qwen3-8b` is the one set bellwether's main always holds, and has its own test.
 const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // Qwen3: the model writes its own `<think>`; thinking off closes it in the prompt.
     (
@@ -260,14 +260,16 @@ enum Family {
     Qwen2_5,
 }
 
+/// How the Qwen tables spell the thought's markers, for the reasoning allowance's guard.
+const THINK_MARKERS: (&str, &str) = ("<think>", "</think>");
+
 impl Family {
     fn engine(self, fixture: &Fixture) -> Engine {
+        let declared = Declared::of(&fixture.request.tools);
         match self {
-            Self::Qwen3 => Engine::new(qwen3(CallSyntax::Json)),
-            Self::Qwen3Tagged => Engine::new(qwen3(CallSyntax::Tagged(Declared::of(
-                &fixture.request.tools,
-            )))),
-            Self::Qwen2_5 => Engine::new(qwen2_5()),
+            Self::Qwen3 => Engine::new(qwen3(CallSyntax::Json), declared),
+            Self::Qwen3Tagged => Engine::new(qwen3(CallSyntax::Tagged), declared),
+            Self::Qwen2_5 => Engine::new(qwen2_5(), declared),
         }
     }
 
@@ -287,9 +289,14 @@ impl Family {
         }
     }
 
-    /// The corpus classes this syntax meets: the tagged syntax cannot carry a type the text does
-    /// not say, and a template without a thought drops the reference's reasoning.
-    fn allowances(self, prompt: GenerationPrompt) -> Vec<Allowance> {
+    /// The corpus classes this syntax meets in sets recorded before bellwether refused them,
+    /// when the run opts in ([`CORPUS_ALLOWANCES_ENV`]): the tagged syntax cannot carry a type
+    /// the text does not say, a template without a thought drops the reference's reasoning, and
+    /// four Qwen2.5 templates write content or calls, not both.
+    fn allowances(self, slug: &str, prompt: GenerationPrompt) -> Vec<Allowance> {
+        if std::env::var_os(CORPUS_ALLOWANCES_ENV).is_none() {
+            return Vec::new();
+        }
         let mut allowed = Vec::new();
         if self == Self::Qwen3Tagged {
             allowed.push(Allowance::DeclaredTypeConflict);
@@ -297,7 +304,7 @@ impl Family {
         if prompt == GenerationPrompt::Plain {
             allowed.push(Allowance::ReasoningNotWritten);
         }
-        if self == Self::Qwen2_5 {
+        if CONTENT_OR_CALLS.contains(&slug) {
             allowed.push(Allowance::CallsNotWritten);
         }
         allowed
@@ -335,23 +342,38 @@ impl GenerationPrompt {
     }
 }
 
-/// A class of difference the corpus has, allowed for what the fixture shows rather than by id.
-/// Both are cases bellwether refuses or tracks on its side; fixtures recorded before those rules
-/// still hold them.
+/// The variable a preview run sets to allow the corpus classes below; CI, on sets bellwether
+/// records now, leaves it unset, so a class that comes back fails the run.
+const CORPUS_ALLOWANCES_ENV: &str = "SYMPHONY_CORPUS_ALLOWANCES";
+
+/// The slugs whose template writes a message's content or its calls, not both.
+const CONTENT_OR_CALLS: &[&str] = &[
+    "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-7b-instruct",
+    "qwen2.5-vl-32b-instruct",
+    "qwen2.5-omni-3b",
+];
+
+/// A class of difference the scale-run sets of 2026-10-06 have, allowed for what the fixture
+/// shows rather than by id, and only when the run opts in. Each is a case bellwether refuses at
+/// record time now; the sets that hold them were recorded before the rule that refuses them, and
+/// the classes go once those sets are recorded again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Allowance {
     /// The reference's argument is a boolean, a number or null for a parameter the tool declares
     /// `string`, so the template writes it as it writes the string, and the parser gives the
     /// string back, as vLLM does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
-    /// and `"dontcare"` and answers `false`). Bellwether #56 refuses such a case at record time.
+    /// and `"dontcare"` and answers `false`). Bellwether #56 refuses such a case.
     DeclaredTypeConflict,
     /// The template writes no thought, so the reasoning the reference carries is not in the output
-    /// (bellwether #52: a case recorded although the template drops a part of the message).
+    /// (bellwether #52, refused by bellwether #68). Allowed only when the output holds neither of
+    /// the family's thought markers, so a thought the parser lost never passes as one the
+    /// template dropped.
     ReasoningNotWritten,
     /// The template writes a message's content or its calls, not both, so the calls the reference
-    /// carries are not in the output: Qwen2.5-VL and Qwen2.5-Omni (bellwether #52 again). Allowed
-    /// only when the output holds no call marker at all, so a call the parser missed never passes
-    /// as one the template dropped.
+    /// carries are not in the output: Qwen2.5-VL and Qwen2.5-Omni (bellwether #33's class, refused
+    /// since it merged). Allowed only when the output holds no call marker at all, so a call the
+    /// parser missed never passes as one the template dropped.
     CallsNotWritten,
 }
 
@@ -561,10 +583,11 @@ fn qwen3_parse_fixtures_match_the_reference() {
     );
     let failures = parity(
         &fixtures,
-        &|_| Engine::new(qwen3(CallSyntax::Json)),
+        &|fixture| Family::Qwen3.engine(fixture),
         &|_| "",
         KNOWN_DIFFERENCES,
         &[],
+        THINK_MARKERS,
     );
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
@@ -598,7 +621,8 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
             &|fixture| family.engine(fixture),
             &|fixture| prompt.tail(fixture),
             family.known_differences(prompt),
-            &family.allowances(prompt),
+            &family.allowances(slug, prompt),
+            THINK_MARKERS,
         ));
         recorded += 1;
     }
@@ -626,6 +650,7 @@ fn parity(
     prompt_tail: &dyn Fn(&Fixture) -> &'static str,
     known_differences: &[KnownDifference],
     allowed: &[Allowance],
+    think_markers: (&str, &str),
 ) -> Vec<String> {
     let known = |id: &str| {
         known_differences
@@ -697,7 +722,9 @@ fn parity(
             }
             listed += 1;
             "listed (bellwether #16)"
-        } else if let Some(allowance) = allowance_for(&said, &expected, text, allowed) {
+        } else if let Some(allowance) =
+            allowance_for(&said, &expected, text, allowed, think_markers)
+        {
             allowed_count += 1;
             match allowance {
                 Allowance::DeclaredTypeConflict => "allowed: declared-type conflict (corpus)",
@@ -749,12 +776,15 @@ fn allowance_for(
     expected: &Said,
     text: &str,
     allowed: &[Allowance],
+    think_markers: (&str, &str),
 ) -> Option<Allowance> {
     let (said, expected) = (said.trimmed(), expected.trimmed());
     allowed.iter().copied().find(|allowance| match allowance {
         Allowance::ReasoningNotWritten => {
             said.reasoning.is_none()
                 && expected.reasoning.is_some()
+                && !text.contains(think_markers.0)
+                && !text.contains(think_markers.1)
                 && Said {
                     reasoning: None,
                     ..expected.clone()
@@ -881,7 +911,7 @@ fn qwen3_token_plans_count_every_token_where_its_first_byte_lands() {
         let finish = engine_finish(&fixture.reference.finish_reason);
         let by_text = Said::of(
             &replay(
-                &mut Engine::new(qwen3(CallSyntax::Json)),
+                &mut Engine::new(qwen3(CallSyntax::Json), Declared::default()),
                 text,
                 &[],
                 &finish,
@@ -1013,7 +1043,7 @@ fn replay_tokens(
     sizes: &[usize],
     finish: &EngineFinish,
 ) -> Result<Vec<Event>, ParseError> {
-    let mut parser = Engine::new(qwen3(CallSyntax::Json));
+    let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
     let mut out = Events::new();
     parser.feed(prompt(), &mut out)?;
     let mut first = 0;
