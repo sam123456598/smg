@@ -2,7 +2,7 @@
 //! outer marker rather than hard-coded (e.g. `:6124c78e`).
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     errors::{ParserError, ParserResult},
@@ -163,6 +163,68 @@ impl HyV4Parser {
             self.buffer.drain(..i + end.len());
         }
         out
+    }
+
+    /// Constrain a `<tool_calls>` block containing one or more calls. Arguments
+    /// use xgrammar's `glm_xml` style: raw strings and schema-typed JSON values,
+    /// with required/optional properties handled by xgrammar as for GLM-4.7.
+    /// Uses suffix-less markers; this builder has no tokenizer information
+    /// from which to select checkpoint-specific suffixes.
+    pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
+        let calls: Vec<Value> = tools
+            .iter()
+            .filter(|tool| !tool.function.name.is_empty())
+            .map(|tool| {
+                json!({
+                    "type": "tag",
+                    "begin": format!("<tool_call>{}", tool.function.name),
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": tool.function.parameters,
+                        "style": "glm_xml",
+                    },
+                    "end": "</tool_call>",
+                })
+            })
+            .collect();
+        // An empty `or` is unsatisfiable; with no named tool, admit only an
+        // empty block, which parses to no calls.
+        let content = if calls.is_empty() {
+            json!({ "type": "const_string", "value": "" })
+        } else {
+            json!({ "type": "plus", "content": { "type": "or", "elements": calls } })
+        };
+
+        json!({
+            "format": {
+                "type": "triggered_tags",
+                "triggers": ["<tool_calls>"],
+                "tags": [{
+                    "begin": "<tool_calls>",
+                    "content": content,
+                    "end": "</tool_calls>",
+                }],
+                "at_least_one": at_least_one,
+            }
+        })
+    }
+
+    /// Close prefilled reasoning before the forced call. Prefix exclusions also
+    /// prevent checkpoint-suffixed control markers from appearing in reasoning.
+    pub fn reasoning_prefix() -> Value {
+        json!({
+            "type": "tag",
+            "begin": "",
+            "content": {
+                "type": "any_text",
+                "excludes": [
+                    "<think", "</think",
+                    "<tool_call", "</tool_call",
+                    "<arg_key", "</arg_key", "<arg_value", "</arg_value",
+                ],
+            },
+            "end": "</think>",
+        })
     }
 }
 

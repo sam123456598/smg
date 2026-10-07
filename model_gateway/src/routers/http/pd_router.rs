@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -45,9 +51,10 @@ use crate::{
             kv_transfer::{
                 carries_moriio_peer_markers, connector_mode_for_worker, is_moriio_worker,
                 mooncake_decode_params, mooncake_prefill_params, moriio_decode_params,
-                moriio_endpoint, moriio_prefill_params, moriio_side_channel_error,
-                moriio_write_target_error, validate_moriio_handoff, KvConnectorMode,
-                MoriIoEndpoint, MoriIoTransfer, NIXL_PREFILL_KV_PARAMS,
+                moriio_dp_mismatch_error, moriio_endpoint, moriio_prefill_params,
+                moriio_side_channel_error, moriio_write_target_error, validate_moriio_handoff,
+                KvConnectorMode, MoriIoEndpoint, MoriIoTransfer, DATA_PARALLEL_RANK_HEADER,
+                NIXL_PREFILL_KV_PARAMS,
             },
             overload,
             placement::{self, PairFailure, PlacementFailure, PlacementInputs},
@@ -122,6 +129,8 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     prefill_admission: Option<Arc<PrefillAdmission>>,
+    /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
+    moriio_dp_turn: AtomicUsize,
 }
 
 /// Who records the prefill leg's outcome for an attempt: the attempt, from
@@ -259,6 +268,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             prefill_admission: ctx.prefill_admission.clone(),
+            moriio_dp_turn: AtomicUsize::new(0),
         })
     }
 
@@ -597,6 +607,7 @@ impl PDRouter {
                 _ => None,
             };
             let moriio_decode = moriio_endpoints.as_ref().map(|(_, decode)| decode);
+            let dp_rank = moriio_decode.and_then(|decode| self.moriio_dp_rank(decode));
             // In WRITE mode the decode engine needs nothing from the prefill
             // response, so a decode worker can opt into sending both legs at
             // once.
@@ -653,7 +664,8 @@ impl PDRouter {
                                 RawValue::from_string(mooncake_prefill_params(id)).ok()
                             }
                             (KvConnectorMode::MoriIo, Some(id), Some(decode)) => {
-                                RawValue::from_string(moriio_prefill_params(id, decode)).ok()
+                                RawValue::from_string(moriio_prefill_params(id, decode, dp_rank))
+                                    .ok()
                             }
                             _ => None,
                         };
@@ -666,8 +678,12 @@ impl PDRouter {
                     {
                         body.insert(
                             "kv_transfer_params",
-                            RawValue::from_string(moriio_decode_params(id, prefill_endpoint))
-                                .map_err(serialization_error)?,
+                            RawValue::from_string(moriio_decode_params(
+                                id,
+                                prefill_endpoint,
+                                dp_rank,
+                            ))
+                            .map_err(serialization_error)?,
                         );
                     }
 
@@ -689,7 +705,8 @@ impl PDRouter {
             };
             if let (Some(endpoint), Some(id)) = (moriio_decode, &transfer_id) {
                 debug!(
-                    "vLLM PD (MoRI-IO {:?}, {} legs): transfer_id={id} prefill={} decode={}",
+                    "vLLM PD (MoRI-IO {:?}, {} legs): transfer_id={id} prefill={} decode={} \
+                     dp_rank={dp_rank:?}",
                     endpoint.transfer,
                     if concurrent_write {
                         "concurrent"
@@ -708,6 +725,7 @@ impl PDRouter {
                         headers,
                         (prefill_body, decode_body),
                         transfer_id,
+                        dp_rank,
                         prefill_endpoint,
                         context,
                         Arc::clone(&prefill),
@@ -726,6 +744,7 @@ impl PDRouter {
                     (prefill_body, decode_body),
                     mode,
                     transfer_id,
+                    dp_rank,
                     context,
                     Arc::clone(&prefill),
                     Arc::clone(&decode),
@@ -1255,7 +1274,17 @@ impl PDRouter {
                 return Err(misconfigured(reason));
             }
         }
+        if let Some(reason) = moriio_dp_mismatch_error(&prefill_endpoint, &decode_endpoint) {
+            return Err(misconfigured(reason));
+        }
         Ok((prefill_endpoint, decode_endpoint))
+    }
+
+    /// The data-parallel rank both legs of the next request on a MoRI-IO
+    /// pair go to, if its engines run more than one.
+    fn moriio_dp_rank(&self, decode: &MoriIoEndpoint) -> Option<usize> {
+        (decode.dp_size > 1)
+            .then(|| self.moriio_dp_turn.fetch_add(1, Ordering::Relaxed) % decode.dp_size)
     }
 
     /// Requests one MoRI-IO handoff cannot serve, refused before either leg
@@ -1329,6 +1358,7 @@ impl PDRouter {
         leg_bodies: (Bytes, Bytes),
         mode: KvConnectorMode,
         transfer_id: Option<String>,
+        dp_rank: Option<usize>,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -1363,12 +1393,15 @@ impl PDRouter {
             }
             .emit();
 
-            let prefill_request = self.build_post_with_headers(
-                prefill.as_ref(),
-                context.route,
-                prefill_body,
-                headers,
-                false,
+            let prefill_request = Self::pin_dp_rank(
+                self.build_post_with_headers(
+                    prefill.as_ref(),
+                    context.route,
+                    prefill_body,
+                    headers,
+                    false,
+                ),
+                dp_rank,
             );
             let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
                 Ok(response) => response,
@@ -1440,7 +1473,7 @@ impl PDRouter {
         drop(prefill_guard);
         if mode == KvConnectorMode::MoriIo {
             let checked = match (&harvested, transfer_id.as_deref()) {
-                (Some(handoff), Some(id)) => validate_moriio_handoff(handoff, id),
+                (Some(handoff), Some(id)) => validate_moriio_handoff(handoff, id, dp_rank),
                 _ => Err("prefill returned no kv_transfer_params".to_string()),
             };
             if let Err(reason) = checked {
@@ -1506,12 +1539,15 @@ impl PDRouter {
             None => decode_body,
         };
 
-        let decode_request = self.build_post_with_headers(
-            decode.as_ref(),
-            context.route,
-            decode_body,
-            headers,
-            false,
+        let decode_request = Self::pin_dp_rank(
+            self.build_post_with_headers(
+                decode.as_ref(),
+                context.route,
+                decode_body,
+                headers,
+                false,
+            ),
+            dp_rank,
         );
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
@@ -1582,6 +1618,7 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         leg_bodies: (Bytes, Bytes),
         transfer_id: Option<String>,
+        dp_rank: Option<usize>,
         prefill_endpoint: &MoriIoEndpoint,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
@@ -1605,19 +1642,25 @@ impl PDRouter {
         .emit();
 
         let dispatch_start = Instant::now();
-        let prefill_request = self.build_post_with_headers(
-            prefill.as_ref(),
-            context.route,
-            prefill_body,
-            headers,
-            false,
+        let prefill_request = Self::pin_dp_rank(
+            self.build_post_with_headers(
+                prefill.as_ref(),
+                context.route,
+                prefill_body,
+                headers,
+                false,
+            ),
+            dp_rank,
         );
-        let decode_request = self.build_post_with_headers(
-            decode.as_ref(),
-            context.route,
-            decode_body,
-            headers,
-            false,
+        let decode_request = Self::pin_dp_rank(
+            self.build_post_with_headers(
+                decode.as_ref(),
+                context.route,
+                decode_body,
+                headers,
+                false,
+            ),
+            dp_rank,
         );
         let prefill_leg = async {
             let response = match send_with_stale_conn_retry(prefill_request).await {
@@ -1724,12 +1767,11 @@ impl PDRouter {
                     Self::harvest_kv_transfer_params(&prefill_bytes),
                     transfer_id.as_deref(),
                 ) {
-                    (Some(handoff), Some(id)) => {
-                        validate_moriio_handoff(&handoff, id).and_then(|()| {
+                    (Some(handoff), Some(id)) => validate_moriio_handoff(&handoff, id, dp_rank)
+                        .and_then(|()| {
                             moriio_side_channel_error(&handoff, prefill_endpoint)
                                 .map_or(Ok(()), Err)
-                        })
-                    }
+                        }),
                     _ => Err("prefill returned no kv_transfer_params".to_string()),
                 };
                 if let Err(reason) = checked {
@@ -2265,6 +2307,17 @@ impl PDRouter {
             }
         }
         request
+    }
+
+    /// Route a MoRI-IO leg to the data-parallel rank both legs are pinned to.
+    fn pin_dp_rank(
+        request: reqwest::RequestBuilder,
+        dp_rank: Option<usize>,
+    ) -> reqwest::RequestBuilder {
+        match dp_rank {
+            Some(rank) => request.header(DATA_PARALLEL_RANK_HEADER, rank.to_string()),
+            None => request,
+        }
     }
 
     // Helper to merge logprobs from prefill and decode responses
@@ -2864,6 +2917,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             prefill_admission: None,
+            moriio_dp_turn: AtomicUsize::new(0),
         }
     }
 
@@ -4112,6 +4166,211 @@ mod tests {
                 stops.get("stop_token_ids")
             );
             assert_eq!(decode[0].1.get("ignore_eos"), None);
+        }
+    }
+
+    /// The data-parallel rank header and the body of each request a stub got.
+    type RankSeen = Arc<std::sync::Mutex<Vec<(Option<String>, Value)>>>;
+
+    fn rank_header(req: &Request) -> Option<String> {
+        req.headers()
+            .get(DATA_PARALLEL_RANK_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// A MoRI-IO producer stub with four data-parallel ranks. Like a vLLM 0.30
+    /// producer, its handoff names the rank the request ran on: the routed
+    /// one, or `answer_rank` when set.
+    async fn spawn_moriio_dp_prefill_stub(answer_rank: Option<u64>) -> (String, RankSeen) {
+        let seen: RankSeen = Arc::default();
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let rank = rank_header(&req);
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let mut handoff = stub_handoff(
+                    body.pointer("/kv_transfer_params/transfer_id")
+                        .unwrap_or(&Value::Null),
+                );
+                let ran_on = answer_rank
+                    .or_else(|| rank.as_deref().and_then(|r| r.parse().ok()))
+                    .unwrap_or(0);
+                handoff["remote_dp_rank"] = json!(ran_on);
+                handoff["remote_dp_rank_override"] = json!(true);
+                handoff["remote_dp_size"] = json!(4);
+                log.lock().unwrap().push((rank, body));
+                axum::Json(json!({"kv_transfer_params": handoff}))
+            }
+        }));
+        (spawn_stub(app).await, seen)
+    }
+
+    async fn spawn_moriio_dp_decode_stub() -> (String, RankSeen) {
+        let seen: RankSeen = Arc::default();
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let rank = rank_header(&req);
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                log.lock().unwrap().push((rank, body));
+                ([(CONTENT_TYPE, "application/json")], r#"{"choices":[]}"#)
+            }
+        }));
+        (spawn_stub(app).await, seen)
+    }
+
+    /// Register a MoRI-IO pair whose engines run the given numbers of
+    /// data-parallel ranks, with extra labels on the decode worker.
+    fn register_moriio_dp_pair(
+        router: &PDRouter,
+        (prefill_url, prefill_dp): (String, &str),
+        (decode_url, decode_dp): (String, &str),
+        mode: &str,
+        decode_labels: &[(&str, &str)],
+    ) {
+        let prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MoRIIOConnector")
+            .label("moriio_mode", mode)
+            .label("moriio_host", "10.0.0.1")
+            .label("dp_size", prefill_dp);
+        let mut decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MoRIIOConnector")
+            .label("moriio_mode", mode)
+            .label("moriio_host", "10.0.0.2")
+            .label("dp_size", decode_dp);
+        for (key, value) in decode_labels {
+            decode = decode.label(*key, *value);
+        }
+        for worker in [prefill.build(), decode.build()] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+    }
+
+    fn taken_ranked(seen: &RankSeen) -> Vec<(Option<String>, Value)> {
+        std::mem::take(
+            &mut *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_pins_both_legs_to_one_dp_rank() {
+        for (mode, decode_labels) in [
+            ("read", &[][..]),
+            ("write", &[][..]),
+            ("write", &[CONCURRENT_WRITE][..]),
+        ] {
+            let (prefill_url, prefill_seen) = spawn_moriio_dp_prefill_stub(None).await;
+            let (decode_url, decode_seen) = spawn_moriio_dp_decode_stub().await;
+            let router = create_test_pd_router();
+            register_moriio_dp_pair(
+                &router,
+                (prefill_url, "4"),
+                (decode_url, "4"),
+                mode,
+                decode_labels,
+            );
+            let case = format!("{mode} {decode_labels:?}");
+            for _ in 0..4 {
+                let response = moriio_call(&router, "/v1/completions", None, &json!({})).await;
+                assert_eq!(response.status(), StatusCode::OK, "{case}");
+            }
+
+            let decode = taken_ranked(&decode_seen);
+            let mut ranks = Vec::new();
+            for (prefill_rank, prefill_body) in taken_ranked(&prefill_seen) {
+                let params = prefill_body.get("kv_transfer_params").unwrap();
+                let rank: u64 = prefill_rank.as_deref().unwrap().parse().unwrap();
+                assert_eq!(params["remote_dp_size"], 4, "{case}");
+                assert_eq!(params["remote_dp_rank"], rank, "{case}");
+                let transfer_id = &params["transfer_id"];
+                let (decode_rank, decode_body) = decode
+                    .iter()
+                    .find(|(_, body)| &body["kv_transfer_params"]["transfer_id"] == transfer_id)
+                    .unwrap();
+                assert_eq!(decode_rank, &prefill_rank, "{case}: one rank for both legs");
+                let decode_params = &decode_body["kv_transfer_params"];
+                assert_eq!(decode_params["remote_dp_rank"], rank, "{case}");
+                if decode_labels.contains(&CONCURRENT_WRITE) {
+                    assert_eq!(decode_params["remote_dp_size"], 4, "{case}");
+                    assert_eq!(decode_params.get("remote_dp_rank_override"), None);
+                } else {
+                    // Relayed verbatim from the producer.
+                    assert_eq!(decode_params["remote_dp_rank_override"], true, "{case}");
+                }
+                ranks.push(rank);
+            }
+            ranks.sort_unstable();
+            assert_eq!(ranks, [0, 1, 2, 3], "{case}: every rank in turn");
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_refuses_a_pair_with_different_dp_sizes() {
+        for (prefill_dp, decode_dp) in [("4", "1"), ("1", "4"), ("2", "4")] {
+            let (prefill_url, prefill_seen) = spawn_moriio_dp_prefill_stub(None).await;
+            let (decode_url, decode_seen) = spawn_moriio_dp_decode_stub().await;
+            let router = create_test_pd_router();
+            register_moriio_dp_pair(
+                &router,
+                (prefill_url, prefill_dp),
+                (decode_url, decode_dp),
+                "write",
+                &[],
+            );
+            let response = moriio_call(&router, "/v1/completions", None, &json!({})).await;
+            let case = format!("prefill dp {prefill_dp}, decode dp {decode_dp}");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+            assert_eq!(error_code(&response), Some("moriio_pair_misconfigured"));
+            assert!(taken_ranked(&prefill_seen).is_empty(), "{case}");
+            assert!(taken_ranked(&decode_seen).is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_fails_a_handoff_from_another_dp_rank() {
+        for decode_labels in [&[][..], &[CONCURRENT_WRITE][..]] {
+            // The producer reports rank 0 whatever rank the request went to.
+            // A retry would go to the next rank, so allow only one attempt.
+            let (prefill_url, prefill_seen) = spawn_moriio_dp_prefill_stub(Some(0)).await;
+            let (decode_url, decode_seen) = spawn_moriio_dp_decode_stub().await;
+            let router = single_attempt_router();
+            register_moriio_dp_pair(
+                &router,
+                (prefill_url, "4"),
+                (decode_url, "4"),
+                "write",
+                decode_labels,
+            );
+            let pinned_to_0 = moriio_call(&router, "/v1/completions", None, &json!({})).await;
+            assert_eq!(pinned_to_0.status(), StatusCode::OK, "{decode_labels:?}");
+            let pinned_to_1 = moriio_call(&router, "/v1/completions", None, &json!({})).await;
+            assert_eq!(
+                pinned_to_1.status(),
+                StatusCode::BAD_GATEWAY,
+                "{decode_labels:?}"
+            );
+            assert_eq!(error_code(&pinned_to_1), Some("moriio_handoff_invalid"));
+            assert_eq!(taken_ranked(&prefill_seen).len(), 2);
+            // A sequential decode leg is never sent; a concurrent one went out
+            // with the prefill, and its answer is dropped.
+            let decode_legs = if decode_labels.is_empty() { 1 } else { 2 };
+            assert_eq!(taken_ranked(&decode_seen).len(), decode_legs);
         }
     }
 

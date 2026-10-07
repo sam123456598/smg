@@ -185,6 +185,8 @@ validator = "0.20.0"
 tracing-test = "0.2"
 tokio = { workspace = true, features = ["test-util"] }
 kv-index.workspace = true
+# The bellwether render-parity test reads the fixture manifests (TOML).
+toml = "1.1"
 wasmtime-wasi = { workspace = true }
 lru = { workspace = true }
 wat = "1.252"

@@ -119,6 +119,8 @@ pub(crate) struct MoriIoEndpoint {
     /// From the `tp_size` label. Unset means the peer's TP is unknown, which
     /// the connector treats as equal to its own.
     pub(crate) tp_size: Option<usize>,
+    /// From the worker's `dp_size` or the `dp_size` label, 1 when unset.
+    pub(crate) dp_size: usize,
     /// Send the WRITE legs at once. Opt-in: a decode request aborted before
     /// the prefill pushes leaves its blocks allocated in the vLLM connector.
     pub(crate) concurrent_write: bool,
@@ -151,6 +153,12 @@ pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, Str
             ))
         }
     };
+    if worker.dp_rank().is_some() {
+        return Err(format!(
+            "{url}: MoRI-IO PD pins both legs of a request to one data-parallel rank itself; \
+             register the engine once, with a dp_size label, instead of one worker per rank"
+        ));
+    }
     let dp_size = match (worker.dp_size(), label("dp_size")) {
         (Some(dp_size), _) => dp_size,
         (None, None) => 1,
@@ -158,11 +166,8 @@ pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, Str
             .parse::<usize>()
             .map_err(|_| format!("{url}: label dp_size is not an integer: {v:?}"))?,
     };
-    if dp_size > 1 {
-        return Err(format!(
-            "{url}: MoRI-IO PD with dp_size={dp_size} needs both legs pinned to one rank, \
-             which the HTTP PD router does not do"
-        ));
+    if dp_size == 0 {
+        return Err(format!("{url}: dp_size must be at least 1"));
     }
     let port = |name: &str, default: u16| match label(name) {
         None => Ok(default),
@@ -205,23 +210,52 @@ pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, Str
         handshake_port: port(MORIIO_HANDSHAKE_PORT_LABEL, MORIIO_DEFAULT_HANDSHAKE_PORT)?,
         notify_port: port(MORIIO_NOTIFY_PORT_LABEL, MORIIO_DEFAULT_NOTIFY_PORT)?,
         tp_size,
+        dp_size,
         concurrent_write,
+    })
+}
+
+/// The header by which vLLM's API server sends a request to one data-parallel
+/// engine core.
+pub(crate) const DATA_PARALLEL_RANK_HEADER: &str = "x-data-parallel-rank";
+
+/// Why one data-parallel rank cannot serve both legs. A WRITE decode engine
+/// notifies the prefill only from the rank the prefill ran on, so both legs
+/// go to the same rank, which both engines must have.
+pub(crate) fn moriio_dp_mismatch_error(
+    prefill: &MoriIoEndpoint,
+    decode: &MoriIoEndpoint,
+) -> Option<String> {
+    (prefill.dp_size != decode.dp_size).then(|| {
+        format!(
+            "prefill dp_size={} but decode dp_size={}: MoRI-IO PD sends both legs of a \
+             request to the same data-parallel rank, so both engines need the same dp_size",
+            prefill.dp_size, decode.dp_size
+        )
     })
 }
 
 /// Prefill-leg params for MoRI-IO. `remote_tp_size` is the decode's TP (the
 /// connector reads it as the peer's), sent only when labeled; the prefill
-/// engine returns its own as `tp_size` in the handoff. WRITE also names the
-/// decode's side channel: the producer pushes KV before the decode leg exists.
-pub(crate) fn moriio_prefill_params(transfer_id: &str, decode: &MoriIoEndpoint) -> String {
+/// engine returns its own as `tp_size` in the handoff. `dp_rank` is the
+/// data-parallel rank both legs are pinned to. WRITE also names the decode's
+/// side channel: the producer pushes KV before the decode leg exists.
+pub(crate) fn moriio_prefill_params(
+    transfer_id: &str,
+    decode: &MoriIoEndpoint,
+    dp_rank: Option<usize>,
+) -> String {
     let mut params = serde_json::json!({
         "do_remote_decode": true,
         "do_remote_prefill": false,
         "remote_engine_id": null,
         "remote_block_ids": null,
         "transfer_id": transfer_id,
-        "remote_dp_size": 1,
+        "remote_dp_size": decode.dp_size,
     });
+    if let Some(rank) = dp_rank {
+        params["remote_dp_rank"] = Value::from(rank);
+    }
     if let Some(tp_size) = decode.tp_size {
         params["remote_tp_size"] = Value::from(tp_size);
     }
@@ -235,19 +269,27 @@ pub(crate) fn moriio_prefill_params(transfer_id: &str, decode: &MoriIoEndpoint) 
 
 /// Decode-leg params for MoRI-IO WRITE, minted up front so both legs can go
 /// out at once: the decode engine allocates its blocks and tells the prefill
-/// engine where to push them, through the prefill's side channel.
-pub(crate) fn moriio_decode_params(transfer_id: &str, prefill: &MoriIoEndpoint) -> String {
+/// engine where to push them, through the side channel of the prefill's
+/// `dp_rank`.
+pub(crate) fn moriio_decode_params(
+    transfer_id: &str,
+    prefill: &MoriIoEndpoint,
+    dp_rank: Option<usize>,
+) -> String {
     let mut params = serde_json::json!({
         "do_remote_decode": false,
         "do_remote_prefill": true,
         "remote_engine_id": null,
         "remote_block_ids": null,
         "transfer_id": transfer_id,
-        "remote_dp_size": 1,
+        "remote_dp_size": prefill.dp_size,
         "remote_host": prefill.host,
         "remote_handshake_port": prefill.handshake_port,
         "remote_notify_port": prefill.notify_port,
     });
+    if let Some(rank) = dp_rank {
+        params["remote_dp_rank"] = Value::from(rank);
+    }
     if let Some(tp_size) = prefill.tp_size {
         params["remote_tp_size"] = Value::from(tp_size);
     }
@@ -309,8 +351,13 @@ pub(crate) fn moriio_write_target_error(
 /// out, or before a concurrent decode leg's response is forwarded. A MoRI-IO
 /// decode engine without it computes over KV that never arrives (READ) or
 /// waits for a push that never comes (WRITE), so a missing, foreign or
-/// malformed handoff must fail the request instead.
-pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> Result<(), String> {
+/// malformed handoff must fail the request instead. `dp_rank` is the
+/// data-parallel rank both legs were pinned to, if any.
+pub(crate) fn validate_moriio_handoff(
+    handoff: &RawValue,
+    transfer_id: &str,
+    dp_rank: Option<usize>,
+) -> Result<(), String> {
     let params: Value = serde_json::from_str(handoff.get())
         .map_err(|e| format!("unparsable kv_transfer_params: {e}"))?;
     let params = params
@@ -359,6 +406,9 @@ pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> 
             return Err(malformed(key));
         }
     }
+    // The connector uses some of these without converting them (a string
+    // `remote_dp_rank` never equals the engine's own rank), and the producer
+    // reports them as integers.
     for key in [
         "remote_dp_size",
         "remote_dp_size_local",
@@ -368,34 +418,42 @@ pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> 
     ] {
         if params
             .get(key)
-            .is_some_and(|value| !value.is_null() && handoff_count(value).is_none())
+            .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
         {
             return Err(malformed(key));
+        }
+    }
+    // A WRITE decode engine notifies the prefill only when it runs on the
+    // rank the handoff names, and the decode leg goes to the pinned rank.
+    if let Some(rank) = dp_rank {
+        let named = params.get("remote_dp_rank").and_then(Value::as_u64);
+        if named.and_then(|n| usize::try_from(n).ok()) != Some(rank) {
+            return Err(format!(
+                "handoff remote_dp_rank {} is not the pinned data-parallel rank {rank}",
+                params.get("remote_dp_rank").unwrap_or(&Value::Null)
+            ));
         }
     }
     Ok(())
 }
 
-/// A rank or parallel size in a handoff, as a number or a decimal string.
-fn handoff_count(value: &Value) -> Option<u64> {
-    match value {
-        Value::String(count) => count.trim().parse().ok(),
-        Value::Number(count) => count.as_u64(),
-        _ => None,
-    }
-}
-
 /// Block ids as a MoRI-IO producer reports them: one list per KV cache group,
-/// or a single flat list.
+/// which the decode engine pairs with its own groups, and at least one block.
 fn is_block_id_list(value: &Value) -> bool {
-    let block_ids = |items: &[Value]| items.iter().all(|id| id.as_u64().is_some());
-    match value.as_array() {
-        Some(items) if items.iter().all(Value::is_array) => items
-            .iter()
-            .all(|group| group.as_array().is_some_and(|ids| block_ids(ids))),
-        Some(items) => block_ids(items),
-        None => false,
+    let Some(groups) = value.as_array() else {
+        return false;
+    };
+    let mut blocks = 0;
+    for group in groups {
+        let Some(ids) = group.as_array() else {
+            return false;
+        };
+        if !ids.iter().all(|id| id.as_u64().is_some()) {
+            return false;
+        }
+        blocks += ids.len();
     }
+    blocks > 0
 }
 
 /// A side-channel port in a handoff: the engine reports its configured port
@@ -591,6 +649,7 @@ mod tests {
                 handshake_port: 6301,
                 notify_port: 61005,
                 tp_size: None,
+                dp_size: 1,
                 concurrent_write: false,
             })
         );
@@ -613,9 +672,15 @@ mod tests {
                 handshake_port: 7301,
                 notify_port: 62005,
                 tp_size: Some(4),
+                dp_size: 1,
                 concurrent_write: true,
             })
         );
+        let worker = moriio_worker(
+            "http://decode:8200",
+            &[("moriio_mode", "write"), ("dp_size", "8")],
+        );
+        assert_eq!(moriio_endpoint(&worker).map(|e| e.dp_size), Ok(8));
     }
 
     #[test]
@@ -623,7 +688,7 @@ mod tests {
         for labels in [
             vec![],
             vec![("moriio_mode", "both")],
-            vec![("moriio_mode", "read"), ("dp_size", "2")],
+            vec![("moriio_mode", "read"), ("dp_size", "0")],
             vec![("moriio_mode", "read"), ("dp_size", "one")],
             vec![("moriio_mode", "read"), ("moriio_notify_port", "abc")],
             vec![("moriio_mode", "read"), ("moriio_handshake_port", "0")],
@@ -644,6 +709,15 @@ mod tests {
             .label("moriio_mode", "read")
             .build();
         assert!(moriio_endpoint(&nixl).is_err());
+        // One worker per rank would let the two legs of a request pick
+        // different ranks.
+        let per_rank = crate::worker::BasicWorkerBuilder::new("http://decode:8200")
+            .worker_type(crate::worker::WorkerType::Decode)
+            .kv_connector(MORIIO_CONNECTOR)
+            .label("moriio_mode", "write")
+            .dp_config(3, 8)
+            .build();
+        assert!(moriio_endpoint(&per_rank).is_err());
     }
 
     #[test]
@@ -654,9 +728,11 @@ mod tests {
             handshake_port: 6301,
             notify_port: 61005,
             tp_size: Some(4),
+            dp_size: 1,
             concurrent_write: false,
         };
-        let read: Value = serde_json::from_str(&moriio_prefill_params("tx-1", &decode)).unwrap();
+        let read: Value =
+            serde_json::from_str(&moriio_prefill_params("tx-1", &decode, None)).unwrap();
         assert_eq!(
             read,
             serde_json::json!({
@@ -670,7 +746,8 @@ mod tests {
             })
         );
         decode.transfer = MoriIoTransfer::Write;
-        let write: Value = serde_json::from_str(&moriio_prefill_params("tx-2", &decode)).unwrap();
+        let write: Value =
+            serde_json::from_str(&moriio_prefill_params("tx-2", &decode, None)).unwrap();
         assert_eq!(
             write,
             serde_json::json!({
@@ -690,8 +767,13 @@ mod tests {
         // decode matches the prefill instead of collapsing onto rank 0.
         decode.tp_size = None;
         let unlabeled: Value =
-            serde_json::from_str(&moriio_prefill_params("tx-3", &decode)).unwrap();
+            serde_json::from_str(&moriio_prefill_params("tx-3", &decode, None)).unwrap();
         assert_eq!(unlabeled.get("remote_tp_size"), None);
+        decode.dp_size = 8;
+        let pinned: Value =
+            serde_json::from_str(&moriio_prefill_params("tx-4", &decode, Some(3))).unwrap();
+        assert_eq!(pinned["remote_dp_size"], 8);
+        assert_eq!(pinned["remote_dp_rank"], 3);
     }
 
     #[test]
@@ -702,6 +784,7 @@ mod tests {
             handshake_port,
             notify_port,
             tp_size: None,
+            dp_size: 1,
             concurrent_write: false,
         };
         let remote = endpoint("10.0.0.1", 6301, 61005);
@@ -771,9 +854,11 @@ mod tests {
             handshake_port: 7301,
             notify_port: 62005,
             tp_size: None,
+            dp_size: 1,
             concurrent_write: false,
         };
-        let params: Value = serde_json::from_str(&moriio_decode_params("tx-1", &prefill)).unwrap();
+        let params: Value =
+            serde_json::from_str(&moriio_decode_params("tx-1", &prefill, None)).unwrap();
         assert_eq!(
             params,
             serde_json::json!({
@@ -789,8 +874,32 @@ mod tests {
             })
         );
         prefill.tp_size = Some(8);
-        let labeled: Value = serde_json::from_str(&moriio_decode_params("tx-2", &prefill)).unwrap();
+        let labeled: Value =
+            serde_json::from_str(&moriio_decode_params("tx-2", &prefill, None)).unwrap();
         assert_eq!(labeled.get("remote_tp_size"), Some(&Value::from(8)));
+        assert_eq!(labeled.get("remote_dp_rank"), None);
+        prefill.dp_size = 8;
+        let pinned: Value =
+            serde_json::from_str(&moriio_decode_params("tx-3", &prefill, Some(5))).unwrap();
+        assert_eq!(pinned["remote_dp_size"], 8);
+        assert_eq!(pinned["remote_dp_rank"], 5);
+    }
+
+    #[test]
+    fn moriio_pair_needs_one_dp_size_for_both_legs() {
+        let endpoint = |dp_size| MoriIoEndpoint {
+            transfer: MoriIoTransfer::Write,
+            host: "10.0.0.1".to_string(),
+            handshake_port: 6301,
+            notify_port: 61005,
+            tp_size: None,
+            dp_size,
+            concurrent_write: false,
+        };
+        assert_eq!(moriio_dp_mismatch_error(&endpoint(1), &endpoint(1)), None);
+        assert_eq!(moriio_dp_mismatch_error(&endpoint(8), &endpoint(8)), None);
+        assert!(moriio_dp_mismatch_error(&endpoint(8), &endpoint(1)).is_some());
+        assert!(moriio_dp_mismatch_error(&endpoint(1), &endpoint(8)).is_some());
     }
 
     #[test]
@@ -801,6 +910,7 @@ mod tests {
             handshake_port: 6301,
             notify_port: 61005,
             tp_size: None,
+            dp_size: 1,
             concurrent_write: false,
         };
         let handoff = |handshake: Value, notify: Value| {
@@ -842,8 +952,11 @@ mod tests {
             "transfer_id": "tx-abc",
         });
         let raw = |v: &Value| RawValue::from_string(v.to_string()).unwrap();
-        assert_eq!(validate_moriio_handoff(&raw(&valid), "tx-abc"), Ok(()));
-        assert!(validate_moriio_handoff(&raw(&valid), "tx-other").is_err());
+        assert_eq!(
+            validate_moriio_handoff(&raw(&valid), "tx-abc", None),
+            Ok(())
+        );
+        assert!(validate_moriio_handoff(&raw(&valid), "tx-other", None).is_err());
         for (key, value) in [
             ("remote_host", Value::Null),
             ("remote_block_ids", Value::Null),
@@ -852,7 +965,7 @@ mod tests {
             let mut broken = valid.clone();
             broken[key] = value;
             assert!(
-                validate_moriio_handoff(&raw(&broken), "tx-abc").is_err(),
+                validate_moriio_handoff(&raw(&broken), "tx-abc", None).is_err(),
                 "{key} must be required"
             );
         }
@@ -861,7 +974,38 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("remote_notify_port");
-        assert!(validate_moriio_handoff(&raw(&no_port), "tx-abc").is_err());
+        assert!(validate_moriio_handoff(&raw(&no_port), "tx-abc", None).is_err());
+    }
+
+    #[test]
+    fn moriio_handoff_must_come_from_the_pinned_dp_rank() {
+        let handoff = |rank: Option<Value>| {
+            let mut params = serde_json::json!({
+                "do_remote_prefill": true, "do_remote_decode": false,
+                "remote_block_ids": [[484, 485]], "remote_engine_id": "10.24.112.125:6301",
+                "remote_host": "10.24.112.125", "remote_handshake_port": "6301",
+                "remote_notify_port": "61005", "remote_dp_rank_override": true,
+                "remote_dp_size": 8, "tp_size": 1, "transfer_id": "tx-abc",
+            });
+            if let Some(rank) = rank {
+                params["remote_dp_rank"] = rank;
+            }
+            RawValue::from_string(params.to_string()).unwrap()
+        };
+        for (rank, pinned, accepted) in [
+            (Some(Value::from(3)), Some(3), true),
+            (Some(Value::from(3)), None, true),
+            (None, None, true),
+            (Some(Value::from(0)), Some(3), false),
+            (None, Some(3), false),
+            (Some(Value::Null), Some(0), false),
+        ] {
+            assert_eq!(
+                validate_moriio_handoff(&handoff(rank.clone()), "tx-abc", pinned).is_ok(),
+                accepted,
+                "remote_dp_rank {rank:?} pinned to {pinned:?}"
+            );
+        }
     }
 
     #[test]
@@ -878,6 +1022,7 @@ mod tests {
             validate_moriio_handoff(
                 &RawValue::from_string(handoff.to_string()).unwrap(),
                 "tx-abc",
+                None,
             )
         };
         for (key, value) in [
@@ -893,6 +1038,10 @@ mod tests {
             ("remote_block_ids", serde_json::json!([[-1]])),
             ("remote_block_ids", serde_json::json!([[1.5]])),
             ("remote_block_ids", serde_json::json!([484, [485]])),
+            // vLLM pairs the groups with its own: a flat list raises there.
+            ("remote_block_ids", serde_json::json!([484, 485])),
+            ("remote_block_ids", serde_json::json!([])),
+            ("remote_block_ids", serde_json::json!([[]])),
             ("remote_host", serde_json::json!("")),
             ("remote_host", serde_json::json!(42)),
             ("remote_host", serde_json::json!("10.24.112.125 ")),
@@ -903,24 +1052,27 @@ mod tests {
             ("remote_dp_size", serde_json::json!("abc")),
             ("remote_dp_size_local", serde_json::json!(-1)),
             ("remote_dp_rank", serde_json::json!([0])),
+            // A string rank never equals the decode engine's own rank.
+            ("remote_dp_rank", serde_json::json!("0")),
+            ("remote_dp_size", serde_json::json!("1")),
             ("tp_size", serde_json::json!("two")),
+            ("tp_size", serde_json::json!("8")),
             ("remote_tp_size", serde_json::json!(1.5)),
         ] {
             assert!(check(key, &value).is_err(), "{key}={value} must be refused");
         }
-        // Also valid: a flat or empty block list, numeric ports, and any host
-        // the decode engine may dial. The host is not compared with the
-        // labels: it can be a name, or an address on another interface.
+        // Also valid: a group without blocks next to one with blocks, numeric
+        // ports, and any host the decode engine may dial. The host is not
+        // compared with the labels: it can be a name, or an address on
+        // another interface.
         for (key, value) in [
-            ("remote_block_ids", serde_json::json!([484, 485])),
-            ("remote_block_ids", serde_json::json!([])),
             ("remote_block_ids", serde_json::json!([[484], []])),
             ("remote_handshake_port", serde_json::json!(6301)),
             ("remote_host", serde_json::json!("prefill-0.pd.svc")),
             ("remote_host", serde_json::json!("10.101.31.101")),
             ("remote_dp_size", serde_json::json!(1)),
             ("remote_dp_size_local", serde_json::json!(0)),
-            ("remote_dp_rank", serde_json::json!("0")),
+            ("remote_dp_rank", serde_json::json!(0)),
             ("tp_size", serde_json::json!(8)),
             ("remote_tp_size", Value::Null),
         ] {

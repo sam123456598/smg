@@ -232,7 +232,19 @@ The workflow runs `scripts/ci_node_health.py` on the `k8s-runner-cpu` scale set.
 It reads Prometheus (node-problem-detector, DCGM, node-exporter,
 kube-state-metrics) over the ClusterIP and the GitHub Actions API, and keeps **one GitHub
 issue per active problem** under the `ci-node-health` label. The workflow itself needs no
-kubeconfig and no secret beyond `GITHUB_TOKEN`.
+kubeconfig and no secret beyond `GITHUB_TOKEN`. The cluster trigger also supplies a bounded
+snapshot of Failed runner counts and up to three error examples per repository pool.
+The monitor reports these as `Failed runners occupy pool capacity`, covering all three H100
+pools and `k8s-runner-cpu`, even when GPU capacity remains available. It only alerts;
+it never deletes or patches runner records. The existing issue is updated while failures
+persist and closes after the normal two clean hourly runs.
+
+The trigger has a dedicated service account with only `list` permission on
+`EphemeralRunners` in `actions-runner-system`. It forwards names, reasons, counts and
+bounded error messages, never raw runner objects or JIT configuration. A failed read or
+snapshot older than two hours raises `Monitor cannot read runner status` and cannot
+clear an existing Failed-runner alert. A manual dispatch without a snapshot skips the
+runner-status check and preserves its existing issues.
 
 - Slack: `/github subscribe smg-project/smg issues +label:"ci-node-health"` in the channel.
   Only "opened" and "closed" reach Slack; body updates while a problem persists do not.
@@ -247,12 +259,21 @@ kubeconfig and no secret beyond `GITHUB_TOKEN`.
 
 ### Deploy the hourly trigger
 
-The CronJob reads the existing `github-arc-secret` (App ID, installation ID, and private
-key). The App **and its installation** must grant **Actions: Read and write** on
+The trigger retains the existing `ruby:3.3-slim` image and uses its bundled JSON, HTTP,
+OpenSSL and time libraries. It installs no packages at runtime. The Python health check
+remains in the GitHub workflow. The CronJob reads the
+existing `github-arc-secret` (App ID, installation ID, and private key), and its Kubernetes
+service-account token to list runner status. The App **and its installation** must grant
+**Actions: Read and write** on
 `smg-project/smg`, in addition to the ARC permissions above. It creates a short-lived
 installation token limited to the `smg` repository and Actions write permission, dispatches
 the workflow, and revokes the token. No personal access token is needed. The App private key
 is mounted read-only; neither it nor the generated token is printed in logs.
+
+The workflow extension must be present at `WORKFLOW_REF` before applying this trigger.
+It defaults to `main`. For validation before merge, set it to the feature branch:
+`kubectl set env cronjob/ci-node-health-trigger -n actions-runner-system WORKFLOW_REF=codex/runner-failure-alerts`.
+After merging, set `WORKFLOW_REF=main` again; keep the branch until then.
 
 With `kubectl` pointed at the CI runner cluster:
 

@@ -38,6 +38,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -197,9 +198,15 @@ def parse_scores(
 
 
 def _find_category_summary(score_root: Path, category: str) -> tuple[float, int] | None:
-    # BFCL nests scores as <model>/<section>/BFCL_v4_<category>_score.json, so
-    # match a trailing-wildcard pattern (the BFCL_v4_ prefix varies by version).
-    for path in score_root.rglob(f"*{category}_score.json"):
+    # BFCL nests scores as <model>/<section>/BFCL_v4_<category>_score.json, and
+    # the BFCL_v4_ prefix varies by version. The category must be the whole name
+    # after that prefix: "*multiple_score.json" alone also matches
+    # parallel_multiple, live_multiple and live_parallel_multiple, and which of
+    # them rglob yields first depends on the filesystem.
+    exact = re.compile(rf"(?:BFCL_v\d+_)?{re.escape(category)}_score\.json")
+    for path in sorted(score_root.rglob(f"*{category}_score.json")):
+        if not exact.fullmatch(path.name):
+            continue
         try:
             first = path.read_text(encoding="utf-8").splitlines()[0]
             summary = json.loads(first)

@@ -404,7 +404,8 @@ jobs:
   # summary (BENCH_ENFORCE_THRESHOLDS=1 makes it fail). Results are still
   # uploaded and summarized.
   benchmarks:
-    needs: build-wheel
+    needs: [build-wheel, detect-changes]
+    if: needs.detect-changes.outputs.symphony-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -493,6 +494,9 @@ jobs:
       realtime: ${{ steps.filter.outputs.realtime }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
+      # Symphony is not wired into the gateway yet: a change confined to its crate and the
+      # lock file runs the CPU checks only, and every GPU lane below skips on this flag.
+      symphony-only: ${{ steps.filter.outputs.symphony == 'true' && steps.filter.outputs.outside-symphony == 'false' }}
       tokenspeed-image: ${{ steps.tokenspeed-image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
@@ -526,6 +530,9 @@ jobs:
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          # Lets a filter exclude paths with `!` patterns. Filters without them
+          # behave exactly as before: any changed file matching any pattern.
+          predicate-quantifier: 'some-with-excludes'
           filters: |
             common:
               - 'model_gateway/**'
@@ -600,6 +607,15 @@ jobs:
               - 'e2e_test/realtime/**'
             go-bindings:
               - 'e2e_test/bindings_go/**'
+            symphony:
+              - 'crates/symphony/**'
+            # Everything that is not Symphony's crate or the lock file. A PR is Symphony-only
+            # when `symphony` matched and this did not. The `!` patterns only exclude under
+            # `some-with-excludes` above; with the default quantifier `**` would match every file.
+            outside-symphony:
+              - '**'
+              - '!crates/symphony/**'
+              - '!Cargo.lock'
             rust-ci:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -633,6 +649,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -691,6 +708,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -731,6 +749,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -754,6 +773,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -804,6 +824,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -852,6 +873,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -883,6 +905,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -914,6 +937,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -936,6 +960,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -974,6 +999,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -997,6 +1023,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1049,6 +1076,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-chat-mm-worker.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1133,6 +1161,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1202,6 +1231,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1365,6 +1395,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'

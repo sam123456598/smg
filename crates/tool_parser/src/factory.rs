@@ -418,7 +418,12 @@ impl ParserFactory {
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
         registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
-        registry.register_parser("hy_v4", || Box::new(HyV4Parser::new()));
+        registry.register_parser_with_structural_tag(
+            "hy_v4",
+            || Box::new(HyV4Parser::new()),
+            HyV4Parser::build_structural_tag,
+        );
+        registry.register_reasoning_prefix("hy_v4", HyV4Parser::reasoning_prefix);
         registry.register_parser("cohere", || Box::new(CohereParser::new()));
 
         // Register default model mappings

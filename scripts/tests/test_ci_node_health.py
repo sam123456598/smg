@@ -717,3 +717,123 @@ def test_main_dry_run_reports_monitor_blind_when_prometheus_is_down(mod, monkeyp
 def test_npd_unknown_does_not_open_issues(mod):
     assert "npd_unknown" not in mod.CHECKS
     assert all('status="unknown"' not in pc.promql for pc in mod.PROM_CHECKS)
+
+
+# --- failed runner snapshots -------------------------------------------------
+
+
+def _runner_snapshot(pools=None, checked_at=None):
+    return json.dumps(
+        {
+            "checked_at": (checked_at or NOW).isoformat(),
+            "pools": pools
+            if pools is not None
+            else [
+                {"name": name, "failed": 0, "examples": []}
+                for name in ("1-gpu-h100", "2-gpu-h100", "4-gpu-h100", "k8s-runner-cpu")
+            ],
+        }
+    )
+
+
+def test_failed_runner_snapshot_reports_pool_count_and_error(mod):
+    pools = json.loads(_runner_snapshot())["pools"]
+    pools[0] = {
+        "name": "1-gpu-h100",
+        "failed": 3,
+        "examples": [
+            {"name": "runner-old", "reason": "InvalidPod", "message": "webhook connection refused"}
+        ],
+    }
+    findings, evaluated = mod.runner_failure_findings(_runner_snapshot(pools), NOW)
+    assert [(f.check.key, f.scope) for f in findings] == [("runner_failed", "1-gpu-h100")]
+    assert "3 Failed runner(s)" in findings[0].detail
+    assert "runner-old" in findings[0].detail and "connection refused" in findings[0].detail
+    assert evaluated == {"runner_failed", "runner_monitor_blind"}
+
+
+def test_clean_runner_snapshot_evaluates_both_checks_without_alerting(mod):
+    findings, evaluated = mod.runner_failure_findings(_runner_snapshot(), NOW)
+    assert findings == []
+    assert evaluated == {"runner_failed", "runner_monitor_blind"}
+
+
+def test_missing_snapshot_does_not_treat_unchecked_pools_as_healthy(mod):
+    findings, evaluated = mod.runner_failure_findings("", NOW)
+    assert findings == [] and evaluated == set()
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        "not-json",
+        "null",
+        "[]",
+        "{}",
+        _runner_snapshot(checked_at=NOW - timedelta(hours=3)),
+        _runner_snapshot(checked_at=NOW + timedelta(minutes=10)),
+        _runner_snapshot(pools=[{"name": "1-gpu-h100", "failed": 0, "examples": []}]),
+        _runner_snapshot(
+            pools=[
+                {"name": name, "failed": True, "examples": []}
+                for name in ("1-gpu-h100", "2-gpu-h100", "4-gpu-h100", "k8s-runner-cpu")
+            ]
+        ),
+    ],
+)
+def test_invalid_snapshot_alerts_and_cannot_close_failed_runner_issue(mod, snapshot):
+    findings, evaluated = mod.runner_failure_findings(snapshot, NOW)
+    assert [f.check.key for f in findings] == ["runner_monitor_blind"]
+    assert evaluated == {"runner_monitor_blind"}
+    old = mod.IssueState(
+        99,
+        "runner_failed",
+        NOW - timedelta(hours=5),
+        NOW - timedelta(hours=5),
+        None,
+        {"1-gpu-h100": NOW - timedelta(hours=5)},
+    )
+    ops = mod.plan_ops([old], mod.group_by_check(findings), NOW, "run", evaluated=evaluated)
+    assert not any(op.kind == "close" and op.number == 99 for op in ops)
+
+
+@pytest.mark.parametrize("github_summary", [False, True])
+def test_main_includes_failed_runner_snapshot_in_issue_operations(
+    mod, monkeypatch, capsys, tmp_path, github_summary
+):
+    if github_summary:
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+    else:
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    ops = []
+    apply_ops = mod.apply_ops
+
+    def capture_ops(gh, planned, dry_run):
+        ops.extend(planned)
+        apply_ops(gh, planned, dry_run)
+
+    monkeypatch.setattr(mod, "apply_ops", capture_ops)
+    pools = json.loads(_runner_snapshot())["pools"]
+    pools[3] = {
+        "name": "k8s-runner-cpu",
+        "failed": 1,
+        "examples": [
+            {"name": "cpu-runner-old", "reason": "InvalidPod", "message": "connection refused"}
+        ],
+    }
+    monkeypatch.setenv("RUNNER_FAILURES_JSON", _runner_snapshot(pools, datetime.now(UTC)))
+    monkeypatch.setattr(mod, "Prom", lambda *a, **k: FakeProm({}))
+    monkeypatch.setattr(
+        mod,
+        "GitHub",
+        lambda *a, **k: FakeGitHub(
+            {"actions/runs": {"workflow_runs": []}, **NO_ACTIVE_RUNS, **NO_ISSUES}
+        ),
+    )
+    assert mod.main(["--dry-run", "--repo", "x/y"]) == 0
+    text = capsys.readouterr().out
+    assert "runner_failed" in text
+    assert [(op.kind, op.key) for op in ops] == [("create", "runner_failed")]
+    assert "k8s-runner-cpu" in ops[0].title
+    assert "cpu-runner-old" in ops[0].body
+    assert "InvalidPod" in ops[0].body and "connection refused" in ops[0].body

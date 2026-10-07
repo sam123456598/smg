@@ -7,4 +7,5 @@ pub mod engine;
 pub mod grpc;
 pub mod http;
 pub mod kv_zmq;
+pub mod replay;
 pub mod zmq;

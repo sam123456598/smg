@@ -1,6 +1,16 @@
-use openai_protocol::common::Tool;
+use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
 use serde_json::json;
-use tool_parser::{parsers::HyV4Parser, traits::ToolParser};
+use tool_parser::{HyV4Parser, ParserFactory, ToolConstraint, ToolParser};
+
+const CONSTRAINED_CALLS: &str = concat!(
+    "<tool_calls><tool_call>run",
+    "<arg_key>text</arg_key><arg_value>  中文\"\\\n\t</tool_call> &amp;  </arg_value>",
+    "<arg_key>count</arg_key><arg_value>7</arg_value>",
+    "<arg_key>mixed</arg_key><arg_value>true</arg_value>",
+    "<arg_key>items</arg_key><arg_value>[1,2]</arg_value>",
+    "<arg_key>object</arg_key><arg_value>{\"ok\":true}</arg_value>",
+    "</tool_call><tool_call>ping</tool_call></tool_calls>"
+);
 
 #[expect(clippy::unwrap_used, reason = "literal test fixture must deserialize")]
 fn tools() -> Vec<Tool> {
@@ -63,7 +73,7 @@ async fn hy4_text_truncation_and_reset() {
 
 #[tokio::test]
 async fn hy4_character_chunks_eof_and_factory() {
-    let factory = tool_parser::factory::ParserFactory::new();
+    let factory = ParserFactory::new();
     let p = factory.get_parser("tencent/Hy4-preview-FP8").unwrap();
     assert!(p.has_tool_markers("<tool_calls:6124c78e>"));
     let text =
@@ -372,4 +382,173 @@ async fn hy4_eof_after_call_does_not_leak_partial_group_closer() {
         .unwrap();
     assert_eq!(r.calls[0].parameters, "{}");
     assert!(p.take_unstreamed_normal_text().is_empty());
+}
+
+#[expect(clippy::unwrap_used, reason = "literal test fixture must deserialize")]
+fn constraint_tools() -> Vec<Tool> {
+    let mut tools = tools();
+    let parameters = &mut tools[0].function.parameters;
+    parameters["required"] = json!(["count"]);
+    parameters["additionalProperties"] = json!(false);
+    parameters["properties"]["items"] = json!({"type": "array", "items": {"type": "integer"}});
+    parameters["properties"]["object"] = json!({
+        "type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]
+    });
+    tools.push(
+        serde_json::from_value(json!({"type": "function", "function": {"name": "ping"}})).unwrap(),
+    );
+    tools
+}
+
+#[test]
+fn hy4_structural_tag_uses_glm_xml_arguments() {
+    let mut tools = constraint_tools();
+    tools[0].function.strict = Some(false);
+    let mut nameless = tools[0].clone();
+    nameless.function.name.clear();
+    tools.push(nameless);
+
+    for at_least_one in [false, true] {
+        let tag = HyV4Parser::build_structural_tag(&tools, at_least_one);
+        let format = &tag["format"];
+        assert_eq!(format["type"], "triggered_tags");
+        assert_eq!(format["triggers"], json!(["<tool_calls>"]));
+        assert_eq!(format["at_least_one"], at_least_one);
+        let blocks = format["tags"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["begin"], "<tool_calls>");
+        assert_eq!(blocks[0]["end"], "</tool_calls>");
+        assert_eq!(blocks[0]["content"]["type"], "plus");
+        assert_eq!(blocks[0]["content"]["content"]["type"], "or");
+        let calls = blocks[0]["content"]["content"]["elements"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 2, "nameless tools are excluded");
+        for (call, tool) in calls.iter().zip(&tools) {
+            assert_eq!(
+                call,
+                &json!({
+                    "type": "tag",
+                    "begin": format!("<tool_call>{}", tool.function.name),
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": tool.function.parameters,
+                        "style": "glm_xml",
+                    },
+                    "end": "</tool_call>",
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn hy4_constrains_only_forced_tool_choices() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("hy_v4");
+    let tools = constraint_tools();
+    assert!(registry.has_structural_tag("hy_v4"));
+    assert!(registry.has_reasoning_prefix(parser));
+
+    for choice in [
+        json!("auto"),
+        json!("none"),
+        json!({"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "run"}]}),
+    ] {
+        let choice: ToolChoice = serde_json::from_value(choice).unwrap();
+        for reasoning in [false, true] {
+            assert!(registry
+                .generate_tool_constraint(parser, &tools, &choice, reasoning)
+                .unwrap()
+                .is_none());
+        }
+    }
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    assert!(registry
+        .generate_tool_constraint(parser, &[], &required, false)
+        .unwrap()
+        .is_none());
+
+    let unnamed: Vec<Tool> = serde_json::from_value(
+        json!([{"type": "function", "function": {"name": "", "parameters": {}}}]),
+    )
+    .unwrap();
+    let tag = HyV4Parser::build_structural_tag(&unnamed, true);
+    assert_eq!(
+        tag["format"]["tags"][0]["content"],
+        json!({"type": "const_string", "value": ""})
+    );
+
+    for (choice, selected) in [
+        (json!("required"), tools.as_slice()),
+        (
+            json!({"type": "function", "function": {"name": "run"}}),
+            &tools[..1],
+        ),
+        (
+            json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "run"}]}),
+            &tools[..1],
+        ),
+    ] {
+        // The gateway filters named/allowed tools before invoking the registry.
+        let choice: ToolChoice = serde_json::from_value(choice).unwrap();
+        let plain = HyV4Parser::build_structural_tag(selected, true);
+        let thinking = json!({
+            "format": {
+                "type": "sequence",
+                "elements": [HyV4Parser::reasoning_prefix(), plain["format"]],
+            },
+        });
+        for (reasoning, expected) in [(false, &plain), (true, &thinking)] {
+            let Some(ToolConstraint::StructuralTag(tag)) = registry
+                .generate_tool_constraint(parser, selected, &choice, reasoning)
+                .unwrap()
+            else {
+                panic!("expected a structural tag");
+            };
+            assert_eq!(
+                &serde_json::from_str::<serde_json::Value>(&tag).unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn hy4_constrained_calls_parse_complete_and_streaming() {
+    let tools = constraint_tools();
+    let text = CONSTRAINED_CALLS;
+    let (content, calls) = HyV4Parser::new()
+        .parse_complete_with_tools(text, &tools)
+        .await
+        .unwrap();
+    assert!(content.is_empty());
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].function.name, "run");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap(),
+        json!({
+            "text": "  中文\"\\\n\t</tool_call> &amp;  ", "count": 7, "mixed": true, "items": [1,2], "object": {"ok": true}
+        })
+    );
+    assert_eq!(calls[1].function.name, "ping");
+    assert_eq!(calls[1].function.arguments, "{}");
+    let mut parser = HyV4Parser::new();
+    let mut deltas = Vec::new();
+    for ch in text.chars() {
+        let result = parser
+            .parse_incremental(&ch.to_string(), &tools)
+            .await
+            .unwrap();
+        assert!(result.normal_text.is_empty());
+        deltas.extend(result.calls);
+    }
+    assert!(parser.take_unstreamed_normal_text().is_empty());
+    let streamed = join_calls(deltas);
+    assert_eq!(streamed.len(), calls.len());
+    for (streamed, call) in streamed.iter().zip(&calls) {
+        assert_eq!(streamed.name.as_deref(), Some(call.function.name.as_str()));
+        assert_eq!(streamed.parameters, call.function.arguments);
+    }
 }

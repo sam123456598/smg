@@ -18,6 +18,7 @@ Environment:
     GITHUB_TOKEN         required to write issues (reads work without it)
     GITHUB_REPOSITORY    default for --repo
     PROM_URL             default for --prom-url
+    RUNNER_FAILURES_JSON  bounded status snapshot collected by the cluster trigger
     GITHUB_STEP_SUMMARY  when set, the fleet summary is appended there
     GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID  build the run link
 """
@@ -38,6 +39,8 @@ from datetime import UTC, datetime, timedelta
 
 ISSUE_LABEL = "ci-node-health"
 H100_LABELS = ("1-gpu-h100", "2-gpu-h100", "4-gpu-h100")
+RUNNER_POOLS = (*H100_LABELS, "k8s-runner-cpu")
+RUNNER_FAILURE_CHECKS = {"runner_failed", "runner_monitor_blind"}
 CLOSE_AFTER = timedelta(minutes=90)
 COMMENT_EVERY = timedelta(hours=24)
 EVENT_REOPEN_GRACE = timedelta(hours=1)  # the gpu_xid lookback window
@@ -132,6 +135,25 @@ CHECKS: dict[str, Check] = {
             "is registered online. PR #2283 is what this looks like when nobody notices.",
             "`kubectl get autoscalingrunnersets -n actions-runner-system`, then the listener "
             "pod logs and `kubectl get events -n actions-runner-system | grep FailedScheduling`.",
+        ),
+        Check(
+            "runner_failed",
+            "CRIT",
+            "Failed runners occupy pool capacity",
+            "Failed EphemeralRunner records count toward the runner pool size in ARC 0.14.2 "
+            "and can prevent replacement runners from starting even when GPUs are free.",
+            "`kubectl get ephemeralrunners -n actions-runner-system`. Inspect the reported "
+            "reason and runner-controller logs; fix the underlying fault before manually "
+            "deleting only the confirmed Failed records. This monitor never deletes runners.",
+        ),
+        Check(
+            "runner_monitor_blind",
+            "CRIT",
+            "Monitor cannot read runner status",
+            "The cluster trigger could not supply a fresh, complete runner failure snapshot. "
+            "Existing Failed-runner alerts remain open until a successful check.",
+            "Check `ci-node-health-trigger` job logs and its service account's permission to "
+            "list EphemeralRunners in actions-runner-system.",
         ),
         Check(
             "monitor_blind",
@@ -310,6 +332,60 @@ def prom_findings(prom: Prom, nodes: set[str]) -> list[Finding]:
             value = float(sample["value"][1])
             findings.append(Finding(pc.check, node, pc.detail(sample["metric"], value)))
     return findings
+
+
+# --- runner status supplied by the read-only cluster trigger -----------------
+
+
+def runner_failure_findings(snapshot: str, now: datetime) -> tuple[list[Finding], set[str]]:
+    """Missing/error/stale data cannot clear a previously reported runner failure."""
+    if not snapshot:
+        return [], set()  # manual runs without a snapshot skip this check
+    try:
+        data = json.loads(snapshot)
+        if not isinstance(data, dict):
+            raise ValueError("snapshot must be an object")
+        if data.get("error"):
+            raise ValueError(str(data["error"])[:200])
+        checked_at = datetime.fromisoformat(data["checked_at"])
+        if checked_at.tzinfo is None or not -timedelta(minutes=5) <= now - checked_at <= timedelta(
+            hours=2
+        ):
+            raise ValueError("runner snapshot is stale or has an invalid timestamp")
+        pools = data["pools"]
+        if not isinstance(pools, list) or len(pools) != len(RUNNER_POOLS):
+            raise ValueError("runner snapshot must cover all repository pools")
+        if {p["name"] for p in pools} != set(RUNNER_POOLS):
+            raise ValueError("runner snapshot contains missing, duplicate, or unknown pools")
+        findings = []
+        for pool in pools:
+            count = pool["failed"]
+            if type(count) is not int or count < 0:
+                raise ValueError("failed runner count must be a nonnegative integer")
+            examples = pool["examples"]
+            if not isinstance(examples, list) or len(examples) > 3 or (count and not examples):
+                raise ValueError("runner error examples are missing or invalid")
+            details = []
+            for example in examples:
+                if not all(isinstance(example[k], str) for k in ("name", "reason", "message")):
+                    raise ValueError("runner error example fields must be strings")
+                details.append(
+                    f"{example['name'][:100]}: {example['reason'][:100]} "
+                    f"{' '.join(example['message'].split())[:500]}"
+                )
+            if count:
+                findings.append(
+                    Finding(
+                        CHECKS["runner_failed"],
+                        pool["name"],
+                        f"{count} Failed runner(s) occupy pool slots; " + "; ".join(details),
+                    )
+                )
+        return findings, RUNNER_FAILURE_CHECKS.copy()
+    except (ValueError, KeyError, TypeError) as exc:
+        return [Finding(CHECKS["runner_monitor_blind"], "runner-status", str(exc)[:200])], {
+            "runner_monitor_blind"
+        }
 
 
 # --- GitHub ------------------------------------------------------------------
@@ -911,7 +987,13 @@ def main(argv: list[str] | None = None) -> int:
 
     findings: list[Finding] = []
     rows: list[dict] = []
-    evaluated = set(CHECKS)
+    evaluated = set(CHECKS) - RUNNER_FAILURE_CHECKS
+    runner_findings, runner_evaluated = runner_failure_findings(
+        os.environ.get("RUNNER_FAILURES_JSON", ""), now
+    )
+    findings.extend(runner_findings)
+    evaluated |= runner_evaluated
+    runner_ok = not any(f.check.key == "runner_monitor_blind" for f in runner_findings)
     prom_ok = True
     try:
         nodes = h100_nodes(prom)
@@ -943,7 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     _write_summary(render_summary(rows, stats, findings, now))
-    return 0 if prom_ok else 1
+    return 0 if prom_ok and runner_ok else 1
 
 
 if __name__ == "__main__":
