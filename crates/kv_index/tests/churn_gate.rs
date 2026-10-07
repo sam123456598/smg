@@ -3,8 +3,8 @@
 //!
 //! The churn bench (`benches/churn.rs`) runs the same generator for the series; this is the part
 //! of it that fails a gate: exactness under churn always, and the bound on runs live that keeps
-//! fragmentation from coming back silently once a divergence inside a run no longer splits it.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::cast_precision_loss)]
+//! fragmentation from coming back silently where a divergence inside a run hangs a child off the
+//! offset and leaves the run whole.
 
 use kv_index::{
     churn::{Churn, ChurnConfig, FreeOrder},

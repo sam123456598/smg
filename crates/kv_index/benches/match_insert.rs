@@ -8,7 +8,7 @@
 //! warm tree; "miss" appends a never-seen turn each time; "hit_8_threads"
 //! runs the hit path on eight threads against one tree and reports wall time
 //! divided by operations.
-#![allow(clippy::expect_used, clippy::cast_possible_truncation)]
+#![expect(clippy::expect_used)]
 
 use std::{
     cell::RefCell,

@@ -1,7 +1,6 @@
 //! The split counters in the stats name the cause of every split: a removal leaving a hole, a
 //! store entering a run under a parent the worker did not hold up to; a chain diverging inside a
-//! run no longer splits it (the tail hangs off the offset as a child) and counts nothing. The churn harness reads them to attribute fragmentation; this keeps them honest.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+//! run hangs the tail off the offset as a child and counts nothing. The churn harness reads them to attribute fragmentation; this keeps them honest.
 
 use kv_index::{
     compute_content_hash, request_prefix_hashes, ChainBlockMap, ContentHash, ShardedChainIndex,

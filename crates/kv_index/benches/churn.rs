@@ -14,12 +14,8 @@
 //! coverage, no prefix holder of its own on the child), arena and header bytes, and the events
 //! applied; and the index is checked against the reference indexer on a sample of queries. The
 //! series goes to `--json`.
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::cast_precision_loss,
-    clippy::print_stdout
-)]
+
+#![expect(clippy::print_stdout)]
 
 use std::{
     io::Write,

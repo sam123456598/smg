@@ -8,7 +8,7 @@
 //! must hold exactly the same blocks and score every pool chain the same way. Readers run
 //! throughout and check the invariants that hold under any interleaving: no score exceeds the
 //! request, early-exit scores are 1, and nothing panics.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used)]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,53 +22,11 @@ use std::{
 };
 
 use kv_index::{
-    request_prefix_hashes, ChainBlockMap, ContentHash, ReferenceIndexer, SequenceHash,
-    ShardedChainIndex, StoredBlock,
+    ChainBlockMap, ContentHash, ReferenceIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
 };
 
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed.max(1))
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn range(&mut self, lo: usize, hi_inclusive: usize) -> usize {
-        lo + self.below(hi_inclusive - lo + 1)
-    }
-}
-
-fn content(stream: u64, position: usize) -> ContentHash {
-    kv_index::compute_content_hash(&[
-        (stream & 0xffff_ffff) as u32,
-        (stream >> 32) as u32,
-        position as u32,
-    ])
-}
-
-fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
-    contents
-        .iter()
-        .zip(request_prefix_hashes(contents))
-        .map(|(&content_hash, seq_hash)| StoredBlock {
-            seq_hash,
-            content_hash,
-        })
-        .collect()
-}
+mod common;
+use common::{blocks_of, content, Rng};
 
 /// A shared pool of conversations: a few prompts, each continued by several turns, with sibling
 /// turns branching off at various depths.

@@ -26,7 +26,7 @@ use std::{
 };
 
 use crate::{
-    chain_index::{ChainIndex, ChainIndexStats, LaneStats},
+    chain_index::{ChainIndex, ChainIndexStats},
     event_tree::{
         ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock, WorkerIdExhausted,
     },
@@ -291,15 +291,6 @@ impl ShardedChainIndex {
             .fold((0, 0), |(p, b), (q, c)| (p + q, b + c))
     }
 
-    /// As [`ChainIndex::debug_mergeable_by_rule`], summed over the shards.
-    #[doc(hidden)]
-    pub fn debug_mergeable_by_rule(&self) -> (usize, usize, usize) {
-        self.shards
-            .iter()
-            .map(ChainIndex::debug_mergeable_by_rule)
-            .fold((0, 0, 0), |(s, g, b), (x, y, z)| (s + x, g + y, b + z))
-    }
-
     /// Shape and memory counters summed over the shards.
     pub fn stats(&self) -> ChainIndexStats {
         let mut total = ChainIndexStats::default();
@@ -332,30 +323,6 @@ impl ShardedChainIndex {
     /// Shape and memory counters of each shard.
     pub fn shard_stats(&self) -> Vec<ChainIndexStats> {
         self.shards.iter().map(ChainIndex::stats).collect()
-    }
-
-    /// Lane-side counters summed over the shards (zero without the `lane-stats` feature).
-    pub fn lane_stats(&self) -> LaneStats {
-        let mut total = LaneStats::default();
-        for stats in self.shards.iter().map(ChainIndex::lane_stats) {
-            for i in 0..3 {
-                total.locks[i] += stats.locks[i];
-                total.contended[i] += stats.contended[i];
-                total.wait_ns[i] += stats.wait_ns[i];
-                total.store_ns[i] += stats.store_ns[i];
-                total.remove_ns[i] += stats.remove_ns[i];
-            }
-            total.restarts += stats.restarts;
-            total.splits_divergence += stats.splits_divergence;
-            total.splits_hole += stats.splits_hole;
-            total.splits_stale_parent += stats.splits_stale_parent;
-            total.inserts += stats.inserts;
-            total.stores += stats.stores;
-            total.store_blocks += stats.store_blocks;
-            total.removes += stats.removes;
-            total.remove_blocks += stats.remove_blocks;
-        }
-        total
     }
 
     /// Every block every worker holds, as `(worker, position, content hash, prefix hash)`,

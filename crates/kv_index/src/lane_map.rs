@@ -85,11 +85,6 @@ impl ChainBlockMap {
         self.slots.len()
     }
 
-    /// Bytes held from the process allocator: slots and tags.
-    pub fn memory_bytes(&self) -> usize {
-        self.slots.len() * size_of::<Slot>() + self.tags.len()
-    }
-
     #[inline]
     fn home(&self, key: u64) -> usize {
         // Fibonacci hashing spreads structured keys; engine hashes are already uniform.
@@ -237,7 +232,11 @@ impl ChainBlockMap {
 
     /// Remove every key of a batch, reporting each present one's location, with the home slots
     /// touched `AHEAD` keys early.
-    pub fn remove_all(&mut self, keys: &[SequenceHash], mut on_removed: impl FnMut(BlockRef)) {
+    pub(crate) fn remove_all(
+        &mut self,
+        keys: &[SequenceHash],
+        mut on_removed: impl FnMut(BlockRef),
+    ) {
         if self.len == 0 {
             return;
         }
@@ -258,7 +257,7 @@ impl ChainBlockMap {
     /// slots touched `AHEAD` keys early: the lane map writes of one store. A key already present
     /// moves to its new place and `on_moved` sees its old and new places (a block the engine
     /// stored again at the same place passes through here unchanged).
-    pub fn insert_run(
+    pub(crate) fn insert_run(
         &mut self,
         keys: impl ExactSizeIterator<Item = SequenceHash> + Clone,
         first: BlockRef,

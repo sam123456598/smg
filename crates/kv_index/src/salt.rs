@@ -34,16 +34,6 @@ pub fn content_hash_with_seed(token_ids: &[u32], seed: u64) -> ContentHash {
     ContentHash(hasher.finish())
 }
 
-/// The content hash of one block stored under a cache namespace. Equal to
-/// [`crate::compute_content_hash`] when the namespace is empty.
-pub fn namespaced_content_hash(
-    token_ids: &[u32],
-    lora_name: Option<&str>,
-    cache_salt: Option<&str>,
-) -> ContentHash {
-    content_hash_with_seed(token_ids, namespace_seed(lora_name, cache_salt))
-}
-
 /// [`crate::compute_request_content_hashes`] under an explicit seed (see
 /// [`namespace_seed`]): one hash per full block of `block_size` tokens, the
 /// partial tail ignored.
@@ -74,6 +64,17 @@ pub fn namespaced_request_content_hashes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The content hash of one block stored under a cache namespace. Equal to
+    /// [`crate::compute_content_hash`] when the namespace is empty.
+    fn namespaced_content_hash(
+        token_ids: &[u32],
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> ContentHash {
+        content_hash_with_seed(token_ids, namespace_seed(lora_name, cache_salt))
+    }
+
     use crate::{compute_content_hash, compute_request_content_hashes};
 
     const TOKENS: [u32; 6] = [11, 22, 33, 44, 55, 66];

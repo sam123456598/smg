@@ -27,8 +27,6 @@ tracing = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [features]
-# Per-lane lock-wait and split counters for the replay diagnostics; costs two clock reads per lock.
-lane-stats = []
 
 [dev-dependencies]
 anyhow = { workspace = true }

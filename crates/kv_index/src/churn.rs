@@ -9,12 +9,7 @@
 //! the configured order: least recently used first, equal-age blocks tail-first (the mock's
 //! order, which frees suffixes) or by hash (which frees middle stretches).
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::cast_precision_loss,
-    clippy::missing_panics_doc
-)]
+#![expect(clippy::expect_used)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

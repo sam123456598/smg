@@ -1,5 +1,4 @@
-//! Exactness harness: the production `PositionalIndexer` against the `ReferenceIndexer`
-//! (`docs/kv-router-leap.md`, guardrail 1).
+//! Exactness harness: the production `PositionalIndexer` against the `ReferenceIndexer`.
 //!
 //! A seeded corpus of stores, extensions, divergent siblings, tail and whole-chain removals,
 //! clears and worker removals is replayed into both indexers through the same per-worker
@@ -14,67 +13,15 @@
 //! an earlier request, so that request's middle blocks fall out of the LRU before its later blocks
 //! do. The engine's prefix match stops at the hole, so a worker's score must end there too. Scale
 //! with `KV_INDEX_EXACTNESS_EVENTS` (default 20000) and `KV_INDEX_EXACTNESS_SEED`.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kv_index::{
-    request_prefix_hashes, ContentHash, PositionalIndexer, ReferenceIndexer, SequenceHash,
-    StoredBlock, WorkerBlockMap,
-};
+use kv_index::{ContentHash, PositionalIndexer, ReferenceIndexer, SequenceHash, WorkerBlockMap};
 use rustc_hash::FxHashMap;
 
-/// xorshift64*, enough for a deterministic corpus without pulling a dependency into the test.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed.max(1))
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn range(&mut self, lo: usize, hi_inclusive: usize) -> usize {
-        lo + self.below(hi_inclusive - lo + 1)
-    }
-
-    fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
-        self.next() % denominator < numerator
-    }
-}
-
-fn content(stream: u64, position: usize) -> ContentHash {
-    kv_index::compute_content_hash(&[
-        (stream & 0xffff_ffff) as u32,
-        (stream >> 32) as u32,
-        position as u32,
-    ])
-}
-
-/// Blocks of a content sequence as an engine would hash them: the engine hash is the chain hash
-/// of the contents so far, which is unique per distinct prefix and shared by every worker that
-/// stores the same prefix.
-fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
-    contents
-        .iter()
-        .zip(request_prefix_hashes(contents))
-        .map(|(&content_hash, seq_hash)| StoredBlock {
-            seq_hash,
-            content_hash,
-        })
-        .collect()
-}
+mod common;
+use common::{blocks_of, content, Rng};
 
 struct Held {
     worker: u32,
