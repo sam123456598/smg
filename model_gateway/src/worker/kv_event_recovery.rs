@@ -48,10 +48,10 @@ pub(crate) const RESTART_WINDOW: u64 = 1_024;
 
 /// Missed batches beyond this clear the rank instead of keeping its state:
 /// the same decision the servicers make when their replay buffer overflows.
-pub(crate) const GAP_CLEAR_THRESHOLD: u64 = 1_024;
+const GAP_CLEAR_THRESHOLD: u64 = 1_024;
 
 /// Live batches held while a snapshot resync is in flight.
-pub(crate) const TAIL_LIMIT: usize = 1_024;
+const TAIL_LIMIT: usize = 1_024;
 
 /// Where the rank's cursor stands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,9 +67,9 @@ pub(crate) enum Cursor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingReplay {
     /// The sequence the server was asked to resume from.
-    pub expected: u64,
+    expected: u64,
     /// The sequence that revealed the gap.
-    pub received: u64,
+    received: u64,
 }
 
 /// What the subscriber must do with a batch.

@@ -56,7 +56,7 @@ const WEDGE_BOUND_CAP: Duration = Duration::from_secs(120);
 /// The wedge bound for `worker` now: the configured threshold, or the time
 /// the engine may still need before the first token of its in-flight prompts
 /// is due, whichever is longer.
-pub(crate) fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
+fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
     wedge
         .max(worker.prefill_backlog())
         .min(wedge.max(WEDGE_BOUND_CAP))

@@ -1177,7 +1177,7 @@ fn chain_index_lookups_change_nothing() {
         .iter()
         .find(|backend| backend.index.name() == "chain")
         .expect("chain backend");
-    let before = chain.index.chain_stats().expect("run stats");
+    let before = chain.index.chain_stats().expect("chain stats");
     let blocks = chain.blocks();
     let queries = query_set(&corpus.chains);
     for _ in 0..20 {
@@ -1186,7 +1186,7 @@ fn chain_index_lookups_change_nothing() {
             let _ = chain.index.find_matches(query, true);
         }
     }
-    let after = chain.index.chain_stats().expect("run stats");
+    let after = chain.index.chain_stats().expect("chain stats");
     assert_eq!(
         format!("{after:?}"),
         format!("{before:?}"),

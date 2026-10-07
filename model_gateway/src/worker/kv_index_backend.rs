@@ -182,6 +182,7 @@ impl WorkerBlocks {
         0
     }
 
+    /// Whether the worker holds no block.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
