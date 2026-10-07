@@ -27,7 +27,7 @@ const ENTRY_OVERHEAD: usize = 96;
 
 /// Why a cursor cannot be served from the history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Window {
+pub(crate) enum Window {
     /// Nothing relayed yet.
     Empty,
     /// The batch after the cursor is older than the oldest one kept.
@@ -68,7 +68,7 @@ impl History {
     }
 
     /// Slots occupied by holes.
-    pub fn holes(&self) -> usize {
+    pub(crate) fn holes(&self) -> usize {
         self.holes
     }
 
@@ -76,11 +76,11 @@ impl History {
         self.bytes
     }
 
-    pub fn oldest(&self) -> Option<u64> {
+    pub(crate) fn oldest(&self) -> Option<u64> {
         (!self.is_empty()).then_some(self.first)
     }
 
-    pub fn newest(&self) -> Option<u64> {
+    pub(crate) fn newest(&self) -> Option<u64> {
         self.oldest()
             .map(|first| first + self.entries.len() as u64 - 1)
     }
@@ -88,7 +88,7 @@ impl History {
     /// The window holds every batch the publisher ever numbered: it starts at
     /// 0 and has no holes. A subscriber without a cursor can take it as the
     /// publisher's whole state.
-    pub fn complete_from_start(&self) -> bool {
+    pub(crate) fn complete_from_start(&self) -> bool {
         !self.entries.is_empty() && self.first == 0 && self.holes == 0
     }
 
@@ -101,7 +101,7 @@ impl History {
     }
 
     /// Record that `seq` passed without a batch.
-    pub fn push_lost(&mut self, seq: u64) {
+    pub(crate) fn push_lost(&mut self, seq: u64) {
         self.append(seq, Entry::Lost, ENTRY_OVERHEAD);
     }
 
@@ -109,7 +109,7 @@ impl History {
     /// sequence, any when the history is empty). Only the newest
     /// `max_batches` of them could stay in the window, so a longer run
     /// starts the window over at the slots that would have survived.
-    pub fn push_lost_range(&mut self, from: u64, to: u64) {
+    pub(crate) fn push_lost_range(&mut self, from: u64, to: u64) {
         if to < from {
             return;
         }
@@ -161,7 +161,7 @@ impl History {
         }
     }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
         self.holes = 0;
@@ -171,7 +171,7 @@ impl History {
     /// The batches after `cursor`, in order, holes skipped; or why the window
     /// cannot serve that cursor. A cursor equal to the newest sequence yields
     /// nothing and is fine.
-    pub fn after(&self, cursor: u64) -> Result<Vec<Arc<KvEventBatch>>, Window> {
+    pub(crate) fn after(&self, cursor: u64) -> Result<Vec<Arc<KvEventBatch>>, Window> {
         let (Some(oldest), Some(newest)) = (self.oldest(), self.newest()) else {
             return Err(Window::Empty);
         };
@@ -187,7 +187,7 @@ impl History {
     }
 
     /// Every batch in the window, holes skipped.
-    pub fn all(&self) -> Vec<Arc<KvEventBatch>> {
+    pub(crate) fn all(&self) -> Vec<Arc<KvEventBatch>> {
         self.batches(0)
     }
 

@@ -26,9 +26,9 @@ message KvEventBatch {
   double timestamp = 2;
   repeated KvCacheEvent events = 3;
   optional int32 dp_rank = 4;
+  reserved 5, 6;
   // Set when this batch is one chunk of a relay state snapshot rather than a
-  // batch the publisher sent (see KvSnapshotChunk). Fields 5 and 6 are left
-  // for the publisher-epoch proposal in crates/kv_index/docs/recovery-protocol.md.
+  // batch the publisher sent (see KvSnapshotChunk).
   KvSnapshotChunk snapshot = 7;
   // The engine's load as the servicer knows it when it sends this batch (see
   // EngineLoad); absent from servicers that predate the field.

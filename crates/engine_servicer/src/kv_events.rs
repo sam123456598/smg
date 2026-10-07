@@ -87,7 +87,10 @@
 //! `SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor` turns on the relay's
 //! engine-hash verification ([`crate::engine_hash`]); mismatches are counted,
 //! never dropped. The relay's counters ([`RelayCounts`]) are logged on every
-//! gap, restart and refusal.
+//! gap, restart and refusal, and together with the normalizer's
+//! ([`crate::kv_wire::Counts`]: forwarded, dropped by reason, the hash
+//! check's tally) in a summary line every 500 relayed batches and when the
+//! relay closes.
 //!
 //! Framing (`ZmqEventPublisher` in both engines): one PUB multipart message
 //! per scheduler step, `[topic, sequence as u64 big-endian, msgpack batch]`.
@@ -134,11 +137,11 @@ pub(crate) const TOKENSPEED_DISABLED_MESSAGE: &str = "KV cache events not enable
 
 /// When the relay subscribes to the publisher: at the servicer's start
 /// (default, any other value) or `lazy`, at the first `SubscribeKvEvents`.
-pub const RELAY_START_ENV: &str = "SMG_KV_EVENT_RELAY_START";
+pub(crate) const RELAY_START_ENV: &str = "SMG_KV_EVENT_RELAY_START";
 /// How many relayed batches the history keeps (the engines' `buffer_steps`).
-pub const HISTORY_BATCHES_ENV: &str = "SMG_KV_EVENT_HISTORY_BATCHES";
+pub(crate) const HISTORY_BATCHES_ENV: &str = "SMG_KV_EVENT_HISTORY_BATCHES";
 /// The history's byte budget over the encoded batches.
-pub const HISTORY_BYTES_ENV: &str = "SMG_KV_EVENT_HISTORY_BYTES";
+pub(crate) const HISTORY_BYTES_ENV: &str = "SMG_KV_EVENT_HISTORY_BYTES";
 pub const DEFAULT_HISTORY_BATCHES: usize = 10_000;
 pub const DEFAULT_HISTORY_BYTES: usize = 256 << 20;
 const DEFAULT_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -153,11 +156,11 @@ const LIVE_CHANNEL: usize = 4_096;
 const SUMMARY_EVERY_BATCHES: u64 = 500;
 
 /// How often a subscriber's stream checks the load record for a change.
-pub const DEFAULT_LOAD_TICK: Duration = Duration::from_millis(100);
+pub(crate) const DEFAULT_LOAD_TICK: Duration = Duration::from_millis(100);
 /// Silence after which a `load_only` heartbeat goes out.
-pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// The heartbeat interval once the engine has been idle for two heartbeats.
-pub const DEFAULT_HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
 /// The replay socket's end marker, eight 0xff bytes on both wires.
 const END_SEQUENCE: [u8; 8] = [0xff; 8];
 
@@ -185,7 +188,7 @@ pub struct RelayConfig {
 impl RelayConfig {
     /// Rank 0 of the publisher at `kv_events_endpoint` (bind wildcards
     /// resolved), with the history caps from the environment.
-    pub fn for_publisher(
+    pub(crate) fn for_publisher(
         kv_events_endpoint: &str,
         replay_endpoint: Option<&str>,
         topic: &str,
@@ -208,7 +211,7 @@ impl RelayConfig {
 
 /// Where the relay reads the engine's load for the record it attaches to
 /// every batch: the servicer's `GetLoads` bookkeeping.
-pub trait LoadSource: Send + Sync {
+pub(crate) trait LoadSource: Send + Sync {
     /// The load for `dp_rank` (the batch's rank; `None` for a publisher that
     /// names none) as `GetLoads` would report it now, or `None` while nothing
     /// is known (the engine is not up yet). `sample` and `load_only` are the
@@ -340,7 +343,7 @@ enum Admission {
 
 /// What showed that the publisher started over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RestartReason {
+pub(crate) enum RestartReason {
     /// The sequence went backwards on the same socket.
     SequenceRegression,
     /// The engine's startup `AllBlocksCleared` arrived under a sequence the
@@ -450,6 +453,7 @@ impl Drop for KvEventRelay {
             bytes = shared.history.bytes(),
             live_blocks = shared.state.blocks(),
             live_entries = shared.state.entries(),
+            state = ?shared.state.counts(),
             "KV event relay closed"
         );
     }
@@ -480,13 +484,13 @@ impl KvEventRelay {
 
     /// Install where the load record on every sent batch comes from (once;
     /// a second call is ignored).
-    pub fn set_load_source(&self, source: Arc<dyn LoadSource>) {
+    pub(crate) fn set_load_source(&self, source: Arc<dyn LoadSource>) {
         let _ = self.load_source.set(source);
     }
 
     /// The relay for an engine's publisher, or `None` when events are off
     /// (an empty endpoint).
-    pub fn for_publisher(
+    pub(crate) fn for_publisher(
         kv_events_endpoint: &str,
         replay_endpoint: Option<&str>,
         topic: &str,
@@ -505,8 +509,10 @@ impl KvEventRelay {
     }
 
     /// The normalizer's counters as of the last relayed batch (forwarded,
-    /// dropped by reason, the engine-hash check's tally).
-    pub fn wire_counts(&self) -> WireCounts {
+    /// dropped by reason, the engine-hash check's tally); what the summary
+    /// and closing log lines print.
+    #[cfg(test)]
+    pub(crate) fn wire_counts(&self) -> WireCounts {
         lock(&self.shared).wire.clone()
     }
 
@@ -530,7 +536,7 @@ impl KvEventRelay {
 
     /// [`Self::start`] when the servicer begins serving, unless
     /// [`RELAY_START_ENV`] is `lazy`; needs a Tokio runtime.
-    pub fn start_at_boot(&self) {
+    pub(crate) fn start_at_boot(&self) {
         if starts_at_boot(std::env::var(RELAY_START_ENV).ok().as_deref()) {
             self.start();
         } else {

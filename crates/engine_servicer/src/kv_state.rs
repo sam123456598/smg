@@ -10,8 +10,8 @@
 //! `AllBlocksCleared` empties the rank. Copies are capped per block the way
 //! the gateway caps them ([`COPIES_CAP`]), so a snapshot rebuilds the copy
 //! counts the gateway would hold after the same stream. Memory is one entry
-//! per live `(rank, tier, hash)`, about 230 bytes at block size 16 (160 MB
-//! for a 676k-block pool); nothing is kept per relayed batch.
+//! per live `(rank, tier, hash)`, about 230 bytes at block size 16; nothing
+//! is kept per relayed batch.
 //!
 //! A snapshot ([`LiveState::snapshot`]) is one pass over the entries that
 //! clones the per-block `Arc`s. The relay takes it under its lock together
@@ -23,11 +23,10 @@
 //! slow snapshot reader never holds up the publisher task or any other
 //! subscriber. Each rank keeps its entries in a dense slot vector in store
 //! order under a hash index, so the pass is a sequential scan whose `Arc`
-//! clones follow the records' allocation order: 676k blocks take 11-13 ms
-//! under the lock in a release build on a Grace host (28 ms when the pass
-//! iterated a hash map), and that is the worst live latency another
-//! subscriber sees while a snapshot is taken; the ordering pass that follows
-//! takes about 0.5 s off the lock and encoding the 331 chunks 50 ms.
+//! clones follow the records' allocation order: tens of milliseconds for a
+//! pool of several hundred thousand blocks in a release build, which is the
+//! worst live latency another subscriber sees while a snapshot is taken;
+//! the ordering pass and the chunk encoding that follow run off the lock.
 //!
 //! The chunks of one snapshot carry consecutive sequence numbers ending at
 //! the sequence the state was taken at, so the gateway's per-rank cursor
@@ -57,7 +56,7 @@ pub const CHUNK_BLOCKS: usize = 2_048;
 /// What a `Stored` event says about all of its blocks: shared by the blocks
 /// of one event, and by consecutive events that repeat it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StoredTail {
+pub(crate) struct StoredTail {
     pub tier: Option<i32>,
     pub medium: Option<String>,
     pub group_idx: Option<u32>,
@@ -103,7 +102,7 @@ impl StoredTail {
 
 /// One live block, as the relay can emit it again.
 #[derive(Debug)]
-pub struct LiveBlock {
+pub(crate) struct LiveBlock {
     pub hash: i64,
     /// The hash the block chains from: the previous block of its store, or
     /// the store's `parent_block_hash` for the first.
@@ -189,7 +188,7 @@ impl RankBlocks {
 
 /// What the state has done since the relay started.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StateCounts {
+pub(crate) struct StateCounts {
     /// Physical copies added by stores.
     pub stored: u64,
     /// Copies taken away by removals.
@@ -356,7 +355,7 @@ impl LiveState {
         self.ranks.values().filter(|rank| !rank.is_empty()).count()
     }
 
-    pub fn counts(&self) -> &StateCounts {
+    pub(crate) fn counts(&self) -> &StateCounts {
         &self.counts
     }
 
@@ -393,17 +392,17 @@ impl LiveState {
 }
 
 /// One live block of a snapshot and how many copies the engine holds.
-pub struct SnapshotEntry {
-    pub block: Arc<LiveBlock>,
-    pub copies: u32,
+pub(crate) struct SnapshotEntry {
+    pub(crate) block: Arc<LiveBlock>,
+    pub(crate) copies: u32,
 }
 
 /// The live set at one point of the stream, unordered.
 pub struct Snapshot {
     /// Per rank, in rank order; ranks without blocks are left out.
-    pub ranks: Vec<(Option<i32>, Vec<SnapshotEntry>)>,
+    pub(crate) ranks: Vec<(Option<i32>, Vec<SnapshotEntry>)>,
     /// Physical copies over all ranks.
-    pub blocks: u64,
+    pub(crate) blocks: u64,
 }
 
 impl Snapshot {
@@ -491,7 +490,7 @@ impl SnapshotChunks {
     }
 
     /// The next chunk, or `None` once all `count` have been produced.
-    pub fn next_chunk(&mut self) -> Option<common::KvEventBatch> {
+    pub(crate) fn next_chunk(&mut self) -> Option<common::KvEventBatch> {
         if self.next >= self.count {
             return None;
         }

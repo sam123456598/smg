@@ -36,7 +36,11 @@ big-endian, the integer vLLM would have sent for it.
 Stores and removals are forwarded one for one. vLLM keeps several physical
 copies of one hash and removes them one at a time; the relay does not
 reference-count those (a replayed batch would inflate the counts), the
-gateway counts copies per worker and tier.
+gateway counts copies per worker and tier. Of a hybrid model's KV-cache
+groups only the main-attention ones are forwarded; this relay drops every
+sliding-window and state-space group's events (the Rust relay additionally
+forwards a rank that publishes sliding-window groups only, with the hashes
+aligned to the tail of the tokens).
 
 ``SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor`` (or ``relay(...,
 hash_check=...)``) turns on engine-hash verification: every store whose

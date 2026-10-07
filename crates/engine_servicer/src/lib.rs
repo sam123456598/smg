@@ -25,8 +25,6 @@ pub mod kv_events;
 pub mod kv_history;
 pub mod kv_state;
 pub mod kv_wire;
-#[cfg(test)]
-mod kv_wire_shapes;
 mod load_tracker;
 mod proto_json;
 mod requests;

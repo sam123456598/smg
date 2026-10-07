@@ -15,23 +15,26 @@
 //! - only blocks the engine manages itself (`ownership` other than a
 //!   residency agent);
 //! - the storage tier from `medium`, unknown media dropped;
-//! - only main-attention KV cache groups (hybrid models publish one group per
-//!   attention kind; sliding-window and state-space groups never hold a
-//!   reusable prefix);
-//! - whole blocks only (hash count × block size == token count), no
-//!   self-referencing hash chains, no offload placeholders (a chunk key with
-//!   no tokens);
+//! - the main-attention KV cache group where a rank has one (hybrid models
+//!   publish one group per attention kind under the same hashes, and the
+//!   sliding-window and state-space groups' events, stores and removals, are
+//!   dropped); a rank that publishes only sliding-window groups forwards
+//!   their stores, the hashes aligned to the tail of the tokens, as its only
+//!   signal (see [`Normalizer`]);
+//! - whole blocks only (hash count × block size == token count, or the
+//!   tail of a longer span), no self-referencing hash chains, no offload
+//!   placeholders (a chunk key with no tokens);
 //! - speculative-decoding bigram pages folded to their tokens, so an Eagle
 //!   engine's blocks hash like a plain engine's;
 //! - the cache namespace (LoRA name, cache salt) carried on every store and
 //!   inherited down the parent chain when a child store omits it.
 //!
-//! Stores and removals are forwarded one for one. vLLM keeps several physical
-//! copies of one hash and removes them one at a time, so a removal can arrive
-//! while another copy is still cached; the relay does not reference-count
-//! those, because a replayed or duplicated batch would inflate the counts and
-//! pin blocks forever. The index applies set semantics per worker and tier,
-//! as the reference indexer does, and errs toward a miss.
+//! Stores and removals are forwarded one for one. vLLM keeps up to two
+//! physical copies of one hash and removes them one at a time, so a removal
+//! can arrive while another copy is still cached: every copy's store and
+//! every removal go through, and the gateway counts copies per worker, tier
+//! and hash (capped), as the relay's own live-block record and the hash
+//! check's parent memory do.
 //!
 //! Hash identity: an integer hash is used as is (vLLM sends the low 64 bits
 //! of the digest as an unsigned integer, SGLang the high 64 bits as a signed
@@ -60,7 +63,7 @@ use crate::{
 
 /// `int.from_bytes(bytes, "big")` kept to 64 bits: the whole value for the
 /// publisher's eight-byte sequence frame, the low 64 bits of a longer hash.
-pub fn low64_big_endian(bytes: &[u8]) -> u64 {
+pub(crate) fn low64_big_endian(bytes: &[u8]) -> u64 {
     bytes
         .iter()
         .fold(0, |value, &byte| (value << 8) | u64::from(byte))
@@ -750,7 +753,7 @@ pub fn tier_of(medium: Option<&str>) -> Option<KvCacheTier> {
 
 /// `KvBlock.cache_level` for a tier: `None` on the device (older consumers
 /// read an absent level as the device), the tier's rank otherwise.
-pub fn cache_level_of(tier: KvCacheTier) -> Option<i32> {
+pub(crate) fn cache_level_of(tier: KvCacheTier) -> Option<i32> {
     match tier {
         KvCacheTier::Unspecified | KvCacheTier::Device => None,
         KvCacheTier::Host => Some(1),
@@ -1329,6 +1332,9 @@ fn vllm_keys(keys: Option<&[ExtraKey]>, index: usize) -> Result<Option<Vec<VllmE
         .collect::<Result<Vec<_>, ()>>()
         .map(Some)
 }
+
+#[cfg(test)]
+mod shapes_tests;
 
 #[cfg(test)]
 mod tests {
